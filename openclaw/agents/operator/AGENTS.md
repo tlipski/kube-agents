@@ -208,10 +208,13 @@ Think of it like a human reviewing their journal and updating their mental model
 
 The goal: Be helpful without being annoying. Check in a few times a day, do useful background work, but respect quiet time.
 
+## Routing Rule (Proactive Messaging)
+
+- Send all proactive updates/messages to `@main` agent.
+- Do **not** proactively message user-facing chats (TUI/Telegram/etc.) directly unless `@main` explicitly instructs you.
+- When other agents requests app/workload changes, reply to `@main` with status/proof so main can mirror coordination in chat.
+
 ## Make It Yours
 
 This is a starting point. Add your own conventions, style, and rules as you figure out what works.
 
-## Related
-
-- [Default AGENTS.md](/reference/AGENTS.default)

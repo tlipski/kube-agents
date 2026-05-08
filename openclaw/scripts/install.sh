@@ -219,6 +219,187 @@ else
 fi
 
 
+# --- Phase 6: Configure Main Agent Delegation & Routing ---
+echo "--- Phase 6: Configuring Main Agent Delegation & Routing ---"
+MAIN_WORKSPACE_DIR="$HOME/.openclaw/workspace"
+mkdir -p "$MAIN_WORKSPACE_DIR"
+
+# 1. Append to AGENTS.md if not already present
+MAIN_AGENTS_FILE="$MAIN_WORKSPACE_DIR/AGENTS.md"
+if [ ! -f "$MAIN_AGENTS_FILE" ] || ! grep -q "## 🤝 Agent Delegation Policy" "$MAIN_AGENTS_FILE"; then
+  echo "[kube-agent] Appending delegation policy to $MAIN_AGENTS_FILE..."
+  cat << 'EOF' >> "$MAIN_AGENTS_FILE"
+
+## 🤝 Agent Delegation Policy (Main ↔ DevTeam)
+
+Default rule: **All development-related work is delegated to `devteam`**.
+
+Development-related includes:
+- writing/changing code
+- creating/updating manifests
+- build/release pipeline changes
+- app deployment work
+- app debugging and bugfixes
+
+### Ownership matrix (who owns what)
+| Area | Primary owner | Main role |
+|---|---|---|
+| App code / features / bugfixes | `devteam` | Delegate + verify proof |
+| Build pipelines / image builds / release artifacts | `devteam` | Delegate + verify proof |
+| App deployment manifests and rollout execution | `devteam` | Delegate + verify proof |
+| Cluster operations (health, scaling, upgrades, platform policy) | `operator` | Delegate + verify proof |
+| Cross-agent coordination, tradeoffs, and user communication | `main` | Own directly |
+
+### Main agent responsibilities
+- Interpret user intent and route dev work to `devteam` and cluster/platform work to `operator`
+- Relay cross-agent chat mentions (`@devteam`, `@operator`) so requests and responses remain visible in TUI/Telegram
+- Ask for and verify proof before reporting success
+- Coordinate blockers, decisions, and status updates with the human
+
+### Proof gate (required before saying “done”)
+For dev work, require concrete outputs from `devteam` such as:
+- Git commit SHA + changed files
+- Build IDs + final status
+- Image URLs (prefer digest-pinned refs)
+- Deployment proof (`kubectl get deploy/pods/svc`, rollout output)
+
+### Exceptions
+Main may do development work directly only when:
+1. User explicitly says main should do it directly, or
+2. `devteam` is blocked and user approves main-agent fallback.
+EOF
+else
+  echo "[kube-agent] Delegation policy already present in $MAIN_AGENTS_FILE."
+fi
+
+# 2. Append to TOOLS.md if not already present
+MAIN_TOOLS_FILE="$MAIN_WORKSPACE_DIR/TOOLS.md"
+if [ ! -f "$MAIN_TOOLS_FILE" ] || ! grep -q "## Agent Routing Shortcuts" "$MAIN_TOOLS_FILE"; then
+  echo "[kube-agent] Appending routing shortcuts to $MAIN_TOOLS_FILE..."
+  cat << 'EOF' >> "$MAIN_TOOLS_FILE"
+
+## Agent Routing Shortcuts
+
+Use these chat patterns in shared conversations:
+- `@devteam <task>` → route to devteam for development work
+- `@operator <task>` → route to operator for cluster/platform operations
+- `@main <task>` → coordination/verification/meta tasks
+
+## DevTeam Delivery Checklist (must return)
+For any code/build/deploy task, require:
+- Repo path used
+- `git rev-parse HEAD`
+- `git show --name-status --oneline -n 1`
+- Build IDs + terminal status
+- Image refs (prefer `@sha256` digests)
+- Deployment verification (`kubectl get deploy/pods/svc`, rollout status)
+
+## Operator Delivery Checklist (must return)
+For any cluster/platform task, require:
+- Cluster/context used (`kubectl config current-context`)
+- Scope checked (namespace/cluster resources inspected)
+- Before/after state outputs (`kubectl get ...`)
+- Event/log evidence for incidents when relevant
+- Risk/impact note (user-facing)
+- If changes made: exact command/manifests and rollout/health verification
+
+## Safety Rails for DevTeam
+- Always use fresh clone for risky repo replacement tasks
+- Never delete `.git`
+- Never claim completion without command evidence
+- If blocked: include exact failing command + stderr + minimal fix
+EOF
+else
+  echo "[kube-agent] Routing shortcuts already present in $MAIN_TOOLS_FILE."
+fi
+
+# 3. Create ROUTING.md if not already present
+MAIN_ROUTING_FILE="$MAIN_WORKSPACE_DIR/ROUTING.md"
+if [ ! -f "$MAIN_ROUTING_FILE" ] || ! grep -q "# ROUTING.md - Main" "$MAIN_ROUTING_FILE"; then
+  echo "[kube-agent] Creating routing playbook $MAIN_ROUTING_FILE..."
+  cat << 'EOF' > "$MAIN_ROUTING_FILE"
+# ROUTING.md - Main ↔ DevTeam Routing Guide
+
+Use this file as the practical handoff playbook.
+
+## Default Rule
+- Development-related work routes to `devteam`.
+- Main coordinates, verifies proof, and reports outcomes.
+
+## Quick Routing Commands
+- `@devteam <task>` → code/build/deploy/debug/manifests
+- `@operator <task>` → cluster operations/health/capacity/upgrades/security patching
+- `@main <task>` → coordination, policy, verification, planning
+
+## What counts as development work (route to devteam)
+- Writing/changing source code
+- Creating/updating app k8s manifests
+- Running build/release pipelines
+- Deploying application changes
+- App-level debugging and bug fixes
+
+## What counts as operator work (route to operator)
+- Cluster health monitoring and incident triage
+- Node/cluster capacity and scaling decisions
+- Workload-aware cluster upgrades and maintenance windows
+- Namespace/RBAC/network-policy provisioning and enforcement
+- Security patching and cert-expiry checks
+- Cross-cluster reliability, quotas, and platform-level guardrails
+
+## Required Proof (before main says “done”)
+DevTeam must return:
+1. Repo path used
+2. `git rev-parse HEAD`
+3. `git show --name-status --oneline -n 1`
+4. Build IDs + final status
+5. Image refs (prefer digest-pinned `@sha256`)
+6. Deployment proof:
+   - `kubectl get deploy -n <ns>`
+   - `kubectl get pods -n <ns>`
+   - `kubectl get svc -n <ns>`
+   - rollout status output
+
+## Blocked-task format (mandatory)
+If blocked, return:
+- Exact failing command
+- Exact stderr
+- Minimal fix required to unblock
+
+## Safety Rails
+- For risky repo replacement: fresh clone first
+- Never delete `.git`
+- Never claim completion without command evidence
+- Keep changes scoped to requested repo/task
+
+## Fallback Policy
+Main may do development work directly only when:
+1. User explicitly requests main to do it, or
+2. DevTeam is blocked and user approves main fallback
+
+Main may do operator work directly only when:
+1. User explicitly requests main to do it, or
+2. Operator is blocked and user approves main fallback
+
+## Recommended Handoff Templates
+Use this when assigning dev tasks:
+
+"Implement <task>. Work in repo <repo>. Return proof: repo path, git HEAD, last commit file list, build IDs/status, image digests, kubectl deploy/pods/svc, rollout output. If blocked, include exact command + stderr + minimal fix."
+
+Use this when assigning operator tasks:
+
+"Operate on cluster/platform task <task>. Read-only inspect first, then apply minimal safe change. Return proof: current context/cluster, commands run, before/after state (`kubectl get ...`), events/log evidence, and impact assessment. If blocked, include exact command + stderr + minimal fix."
+
+## Cross-Agent Relay Rule (chat-visible coordination)
+- If `operator` posts a message containing `@devteam ...` in TUI/Telegram, `main` MUST relay that instruction to `devteam`.
+- `main` MUST mirror devteam’s response back into the same chat thread/channel so coordination stays visible.
+- `@operator ...` messages from `devteam` follow the same pattern: relay via `main` and mirror reply back to chat.
+- Use session-to-session handoff for execution; keep the human-facing conversation in TUI/Telegram.
+EOF
+else
+  echo "[kube-agent] Routing playbook already present in $MAIN_ROUTING_FILE."
+fi
+
+
 # Cleanup
 [ -n "${TMP_DIR:-}" ] && rm -rf "$TMP_DIR"
 

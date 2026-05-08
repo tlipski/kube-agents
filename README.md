@@ -5,15 +5,10 @@ The k8s agentic harness will fundamentally redefine the DevOps presentation laye
 ## Key Components
 
 ### 1. Kubernetes Operator Agent (`operator`)
-The core of the OpenClaw integration. A dedicated, safety-conscious AI agent configured with a calm, analytical persona (`SOUL.md`), designed to act as a senior Kubernetes Operator. It comes pre-configured to monitor cluster health, scan recommendations, and troubleshoot incidents.
+An autonomous custodian of the infrastructure configured with a calm, analytical persona (`SOUL.md`). It manages global concerns like multi-cluster balancing, capacity, upgrades, and platform security policies, while executing scheduled cron jobs (health patrols, CVE scans, log rotations, certificate scans).
 
-The Operator agent is enriched with targeted skills (expert playbooks) for specialized tasks:
-- **Observability**: Metrics, logging, and diagnostics.
-- **Reliability**: High availability and workload stability.
-- **Networking & Edge**: Ingress, gateways, and routing.
-- **Security**: Workload hardening and vulnerability scanning.
-- **Cost Analysis**: Analyzing GKE cost allocation and resource usage.
-- ...and more.
+### 2. Development Team Agent (`devteam`)
+A production-safety coach and application workload custodian configured with a performance-driven persona (`SOUL.md`). It represents developer interests, enforcing schema validation, resource requests/limits templates, and automated NetworkPolicies, while running development-specific cron tasks (rollout watches, error rate monitors, and SLO checks).
 
 ---
 
@@ -26,9 +21,8 @@ Choose how you want to deploy the Kubernetes agentic capabilities.
 You can install the specialized **Kubernetes Operator** agent and its bundled skills directly into your [OpenClaw](https://openclaw.ai/) workspace using a single command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/kube-agents/<branch>/openclaw/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/openclaw/scripts/install.sh | bash
 ```
-*(Note: Replace `<owner>` and `<branch>` with your repository details. Live GKE MCP server integration is an upcoming feature. In the meantime, the agent can still perform operations using standard shell commands).*
 
 For more details, see the [OpenClaw Integration Guide](openclaw/README.md).
 
