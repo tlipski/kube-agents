@@ -12,34 +12,35 @@ A production-safety coach and application workload custodian configured with a p
 
 ---
 
-## Installation & Setup
+## Harness Integration & Setup
 
-Choose how you want to deploy the Kubernetes agentic capabilities.
+This workspace contains agent configurations, personas, and skills that can be imported into various Claw-like pattern gateways or multi-agent platforms (such as CrewAI, Microsoft AutoGen, LangGraph, or OpenClaw).
 
-### Use in OpenClaw (Recommended)
+You can load or register the specialized agents directly into your orchestrator environment from this repository.
 
-You can install the specialized **Kubernetes Operator** agent and its bundled skills directly into your [OpenClaw](https://openclaw.ai/) workspace using a single command:
+### 1. Declarative Registration (YAML/JSON)
+For platforms or gateways that load agents declaratively, add the workspace paths to your profile or orchestrator configuration:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/openclaw/scripts/install.sh | bash
+```yaml
+agents:
+  - id: operator
+    workspace: ./workspace/agents/operator
+  - id: devteam
+    workspace: ./workspace/agents/devteam
 ```
 
-For more details, see the [OpenClaw Integration Guide](openclaw/README.md).
-
-### Showcasing in Action
-To immediately test and demonstrate the harness's dynamic routing, automated remediation, and cross-agent negotiations, follow our step-by-step [Showcase & Demo Scenarios guide](openclaw/README.md#showcasing-the-harness-in-action-demo-scenarios).
-
-#### Installing from a Custom Branch or Fork
-
-If you want to install from a forked repository or a custom branch (for example, to test changes), you should export `REPO` and `BRANCH` environment variables before running the install script. This ensures both `curl` and the installer use the correct sources:
+### 2. Imperative CLI Registration
+For hosts supporting CLI-driven imports, register the agent directories from the repository root. For example (using a generic gateway CLI or reference host):
 
 ```bash
-export REPO="https://github.com/<owner>/kube-agents"
-export BRANCH="<branch-name>"
-curl -fsSL "${REPO}/raw/${BRANCH}/openclaw/scripts/install.sh" | bash
+# Register operator agent
+gateway-cli agents add operator --workspace ./workspace/agents/operator --non-interactive
+
+# Register devteam agent
+gateway-cli agents add devteam --workspace ./workspace/agents/devteam --non-interactive
 ```
 
-This will fetch the script from your branch and configure the installer to download assets from the same fork and branch.
+For more details on routing policies, proof gates, and showcasing scenarios, see the [Kubernetes Multi-Agent Integration Guide](workspace/README.md).
 
 ## Disclaimer
 

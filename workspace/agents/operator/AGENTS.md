@@ -185,7 +185,7 @@ You are free to edit `HEARTBEAT.md` with a short checklist or reminders. Keep it
 - Nothing new since last check
 - You just checked <30 minutes ago
 
-When handling `[OpenClaw heartbeat poll]`, if there is no actionable update for the human, respond with exactly `NO_REPLY`.
+When handling a periodic heartbeat poll, if there is no actionable update for the human, respond with exactly `NO_REPLY`.
 
 **Proactive work you can do without asking:**
 
