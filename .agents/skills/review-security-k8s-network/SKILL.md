@@ -2,27 +2,25 @@
 name: review-security-k8s-network
 description: Reviews Kubernetes network configurations, access controls, and routing boundaries for security vulnerabilities.
 ---
+# Task
+Review Kubernetes network configurations (`NetworkPolicies`, `Services`, `Ingresses`, Service Mesh) for vulnerabilities.
 
-# Instructions
-You are a Kubernetes security expert. Your task is to review Kubernetes network configurations, including NetworkPolicies, Services, Ingresses, and Service Mesh setups, for security vulnerabilities.
+# Checks
+## 1. Network Isolation
+- **Default-Deny**: Verify every namespace has a "default-deny" `NetworkPolicy` for *both* Ingress and Egress.
+- **Egress Neglect**: Flag workloads lacking Egress restrictions (enables data exfiltration/C2).
+- **Overly Permissive Rules**: Flag broad CIDRs (`0.0.0.0/0`, `::/0`) or empty `podSelector`/`namespaceSelector`.
 
-## Focus Areas & Deterministic Checks:
+## 2. Service Exposure
+- **Accidental Public Exposure**: Flag `LoadBalancer` services lacking internal annotations if meant to be internal.
+- **NodePort Usage**: Flag `NodePort` usage (bypasses standard protections).
+- **Sensitive Ports**: Flag exposure of admin/sensitive ports (22, 3389, 2379, 10250).
 
-### 1. Network Isolation & Micro-segmentation
-- **Default-Deny Enforcement**: Verify that every namespace implements a "default-deny" `NetworkPolicy` for *both* Ingress and Egress traffic.
-- **Egress Neglect**: Specifically flag workloads that lack Egress restrictions. Unrestricted egress allows compromised pods to exfiltrate data, perform lateral movement, or establish C2 beaconing.
-- **Overly Permissive Rules**: Flag `NetworkPolicy` rules containing broad CIDR blocks (e.g., `0.0.0.0/0` or `::/0`) or empty `podSelector`/`namespaceSelector` blocks unless strictly justified.
+## 3. Traffic Routing
+- **Ingress TLS**: Require `tls` block on Ingresses. Flag missing HTTP->HTTPS redirects.
+- **Endpoint Hijacking**: Flag manual `Endpoints`/`EndpointSlice` resources (risk of malicious external redirect).
+- **HostNetwork Bypass**: Flag `hostNetwork: true` (bypasses pod network policies).
 
-### 2. Service & Exposure Security
-- **Accidental Public Exposure**: Check `Service` definitions of type `LoadBalancer`. Ensure they have the appropriate cloud-provider annotations (e.g., `networking.gke.io/load-balancer-type: "Internal"`) if they are meant to be internal-only.
-- **NodePort Usage**: Flag the use of `NodePort` services. These open ports across all nodes in the cluster and bypass standard network protections.
-- **Sensitive Port Exposure**: Flag any services exposing known administrative or sensitive ports (e.g., 22, 3389, 2379 for etcd, 10250 for kubelet) to broader networks.
-
-### 3. Traffic Routing & Ingress Hygiene
-- **Ingress TLS**: Evaluate `Ingress` configurations to ensure TLS is enforced (`tls` block is present and properly configured). Flag instances where HTTP is not automatically redirected to HTTPS.
-- **Endpoint/EndpointSlice Hijacking**: Check for manually created `Endpoints` or `EndpointSlice` resources. Attackers can use these to secretly redirect intra-cluster traffic to external malicious IPs.
-- **HostNetwork Bypass**: Verify that `NetworkPolicies` are not bypassed by workloads using `hostNetwork: true` (which operate in the node's network namespace and ignore pod-level network policies).
-
-### 4. Service Mesh (If Applicable)
-- **mTLS Enforcement**: If a service mesh (like Istio or Linkerd) is detected, verify that `PeerAuthentication` or equivalent resources enforce `STRICT` mutual TLS (mTLS) for all inter-service communication.
-- **Authorization Bypass**: Review mesh `AuthorizationPolicies` to ensure they follow a default-deny posture and are not inadvertently conflicting with permissive legacy `NetworkPolicies`.
+## 4. Service Mesh
+- **mTLS Enforcement**: Require `STRICT` mutual TLS via `PeerAuthentication`.
+- **Authorization Bypass**: Ensure `AuthorizationPolicies` follow default-deny and don't conflict with legacy policies.
