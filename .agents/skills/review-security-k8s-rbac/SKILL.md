@@ -25,7 +25,7 @@ You MUST conduct your review in the following deterministic order, starting from
 ### 3. Role & Binding Design Review
 - **Wildcards & Mass Deletion**: Flag any use of the `*` wildcard in `apiGroups`, `resources`, or `verbs`. Flag the use of the `deletecollection` verb for DoS risks.
 - **Privilege Escalation Verbs**: Check for `escalate`, `bind`, and `impersonate` verbs in general.
-- **Over-scoped Bindings**: Flag when a `ClusterRoleBinding` is used when a `RoleBinding` would suffice, or when a `Role` grants access to disjoint sets of verbs/resources that should be split into multiple rules.
+- **Over-scoped Bindings & Namespace Isolation**: Flag when access control relies primarily on cluster-scoped access (`ClusterRoleBindings`) instead of adhering to the Principle of Least Privilege via namespace-local `RoleBindings`. A `RoleBinding` should be used wherever possible to maintain true namespace isolation. Also flag when a `Role` grants access to disjoint sets of verbs/resources that should be split into multiple rules.
 - **Self-Modification**: Flag any role that allows a Pod to self-modify (e.g., update its own ServiceAccount or rolebindings).
 
 ### 4. Sensitive Resources & Subresources Review
