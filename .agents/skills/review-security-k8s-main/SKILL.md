@@ -21,6 +21,7 @@ Launch sub-agents for the following skills:
 - `review-security-k8s-rbac`
 - `review-security-k8s-nodes`
 - `review-security-k8s-network`
+- `review-security-k8s-gateway`
 - `review-security-k8s-namespaces`
 - `review-security-k8s-service-accounts`
 - `review-security-k8s-storage`
