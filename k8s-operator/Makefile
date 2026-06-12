@@ -92,6 +92,24 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
+.PHONY: deploy-litellm
+deploy-litellm: kustomize ## Deploy LiteLLM integration.
+	$(KUSTOMIZE) build config/integrations/litellm | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl apply -n $${NAMESPACE:-agent-system} -f -
+
+.PHONY: undeploy-litellm
+undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
+	$(KUSTOMIZE) build config/integrations/litellm | envsubst '$$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-agent-system} -f -
+
+.PHONY: deploy-github
+deploy-github: kustomize ## Deploy GitHub integration.
+	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER $$KEYRING $$KEY $$KEY_VERSION $$GITHUB_ORG $$GITHUB_REPO' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
+
+.PHONY: undeploy-github
+undeploy-github: kustomize ## Undeploy GitHub integration.
+	$(KUSTOMIZE) build config/integrations/github | envsubst '$$NAMESPACE $$PROJECT_ID $$REGION $$CLUSTER $$KEYRING $$KEY $$KEY_VERSION $$GITHUB_ORG $$GITHUB_REPO' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
+
+
+
 ##@ Dependencies
 
 ## Location to install dependencies to
