@@ -139,15 +139,18 @@ COPY agents/platform/skills/ /opt/hermes/skills/
 # Copy platform defaults configuration as temp file
 COPY agents/platform/config.yaml /tmp/platform-config.yaml
 
-
 # Copy devteam deployment template
 COPY deploy/kustomize/devteam/deployment.yaml /opt/defaults/templates/devteam/deployment.yaml
 
 # Copy operator deployment template
 COPY deploy/kustomize/operator/deployment.yaml /opt/defaults/templates/operator/deployment.yaml
 
-# Dynamically merge config.yamls using virtualenv python
-RUN /opt/hermes/.venv/bin/python3 -c "import pathlib, yaml; p1=pathlib.Path('/opt/defaults/config.yaml'); p2=pathlib.Path('/tmp/platform-config.yaml'); s=(yaml.safe_load(p1.read_text()) or {}) if p1.exists() else {}; p=(yaml.safe_load(p2.read_text()) or {}) if p2.exists() else {}; s.update(p); p1.write_text(yaml.safe_dump(s))" && rm -f /tmp/platform-config.yaml
+# Copy config merge helper script
+COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
+
+# Dynamically merge config.yamls using helper script
+RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/platform-config.yaml && \
+    rm -f /tmp/merge_configs.py /tmp/platform-config.yaml
 
 # Normalize ownership and permissions at the end of build
 RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills && \
