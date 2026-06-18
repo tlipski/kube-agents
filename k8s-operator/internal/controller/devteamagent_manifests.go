@@ -17,14 +17,10 @@ limitations under the License.
 package controller
 
 import (
-	"crypto/sha256"
-	"encoding/json"
 	"fmt"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -34,8 +30,8 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// buildConfigMap generates the ConfigMap manifest containing config.yaml
-func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+// buildDevTeamConfigMap generates the ConfigMap manifest containing config.yaml and SETTINGS.md for DevTeamAgent
+func buildDevTeamConfigMap(agent *agentv1alpha1.DevTeamAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -46,13 +42,14 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 			Namespace: agent.Namespace,
 		},
 		Data: map[string]string{
-			"config.yaml": renderConfigYAML(agent),
+			"config.yaml": renderDevTeamConfigYAML(agent),
+			"SETTINGS.md": renderDevTeamSettingsMD(agent),
 		},
 	}
 }
 
-// renderConfigYAML generates the YAML payload for the agent config
-func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
+// renderDevTeamConfigYAML generates the YAML config payload for DevTeamAgent
+func renderDevTeamConfigYAML(agent *agentv1alpha1.DevTeamAgent) string {
 	cwd := "/opt/data"
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.AgentHome != "" {
 		cwd = agent.Spec.Harness.Hermes.AgentHome
@@ -70,11 +67,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			Backend string `json:"backend"`
 			Cwd     string `json:"cwd"`
 		} `json:"terminal"`
-		Platforms struct {
-			GoogleChat struct {
-				Enabled bool `json:"enabled"`
-			} `json:"google_chat"`
-		} `json:"platforms"`
 	}{}
 
 	cfg.Model.Provider = "custom"
@@ -85,13 +77,6 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
 
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GoogleChat != nil {
-		gchat := agent.Spec.Integration.GoogleChat
-		if gchat.Enabled != nil {
-			cfg.Platforms.GoogleChat.Enabled = *gchat.Enabled
-		}
-	}
-
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return ""
@@ -99,9 +84,25 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	return string(data)
 }
 
+// renderDevTeamSettingsMD generates the SETTINGS.md GKE Scope configuration payload for DevTeamAgent
+func renderDevTeamSettingsMD(agent *agentv1alpha1.DevTeamAgent) string {
+	clusterName := ""
+	location := ""
+	namespace := ""
+	if agent.Spec.Harness != nil {
+		clusterName = agent.Spec.Harness.ClusterName
+		location = agent.Spec.Harness.Location
+		namespace = agent.Spec.Harness.Namespace
+	}
+	return fmt.Sprintf(`# GKE Scope Configuration
+- **Cluster Name:** %s
+- **Cluster Location:** %s
+- **Namespace:** %s
+`, clusterName, location, namespace)
+}
 
-// buildPVC generates the PVC manifest for agent data persistence
-func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
+// buildDevTeamPVC generates the PVC manifest for DevTeamAgent data persistence
+func buildDevTeamPVC(agent *agentv1alpha1.DevTeamAgent) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -122,36 +123,21 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 	}
 }
 
-// buildDeployment generates the Deployment manifest for the agent payload
-func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash string) *appsv1.Deployment {
+// buildDevTeamDeployment generates the Deployment manifest for DevTeamAgent
+func buildDevTeamDeployment(agent *agentv1alpha1.DevTeamAgent, configHash, fluentBitHash string) *appsv1.Deployment {
 	replicas := int32(1)
-	fsGroup := int64(10000)
+	fsGroup := int64(1000)
 
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
+	saName := "kubeagents-devteam-agent"
 
 	image := ""
-	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Image != "" {
+	if agent.Spec.Deployment != nil {
 		image = agent.Spec.Deployment.Image
-		hasTagOrDigest := false
-		lastSlash := strings.LastIndex(image, "/")
-		refPart := image
-		if lastSlash != -1 {
-			refPart = image[lastSlash+1:]
+		tag := "latest"
+		if agent.Spec.Deployment.Tag != nil && *agent.Spec.Deployment.Tag != "" {
+			tag = *agent.Spec.Deployment.Tag
 		}
-		if strings.Contains(refPart, ":") || strings.Contains(refPart, "@") {
-			hasTagOrDigest = true
-		}
-
-		if !hasTagOrDigest {
-			tag := "latest"
-			if agent.Spec.Deployment.Tag != nil && *agent.Spec.Deployment.Tag != "" {
-				tag = *agent.Spec.Deployment.Tag
-			}
-			image = fmt.Sprintf("%s:%s", image, tag)
-		}
+		image = fmt.Sprintf("%s:%s", image, tag)
 	}
 
 	pullPolicy := corev1.PullAlways
@@ -195,13 +181,18 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Name:  "OTEL_SERVICE_NAME",
 			Value: agent.Name + "-gateway",
 		},
-	}
-
-	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.BrowserArgs) > 0 {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "AGENT_BROWSER_ARGS",
-			Value: strings.Join(agent.Spec.Deployment.BrowserArgs, " "),
-		})
+		{
+			Name:  "API_SERVER_ENABLED",
+			Value: "true",
+		},
+		{
+			Name:  "API_SERVER_HOST",
+			Value: "0.0.0.0",
+		},
+		{
+			Name:  "PLATFORM_API_URL",
+			Value: "http://platform-agent.kubeagents-system.svc.cluster.local:8642/v1",
+		},
 	}
 
 	if agent.Spec.Harness != nil {
@@ -217,6 +208,12 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				Value: agent.Spec.Harness.Location,
 			})
 		}
+		if agent.Spec.Harness.Namespace != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "GKE_NAMESPACE",
+				Value: agent.Spec.Harness.Namespace,
+			})
+		}
 		if agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.ApiServerSecretRef != nil {
 			envVars = append(envVars, corev1.EnvVar{
 				Name: "API_SERVER_KEY",
@@ -225,39 +222,6 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 				},
 			})
 		}
-	}
-
-	if integration := agent.Spec.Integration; integration != nil {
-		if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
-			envVars = append(envVars, []corev1.EnvVar{
-				{
-					Name:  "GOOGLE_CHAT_PROJECT_ID",
-					Value: gchat.ProjectID,
-				},
-				{
-					Name:  "GOOGLE_CHAT_SUBSCRIPTION_NAME",
-					Value: fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName),
-				},
-				{
-					Name:  "GOOGLE_CHAT_ALLOWED_USERS",
-					Value: strings.Join(gchat.AllowedUsers, ","),
-				},
-				{
-					Name:  "GOOGLE_CHAT_HOME_CHANNEL",
-					Value: gchat.HomeChannel,
-				},
-			}...)
-			if len(gchat.AllowedUsers) == 0 {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "GOOGLE_CHAT_ALLOW_ALL_USERS",
-					Value: "true",
-				})
-			}
-		}
-	}
-
-	if agent.Spec.Deployment != nil && len(agent.Spec.Deployment.Env) > 0 {
-		envVars = mergeEnvVars(envVars, agent.Spec.Deployment.Env)
 	}
 
 	return &appsv1.Deployment{
@@ -302,7 +266,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					},
 					Containers: []corev1.Container{
 						{
-							Name:            "platform-agent",
+							Name:            "devteam-agent",
 							Image:           image,
 							ImagePullPolicy: pullPolicy,
 							Command:         []string{"hermes"},
@@ -320,23 +284,28 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 							Env: envVars,
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("500m"),
-									corev1.ResourceMemory: resource.MustParse("2Gi"),
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("512Mi"),
 								},
 								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("2"),
-									corev1.ResourceMemory: resource.MustParse("4Gi"),
+									corev1.ResourceCPU:    resource.MustParse("500m"),
+									corev1.ResourceMemory: resource.MustParse("1Gi"),
 								},
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
-									Name:      "platform-agent-data-vol",
+									Name:      "devteam-agent-data-vol",
 									MountPath: homeDir,
 								},
 								{
-									Name:      "platform-agent-config-vol",
+									Name:      "devteam-agent-config-vol",
 									MountPath: fmt.Sprintf("%s/config.yaml", homeDir),
 									SubPath:   "config.yaml",
+								},
+								{
+									Name:      "devteam-agent-config-vol",
+									MountPath: fmt.Sprintf("%s/SETTINGS.md", homeDir),
+									SubPath:   "SETTINGS.md",
 								},
 							},
 							SecurityContext: &corev1.SecurityContext{
@@ -367,7 +336,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{
-									Name:      "platform-agent-data-vol",
+									Name:      "devteam-agent-data-vol",
 									MountPath: "/opt/data",
 									ReadOnly:  true,
 								},
@@ -392,7 +361,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 					},
 					Volumes: []corev1.Volume{
 						{
-							Name: "platform-agent-data-vol",
+							Name: "devteam-agent-data-vol",
 							VolumeSource: corev1.VolumeSource{
 								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 									ClaimName: agent.Name + "-data",
@@ -400,7 +369,7 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 							},
 						},
 						{
-							Name: "platform-agent-config-vol",
+							Name: "devteam-agent-config-vol",
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
 									LocalObjectReference: corev1.LocalObjectReference{
@@ -434,71 +403,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	}
 }
 
-// buildPlatformExplorerRole generates the custom ClusterRole manifest
-func buildPlatformExplorerRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "rbac.authorization.k8s.io/v1",
-			Kind:       "ClusterRole",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("kubeagents:explorer:%s:%s", agent.Namespace, agent.Name),
-		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{""},
-				Resources: []string{"nodes", "pods", "namespaces"},
-				Verbs:     []string{"get", "list"},
-			},
-		},
-	}
-}
-
-// buildClusterRoleBinding generates a ClusterRoleBinding manifest
-func buildClusterRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.ClusterRoleBinding {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
-
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "rbac.authorization.k8s.io/v1",
-			Kind:       "ClusterRoleBinding",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: bindingName,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      saName,
-				Namespace: agent.Namespace,
-			},
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     roleName,
-		},
-	}
-}
-
-// Helper to calculate the SHA256 hash of ConfigMap Data for rolling restarts.
-func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
-	if configMap == nil {
-		return "", nil
-	}
-	dataBytes, err := json.Marshal(configMap.Data)
-	if err != nil {
-		return "", err
-	}
-	hash := sha256.Sum256(dataBytes)
-	return fmt.Sprintf("%x", hash), nil
-}
-
-// buildFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf
-func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+// buildDevTeamFluentBitConfigMap generates the ConfigMap manifest containing fluent-bit.conf
+func buildDevTeamFluentBitConfigMap(agent *agentv1alpha1.DevTeamAgent) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -542,8 +448,8 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
 	}
 }
 
-// buildPlatformService generates the Service manifest for PlatformAgent
-func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+// buildDevTeamService generates the Service manifest for DevTeamAgent
+func buildDevTeamService(agent *agentv1alpha1.DevTeamAgent) *corev1.Service {
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -571,32 +477,4 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 			},
 		},
 	}
-}
-
-// mergeEnvVars merges custom env vars into defaults. Custom env vars override defaults with the same name.
-func mergeEnvVars(defaults []corev1.EnvVar, custom []corev1.EnvVar) []corev1.EnvVar {
-	customMap := make(map[string]corev1.EnvVar)
-	for _, env := range custom {
-		customMap[env.Name] = env
-	}
-
-	var merged []corev1.EnvVar
-	for _, env := range defaults {
-		if customEnv, exists := customMap[env.Name]; exists {
-			merged = append(merged, customEnv)
-			delete(customMap, env.Name)
-		} else {
-			merged = append(merged, env)
-		}
-	}
-
-	// Append remaining custom env vars in their original order
-	for _, env := range custom {
-		if customEnv, exists := customMap[env.Name]; exists {
-			merged = append(merged, customEnv)
-			delete(customMap, env.Name)
-		}
-	}
-
-	return merged
 }

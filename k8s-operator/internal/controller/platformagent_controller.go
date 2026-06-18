@@ -50,7 +50,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims;configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;pods,verbs=get;list
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;bind
 
@@ -60,6 +60,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	instance := &agentv1alpha1.PlatformAgent{}
 	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Validate Spec
+	if instance.Spec.Deployment == nil || instance.Spec.Deployment.Image == "" {
+		log.Error(nil, "spec.deployment.image is required but not specified")
+		instance.Status.Phase = "Failed"
+		_ = r.Status().Update(ctx, instance)
+		return ctrl.Result{}, nil
 	}
 
 	log.Info("Reconciling PlatformAgent", "name", instance.Name, "namespace", instance.Namespace)
@@ -79,22 +87,17 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
-	// 3. Reconcile K8s Service Account (with Workload Identity annotation)
-	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 4. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
+	// 3. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
 	if err := r.reconcileRBAC(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 5. Reconcile PVC for agent persistent data
+	// 4. Reconcile PVC for agent persistent data
 	if err := r.reconcilePVC(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 6. Reconcile ConfigMap (config.yaml content)
+	// 5. Reconcile ConfigMap (config.yaml content)
 	configMapHash, err := r.reconcileConfigMap(ctx, instance)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -106,12 +109,17 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 7. Reconcile Deployment (with pod template hash annotation)
+	// 6. Reconcile Deployment (with pod template hash annotation)
 	if err := r.reconcileDeployment(ctx, instance, configMapHash, fluentBitHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 8. Update status phase to Ready
+	// Reconcile Service
+	if err := r.reconcileService(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 7. Update status phase to Ready
 	return ctrl.Result{}, r.updateStatusReady(ctx, instance)
 }
 
@@ -148,13 +156,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 	return ctrl.Result{}, nil
 }
 
-func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	sa := buildServiceAccount(agent)
-	if err := ctrl.SetControllerReference(agent, sa, r.Scheme); err != nil {
-		return err
-	}
-	return r.Patch(ctx, sa, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
-}
+
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	pvc := buildPVC(agent)
@@ -217,6 +219,14 @@ func (r *PlatformAgentReconciler) reconcileDeployment(ctx context.Context, agent
 	return r.Patch(ctx, dep, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
 }
 
+func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	svc := buildPlatformService(agent)
+	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
+		return err
+	}
+	return r.Patch(ctx, svc, client.Apply, client.ForceOwnership, client.FieldOwner("platformagent-controller"))
+}
+
 func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	viewerBindingName := fmt.Sprintf("kubeagents:viewer:%s:%s", agent.Namespace, agent.Name)
 	crbViewer := buildClusterRoleBinding(agent, viewerBindingName, "view")
@@ -242,46 +252,58 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 }
 
 func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	// Fetch actual Deployment
 	dep := &appsv1.Deployment{}
-	depErr := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
-	if depErr != nil && !errors.IsNotFound(depErr) {
-		return depErr
-	}
-
-	pvc := &corev1.PersistentVolumeClaim{}
-	pvcErr := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
-	if pvcErr != nil && !errors.IsNotFound(pvcErr) {
-		return pvcErr
-	}
-
-	newPhase := "Provisioning"
-	if depErr == nil && dep.Status.ReadyReplicas > 0 {
-		newPhase = "Ready"
-	}
-
+	errDep := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
-	if depErr == nil {
+	if errDep == nil {
 		newDeploymentStatusName = dep.Name
 		newDeploymentStatusReadyReplicas = dep.Status.ReadyReplicas
 	}
 
+	// Fetch actual PVC
+	pvc := &corev1.PersistentVolumeClaim{}
+	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
 	newStorageStatusBound := false
-	if pvcErr == nil {
+	if errPVC == nil {
 		newStorageStatusBound = (pvc.Status.Phase == corev1.ClaimBound)
 	}
 
+	// Fetch actual Service
+	svc := &corev1.Service{}
+	errSvc := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, svc)
+	newServiceStatusEndpoint := ""
+	newAddress := ""
+	if errSvc == nil {
+		newServiceStatusEndpoint = fmt.Sprintf("http://%s.%s.svc.cluster.local:8642", svc.Name, svc.Namespace)
+		newAddress = fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
+	}
+
+	// Determine Phase
+	newPhase := "Provisioning"
+	if errDep == nil && dep.Status.ReadyReplicas > 0 {
+		newPhase = "Ready"
+	}
+
+	// Check if anything actually changed
 	if agent.Status.Phase == newPhase &&
 		agent.Status.DeploymentStatus.Name == newDeploymentStatusName &&
 		agent.Status.DeploymentStatus.ReadyReplicas == newDeploymentStatusReadyReplicas &&
-		agent.Status.StorageStatus.Bound == newStorageStatusBound {
+		agent.Status.StorageStatus.Bound == newStorageStatusBound &&
+		agent.Status.ServiceStatus.Endpoint == newServiceStatusEndpoint &&
+		agent.Status.Address == newAddress {
 		return nil
 	}
 
+	// Apply updates
 	agent.Status.Phase = newPhase
 	agent.Status.DeploymentStatus.Name = newDeploymentStatusName
 	agent.Status.DeploymentStatus.ReadyReplicas = newDeploymentStatusReadyReplicas
 	agent.Status.StorageStatus.Bound = newStorageStatusBound
+	agent.Status.ServiceStatus.Endpoint = newServiceStatusEndpoint
+	agent.Status.Address = newAddress
+
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
 
@@ -293,9 +315,9 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&agentv1alpha1.PlatformAgent{}).
 		Owns(&appsv1.Deployment{}).
-		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&corev1.Service{}).
 		Watches(
 			&rbacv1.ClusterRoleBinding{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {

@@ -76,73 +76,6 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 }
 
-func TestBuildServiceAccount(t *testing.T) {
-	tests := []struct {
-		name   string
-		agent  *agentv1alpha1.PlatformAgent
-		verify func(*testing.T, *corev1.ServiceAccount)
-	}{
-		{
-			name: "uses default name if ServiceAccountName is empty",
-			agent: &agentv1alpha1.PlatformAgent{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-agent",
-					Namespace: "my-ns",
-				},
-				Spec: agentv1alpha1.PlatformAgentSpec{
-					Security: &agentv1alpha1.SecuritySpec{
-						ServiceAccountName: "",
-					},
-				},
-			},
-			verify: func(t *testing.T, sa *corev1.ServiceAccount) {
-				if sa.Name != "my-agent" {
-					t.Errorf("expected SA name to be my-agent, got %q", sa.Name)
-				}
-				if len(sa.Annotations) != 0 {
-					t.Errorf("expected no annotations, got %v", sa.Annotations)
-				}
-			},
-		},
-		{
-			name: "uses custom name and injects GKE Workload Identity annotation",
-			agent: &agentv1alpha1.PlatformAgent{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "my-agent",
-					Namespace: "my-ns",
-				},
-				Spec: agentv1alpha1.PlatformAgentSpec{
-					Security: &agentv1alpha1.SecuritySpec{
-						ServiceAccountName: "custom-sa",
-						WorkloadIdentity: &agentv1alpha1.WorkloadIdentitySpec{
-							Gcp: &agentv1alpha1.GcpWorkloadIdentitySpec{
-								GSAName:   "my-gsa",
-								ProjectID: "my-gcp-project",
-							},
-						},
-					},
-				},
-			},
-			verify: func(t *testing.T, sa *corev1.ServiceAccount) {
-				if sa.Name != "custom-sa" {
-					t.Errorf("expected SA name to be custom-sa, got %q", sa.Name)
-				}
-				expectedAnnotation := "my-gsa@my-gcp-project.iam.gserviceaccount.com"
-				actual := sa.Annotations["iam.gke.io/gcp-service-account"]
-				if actual != expectedAnnotation {
-					t.Errorf("expected annotation %q, got %q", expectedAnnotation, actual)
-				}
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			sa := buildServiceAccount(tc.agent)
-			tc.verify(t, sa)
-		})
-	}
-}
 
 func TestBuildPVC(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
@@ -371,5 +304,42 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 	}
 	if !strings.Contains(fbConf, "Name              tail") {
 		t.Errorf("expected fluent-bit.conf to contain Input Name tail")
+	}
+}
+
+func TestBuildPlatformService(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-platform-agent",
+			Namespace: "test-ns",
+		},
+	}
+
+	svc := buildPlatformService(agent)
+	if svc.Name != "test-platform-agent" {
+		t.Errorf("expected Service name test-platform-agent, got %s", svc.Name)
+	}
+	if svc.Namespace != "test-ns" {
+		t.Errorf("expected Service namespace test-ns, got %s", svc.Namespace)
+	}
+
+	if len(svc.Spec.Ports) != 2 {
+		t.Errorf("expected 2 service ports, got %d", len(svc.Spec.Ports))
+	}
+
+	portsMap := make(map[string]int32)
+	for _, port := range svc.Spec.Ports {
+		portsMap[port.Name] = port.Port
+	}
+
+	if portsMap["api"] != 8642 {
+		t.Errorf("expected api port 8642, got %d", portsMap["api"])
+	}
+	if portsMap["dashboard"] != 9119 {
+		t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
+	}
+
+	if svc.Spec.Selector["app"] != "test-platform-agent-gateway" {
+		t.Errorf("expected selector app=test-platform-agent-gateway, got %s", svc.Spec.Selector["app"])
 	}
 }
