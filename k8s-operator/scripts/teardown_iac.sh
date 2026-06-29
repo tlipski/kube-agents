@@ -30,9 +30,9 @@ C_RED='\033[91m'
 C_RESET='\033[0m'
 C_BOLD='\033[1m'
 
-print_step() { echo -e "\n${C_BOLD}${C_CYAN}>>>  $1  <<<${C_RESET}"; }
-print_success() { echo -e "${C_GREEN}✓ $1${C_RESET}"; }
-print_error() { echo -e "${C_RED}✗ $1${C_RESET}"; }
+print_step() { echo -e "\n${C_BOLD}${C_CYAN}>>>${C_RESET} ${C_BOLD}$1${C_RESET} ${C_BOLD}${C_CYAN}<<<${C_RESET}"; }
+print_success() { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+print_error() { echo -e "  ${C_RED}✗${C_RESET} $1"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -40,13 +40,19 @@ TF_DIR="${ROOT_DIR}/deploy/terraform"
 
 # Usage / Help Message
 usage() {
-  echo -e "${C_BOLD}Usage:${C_RESET} $0 [required-options]"
+  echo -e "${C_BOLD}Usage:${C_RESET} $0 [required-options] [optional-options]"
   echo ""
   echo -e "${C_BOLD}Required Options:${C_RESET}"
   echo "  -p, --project-id VALUE         Target GCP Project ID"
   echo "  -r, --region VALUE             GCP Region for the GKE cluster"
   echo "  -c, --cluster-name VALUE       GKE Cluster Name"
   echo "  -n, --namespace VALUE          Kubernetes namespace"
+  echo ""
+  echo -e "${C_BOLD}Optional Options:${C_RESET}"
+  echo "  -go, --github-org VALUE        GitHub Organization/Owner name (for Token Minter)"
+  echo "  -gr, --github-repo VALUE       GitHub Repository name (for Token Minter)"
+  echo "  -ga, --github-app-id VALUE     GitHub App ID (for Token Minter)"
+  echo "  -gp, --github-pem-path VALUE   GitHub App Private Key PEM file path"
   echo ""
   exit 1
 }
@@ -56,6 +62,10 @@ PROJECT_ID=""
 REGION=""
 CLUSTER_NAME=""
 NAMESPACE=""
+GITHUB_ORG=""
+GITHUB_REPO=""
+GITHUB_APP_ID=""
+GITHUB_PEM_PATH=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -74,6 +84,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     -n|--namespace)
       NAMESPACE="$2"
+      shift 2
+      ;;
+    -go|--github-org)
+      GITHUB_ORG="$2"
+      shift 2
+      ;;
+    -gr|--github-repo)
+      GITHUB_REPO="$2"
+      shift 2
+      ;;
+    -ga|--github-app-id)
+      GITHUB_APP_ID="$2"
+      shift 2
+      ;;
+    -gp|--github-pem-path)
+      GITHUB_PEM_PATH="$2"
       shift 2
       ;;
     -h|--help)
@@ -101,6 +127,7 @@ if [ "${CLUSTER_NAME}" != "kube-agents-dedicated-cluster" ]; then
   PLATFORM_GSA=$(echo "ka-plat-${SUFFIX}" | cut -c1-30)
   OPERATOR_GSA=$(echo "ka-oper-${SUFFIX}" | cut -c1-30)
   DEVTEAM_GSA=$(echo "ka-dev-${SUFFIX}" | cut -c1-30)
+  GITHUB_MINTER_GSA=$(echo "ka-git-${SUFFIX}" | cut -c1-30)
   TOPIC_NAME="platform-agent-chat-events-${SUFFIX}"
   SUB_NAME="platform-agent-chat-events-sub-${SUFFIX}"
   DELETION_PROTECTION="false"
@@ -109,6 +136,7 @@ else
   PLATFORM_GSA="kubeagents-platform-gsa"
   OPERATOR_GSA="kubeagents-operator-gsa"
   DEVTEAM_GSA="kubeagents-devteam-gsa"
+  GITHUB_MINTER_GSA="kubeagents-github-minter-gsa"
   TOPIC_NAME="platform-agent-chat-events"
   SUB_NAME="platform-agent-chat-events-sub"
   DELETION_PROTECTION="true"
@@ -137,6 +165,10 @@ terraform destroy -auto-approve \
   -var="platform_gsa_name=${PLATFORM_GSA}" \
   -var="operator_gsa_name=${OPERATOR_GSA}" \
   -var="devteam_gsa_name=${DEVTEAM_GSA}" \
+  -var="github_minter_gsa_name=${GITHUB_MINTER_GSA}" \
+  -var="github_org=${GITHUB_ORG:-}" \
+  -var="github_repo=${GITHUB_REPO:-}" \
+  -var="github_app_id=${GITHUB_APP_ID:-}" \
   -var="gchat_topic_name=${TOPIC_NAME}" \
   -var="gchat_subscription_name=${SUB_NAME}" \
   -var="deletion_protection=${DELETION_PROTECTION}"

@@ -115,4 +115,40 @@ variable "deletion_protection" {
   default     = true
 }
 
+variable "github_minter_gsa_name" {
+  type        = string
+  description = "The name of the Google Service Account for the GitHub Token Minter."
+  default     = "kubeagents-github-minter-gsa"
+}
+
+variable "github_org" {
+  type        = string
+  description = "The GitHub organization/owner name for the Token Minter integration."
+  default     = ""
+}
+
+variable "github_repo" {
+  type        = string
+  description = "The GitHub repository name for the Token Minter integration."
+  default     = ""
+}
+
+variable "github_app_id" {
+  type        = string
+  description = "The GitHub App ID for the Token Minter integration."
+  default     = ""
+}
+
+variable "kms_keyring_name" {
+  type        = string
+  description = "The name of the KMS Keyring for secure token minting."
+  default     = "github-token-minter-keyring"
+}
+
+variable "kms_key_name" {
+  type        = string
+  description = "The name of the KMS cryptographic key for secure token minting."
+  default     = "github-token-minter-key"
+}
+
 

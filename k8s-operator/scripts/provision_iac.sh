@@ -32,10 +32,10 @@ C_WHITE='\033[97m'
 C_RESET='\033[0m'
 C_BOLD='\033[1m'
 
-print_step() { echo -e "\n${C_BOLD}${C_CYAN}>>>  $1  <<<${C_RESET}"; }
-print_success() { echo -e "${C_GREEN}✓ $1${C_RESET}"; }
-print_info() { echo -e "${C_CYAN}ℹ $1${C_RESET}"; }
-print_error() { echo -e "${C_RED}✗ $1${C_RESET}"; }
+print_step() { echo -e "\n${C_BOLD}${C_CYAN}>>>${C_RESET} ${C_BOLD}$1${C_RESET} ${C_BOLD}${C_CYAN}<<<${C_RESET}"; }
+print_success() { echo -e "  ${C_GREEN}✓${C_RESET} $1"; }
+print_info() { echo -e "  ${C_CYAN}ℹ${C_RESET} $1"; }
+print_error() { echo -e "  ${C_RED}✗${C_RESET} $1"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -55,6 +55,10 @@ usage() {
   echo "  -m, --model-provider VALUE     Model Provider: gemini, anthropic, openai, chatgpt (default: gemini)"
   echo "  -d, --model-default-name VALUE Default Model Name (default: gemini-3.5-flash)"
   echo "  -u, --allowed-users VALUE      Comma-separated list of allowed chat users (default: empty/all)"
+  echo "  -go, --github-org VALUE        GitHub Organization/Owner name (for Token Minter)"
+  echo "  -gr, --github-repo VALUE       GitHub Repository name (for Token Minter)"
+  echo "  -ga, --github-app-id VALUE     GitHub App ID (for Token Minter)"
+  echo "  -gp, --github-pem-path VALUE   GitHub App Private Key PEM file path (for KMS import)"
   echo "  -h, --help                     Display this help message and exit"
   echo ""
   exit 1
@@ -68,6 +72,10 @@ NAMESPACE=""
 MODEL_PROVIDER="gemini"
 MODEL_DEFAULT_NAME="gemini-3.5-flash"
 ALLOWED_USERS=""
+GITHUB_ORG=""
+GITHUB_REPO=""
+GITHUB_APP_ID=""
+GITHUB_PEM_PATH=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -98,6 +106,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     -u|--allowed-users)
       ALLOWED_USERS="$2"
+      shift 2
+      ;;
+    -go|--github-org)
+      GITHUB_ORG="$2"
+      shift 2
+      ;;
+    -gr|--github-repo)
+      GITHUB_REPO="$2"
+      shift 2
+      ;;
+    -ga|--github-app-id)
+      GITHUB_APP_ID="$2"
+      shift 2
+      ;;
+    -gp|--github-pem-path)
+      GITHUB_PEM_PATH="$2"
       shift 2
       ;;
     -h|--help)
@@ -135,6 +159,7 @@ if [ "${CLUSTER_NAME}" != "kube-agents-dedicated-cluster" ]; then
   PLATFORM_GSA=$(echo "ka-plat-${SUFFIX}" | cut -c1-30)
   OPERATOR_GSA=$(echo "ka-oper-${SUFFIX}" | cut -c1-30)
   DEVTEAM_GSA=$(echo "ka-dev-${SUFFIX}" | cut -c1-30)
+  GITHUB_MINTER_GSA=$(echo "ka-git-${SUFFIX}" | cut -c1-30)
   TOPIC_NAME="platform-agent-chat-events-${SUFFIX}"
   SUB_NAME="platform-agent-chat-events-sub-${SUFFIX}"
   DELETION_PROTECTION="false"
@@ -143,6 +168,7 @@ else
   PLATFORM_GSA="kubeagents-platform-gsa"
   OPERATOR_GSA="kubeagents-operator-gsa"
   DEVTEAM_GSA="kubeagents-devteam-gsa"
+  GITHUB_MINTER_GSA="kubeagents-github-minter-gsa"
   TOPIC_NAME="platform-agent-chat-events"
   SUB_NAME="platform-agent-chat-events-sub"
   DELETION_PROTECTION="true"
@@ -164,6 +190,10 @@ terraform apply -auto-approve \
   -var="platform_gsa_name=${PLATFORM_GSA}" \
   -var="operator_gsa_name=${OPERATOR_GSA}" \
   -var="devteam_gsa_name=${DEVTEAM_GSA}" \
+  -var="github_minter_gsa_name=${GITHUB_MINTER_GSA}" \
+  -var="github_org=${GITHUB_ORG:-}" \
+  -var="github_repo=${GITHUB_REPO:-}" \
+  -var="github_app_id=${GITHUB_APP_ID:-}" \
   -var="gchat_topic_name=${TOPIC_NAME}" \
   -var="gchat_subscription_name=${SUB_NAME}" \
   -var="deletion_protection=${DELETION_PROTECTION}"
@@ -174,6 +204,9 @@ CONTROLLER_GSA_EMAIL=$(terraform output -raw controller_gsa_email)
 PLATFORM_GSA_EMAIL=$(terraform output -raw platform_agent_gsa_email)
 OPERATOR_GSA_EMAIL=$(terraform output -raw operator_agent_gsa_email)
 DEVTEAM_GSA_EMAIL=$(terraform output -raw devteam_agent_gsa_email)
+GITHUB_MINTER_GSA_EMAIL=$(terraform output -raw github_minter_gsa_email || echo "")
+KMS_KEYRING=$(terraform output -raw kms_keyring || echo "")
+KMS_KEY=$(terraform output -raw kms_key || echo "")
 TOPIC_ID=$(terraform output -raw gchat_pubsub_topic)
 SUB_ID=$(terraform output -raw gchat_pubsub_subscription)
 
@@ -183,6 +216,11 @@ SUB_NAME=$(basename "${SUB_ID}")
 
 print_info "Controller GSA: ${CONTROLLER_GSA_EMAIL}"
 print_info "Platform GSA:   ${PLATFORM_GSA_EMAIL}"
+if [ -n "${GITHUB_ORG}" ]; then
+  print_info "GitHub Minter GSA: ${GITHUB_MINTER_GSA_EMAIL}"
+  print_info "KMS Keyring:       ${KMS_KEYRING}"
+  print_info "KMS Key:           ${KMS_KEY}"
+fi
 print_info "Pub/Sub Topic:  ${TOPIC_NAME}"
 
 # Step 4: Generate Secure API Server Key locally
@@ -199,29 +237,93 @@ KUBE_CONTEXT="gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}"
 print_step "Applying Custom Resource Definitions (CRDs) from config/crd/bases"
 kubectl --context="${KUBE_CONTEXT}" apply -f "${ROOT_DIR}/config/crd/bases/"
 
+# Step 5.6: Securely Import GitHub Private Key into KMS (if provided)
+KMS_KEY_VERSION="1"
+if [ -n "${GITHUB_ORG}" ] && [ -n "${GITHUB_PEM_PATH}" ] && [ -f "${GITHUB_PEM_PATH}" ]; then
+  print_step "Importing GitHub Private Key PEM into KMS via Minty CLI"
+  if ! command -v go &>/dev/null; then
+    print_warning "Go is required to run the Minty CLI tool. Skipping automatic key import."
+  else
+    tmp_dir=$(mktemp -d)
+    print_info "Cloning github-token-minter CLI tool (v2.7.1)..."
+    if git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git "$tmp_dir" >/dev/null 2>&1; then
+      abs_pem=$(realpath "${GITHUB_PEM_PATH}")
+      import_success=0
+      (
+        cd "$tmp_dir"
+        for i in {1..6}; do
+          if go run ./cmd/minty tools import-pk \
+              -project-id="${PROJECT_ID}" \
+              -location="${REGION}" \
+              -key-ring="${KMS_KEYRING}" \
+              -key="${KMS_KEY}" \
+              -private-key="@${abs_pem}"; then
+            exit 0
+          fi
+          echo "  [Retry $i/6] Waiting 5 seconds for KMS Import Job to become ACTIVE..."
+          sleep 5
+        done
+        exit 1
+      ) && import_success=1
+      rm -rf "$tmp_dir"
+      
+      if [ "$import_success" -eq 1 ]; then
+        print_success "Successfully imported GitHub Private Key to KMS."
+        # Resolve the active key version
+        active_ver=$(gcloud kms keys versions list --key="${KMS_KEY}" --keyring="${KMS_KEYRING}" --location="${REGION}" --project="${PROJECT_ID}" --filter="state=ENABLED" --format="value(name)" 2>/dev/null | awk -F'/' '{print $NF}' | sort -n | tail -n 1)
+        if [ -n "$active_ver" ]; then
+          KMS_KEY_VERSION="${active_ver}"
+          print_success "Resolved active KMS key version: ${KMS_KEY_VERSION}"
+        fi
+      else
+        print_error "Failed to import key. Defaulting KMS_KEY_VERSION to 1."
+      fi
+    else
+      rm -rf "$tmp_dir"
+      print_error "Failed to clone minty tool. Defaulting KMS_KEY_VERSION to 1."
+    fi
+  fi
+fi
+
 # Step 6: Deploy Workloads via local Helm CLI
 print_step "Deploying Workloads via Local Helm CLI"
 HELM_CHART_PATH="${ROOT_DIR}/deploy/helm/kube-agents"
 
-helm --kube-context="${KUBE_CONTEXT}" upgrade --install kube-agents "${HELM_CHART_PATH}" \
-  --namespace "${NAMESPACE}" \
-  --create-namespace \
-  --set global.namespace="${NAMESPACE}" \
-  --set projectId="${PROJECT_ID}" \
-  --set clusterName="${CLUSTER_NAME}" \
-  --set clusterLocation="${REGION}" \
-  --set operator.controllerGsaEmail="${CONTROLLER_GSA_EMAIL}" \
-  --set agents.platform.gsaName="${PLATFORM_GSA}" \
-  --set agents.platform.gsaEmail="${PLATFORM_GSA_EMAIL}" \
-  --set agents.operator.gsaEmail="${OPERATOR_GSA_EMAIL}" \
-  --set agents.devteam.gsaEmail="${DEVTEAM_GSA_EMAIL}" \
-  --set model.provider="${MODEL_PROVIDER}" \
-  --set model.defaultName="${MODEL_DEFAULT_NAME}" \
-  --set keys.geminiApiKey="${GEMINI_API_KEY:-placeholder}" \
-  --set keys.apiServerKey="${API_SERVER_KEY}" \
-  --set gchat.topicName="${TOPIC_NAME}" \
-  --set gchat.subscriptionName="${SUB_NAME}" \
-  --set gchat.allowedUsers="${ALLOWED_USERS}"
+HELM_ARGS=(
+  "--namespace" "${NAMESPACE}"
+  "--create-namespace"
+  "--set" "global.namespace=${NAMESPACE}"
+  "--set" "projectId=${PROJECT_ID}"
+  "--set" "clusterName=${CLUSTER_NAME}"
+  "--set" "clusterLocation=${REGION}"
+  "--set" "operator.controllerGsaEmail=${CONTROLLER_GSA_EMAIL}"
+  "--set" "agents.platform.gsaName=${PLATFORM_GSA}"
+  "--set" "agents.platform.gsaEmail=${PLATFORM_GSA_EMAIL}"
+  "--set" "agents.operator.gsaEmail=${OPERATOR_GSA_EMAIL}"
+  "--set" "agents.devteam.gsaEmail=${DEVTEAM_GSA_EMAIL}"
+  "--set" "model.provider=${MODEL_PROVIDER}"
+  "--set" "model.defaultName=${MODEL_DEFAULT_NAME}"
+  "--set" "keys.geminiApiKey=${GEMINI_API_KEY:-placeholder}"
+  "--set" "keys.apiServerKey=${API_SERVER_KEY}"
+  "--set" "gchat.topicName=${TOPIC_NAME}"
+  "--set" "gchat.subscriptionName=${SUB_NAME}"
+  "--set" "gchat.allowedUsers=${ALLOWED_USERS}"
+)
+
+if [ -n "${GITHUB_ORG}" ]; then
+  HELM_ARGS+=(
+    "--set" "githubMinter.enabled=true"
+    "--set" "githubMinter.gsaEmail=${GITHUB_MINTER_GSA_EMAIL}"
+    "--set" "githubMinter.kmsKeyring=${KMS_KEYRING}"
+    "--set" "githubMinter.kmsKey=${KMS_KEY}"
+    "--set" "githubMinter.kmsKeyVersion=${KMS_KEY_VERSION}"
+    "--set" "githubMinter.githubOrg=${GITHUB_ORG}"
+    "--set" "githubMinter.githubRepo=${GITHUB_REPO}"
+    "--set" "githubMinter.githubAppId=${GITHUB_APP_ID}"
+  )
+fi
+
+helm --kube-context="${KUBE_CONTEXT}" upgrade --install kube-agents "${HELM_CHART_PATH}" "${HELM_ARGS[@]}"
 
 # Step 6.5: Force rollout restart of deployments to refresh secrets in running pods
 print_step "Forcing rollout restart of deployments to refresh secrets"
@@ -263,36 +365,47 @@ print_step "Final Status of Pods in Namespace ${NAMESPACE}"
 kubectl --context="${KUBE_CONTEXT}" get pods -n "${NAMESPACE}"
 
 print_success "End-to-End Hybrid Deployment completed and verified successfully!"
-echo -e "\n${C_BOLD}${C_GREEN}Your kube-agents operator, LiteLLM gateway, and Platform Agent bot are fully deployed and running in a dedicated new GKE cluster!${C_RESET}"
+echo -e "\n${C_BOLD}Your kube-agents operator, LiteLLM gateway, and Platform Agent bot are fully deployed and running in a dedicated new GKE cluster!${C_RESET}"
 
-echo -e "\n${C_YELLOW}${C_BOLD}======================= START COPY&PASTE =======================${C_RESET}"
-echo -e "${C_YELLOW}Your Kubernetes Operator and Custom Resources are ready!${C_RESET}"
+echo -e "\n${C_BOLD}======================= START COPY&PASTE =======================${C_RESET}"
+echo -e "${C_BOLD}Your Kubernetes Operator and Custom Resources are ready!${C_RESET}"
 echo -e "Next steps to configure and interact with your bot:\n"
 
 echo -e "[ ] 1. Configure GChat bot connection in GCP Console:"
-echo -e "       ${C_WHITE}https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${PROJECT_ID}${C_RESET}"
-echo -e "       - Name: ${C_GREEN}GKE Platform Agent Bot${C_RESET}"
-echo -e "       - Avatar: ${C_GREEN}https://platform-agent.nousresearch.com/docs/img/logo.png${C_RESET}"
-echo -e "       - Connection Settings: Select ${C_BOLD}Cloud Pub/Sub${C_RESET}"
-echo -e "       - Pub/Sub Topic Name: ${C_GREEN}projects/${PROJECT_ID}/topics/${TOPIC_NAME}${C_RESET}"
-echo -e "       - Under Visibility, check: ${C_GREEN}Only specific people (add your email/emails: ${ALLOWED_USERS:-your-email})${C_RESET}"
+echo -e "       Link: https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${PROJECT_ID}"
+echo -e "       - Application Info -> App name: ${C_BOLD}GKE Platform Agent Bot${C_RESET}"
+echo -e "       - Application Info -> Avatar URL: ${C_BOLD}https://platform-agent.nousresearch.com/docs/img/logo.png${C_RESET}"
+echo -e "       - Connection settings -> Interactive features: ${C_BOLD}Enabled${C_RESET}"
+echo -e "       - Connection settings -> Connection type: Select ${C_BOLD}Cloud Pub/Sub${C_RESET}"
+echo -e "       - Connection settings -> Pub/Sub Topic Name: ${C_BOLD}projects/${PROJECT_ID}/topics/${TOPIC_NAME}${C_RESET}"
+echo -e "       - Visibility -> Check: ${C_BOLD}Only specific people and groups in your organization${C_RESET}"
+echo -e "         (Add your email: ${C_BOLD}${ALLOWED_USERS:-your-email}${C_RESET})"
 
 echo -e ""
-echo -e "[ ] 2. Send a DM to the Bot on Google Chat:"
-echo -e "       Type: ${C_WHITE}\"Hi Hermes\"${C_RESET}"
+echo -e "[ ] 2. Test & Connect to the Chat App (from an allowed user's account):"
+echo -e "       As per https://developers.google.com/workspace/chat/quickstart/gcf-app#test-your-chat-app :"
+echo -e "       a. Open Google Chat: ${C_BOLD}https://chat.google.com${C_RESET} (or open Chat inside Gmail)"
+echo -e "       b. Click the ${C_BOLD}New chat${C_RESET} (+) button."
+echo -e "       c. In the ${C_BOLD}Add 1 or more people${C_RESET} field, search for: ${C_BOLD}GKE Platform Agent Bot${C_RESET}"
+echo -e "       d. Select the app from the search results to start a direct message."
+echo -e "       e. Send a message to the bot (e.g. type: ${C_BOLD}\"Hi Hermes\"${C_RESET})."
+echo -e "       ${C_CYAN}Note: It may take up to 2-3 minutes after GCP Console configuration for the bot to become active and respond.${C_RESET}"
 
 echo -e ""
-echo -e "[ ] 3. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container:"
-echo -e "       ${C_CYAN}(Only required for first-time bot deployments. If the bot responds instantly, skip this!)${C_RESET}"
-echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
+echo -e "[ ] 3. Approve the PAIRING_CODE in GKE (if prompted):"
+echo -e "       - If the bot's first response in Google Chat asks you to approve a pairing code, copy the code."
+echo -e "       - Run the following command in your terminal to approve it:"
+echo -e "         kubectl exec -it -n ${NAMESPACE} --context=${KUBE_CONTEXT} deploy/platform-agent-gateway -c platform-agent -- hermes pairing approve google_chat <PAIRING_CODE>"
+echo -e "       - ${C_BOLD}Note:${C_RESET} If the bot responds instantly with a normal message and does not ask for a pairing code, you can skip this step."
+
 if [ "$MODEL_PROVIDER" = "chatgpt" ]; then
   echo -e ""
-  echo -e "[ ] 4. ${C_YELLOW}Complete ChatGPT OAuth Device Flow Authentication:${C_RESET}"
+  echo -e "[ ] 4. ${C_BOLD}Complete ChatGPT OAuth Device Flow Authentication:${C_RESET}"
   echo -e "       Because you selected 'chatgpt' as the model provider, LiteLLM must be authenticated"
   echo -e "       via OpenAI's OAuth Device Flow. Please follow these steps to authenticate:"
   echo -e "       - View the LiteLLM gateway logs to retrieve the 8-digit user code:"
-  echo -e "         ${C_WHITE}kubectl logs -n ${NAMESPACE} deployment/litellm -f${C_RESET}"
-  echo -e "       - Open your browser and navigate to: ${C_WHITE}https://auth.openai.com/codex/device${C_RESET}"
+  echo -e "         kubectl logs -n ${NAMESPACE} --context=${KUBE_CONTEXT} deployment/litellm -f"
+  echo -e "       - Open your browser and navigate to: https://auth.openai.com/codex/device"
   echo -e "       - Enter the code displayed in the LiteLLM logs and log in to authorize the device."
   echo -e "       - Once authorized, the LiteLLM gateway will automatically pair with your ChatGPT subscription."
 fi

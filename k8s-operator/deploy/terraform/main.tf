@@ -11,7 +11,8 @@ resource "google_project_service" "apis" {
     "pubsub.googleapis.com",
     "chat.googleapis.com",
     "gsuiteaddons.googleapis.com",
-    "cloudresourcemanager.googleapis.com"
+    "cloudresourcemanager.googleapis.com",
+    "cloudkms.googleapis.com"
   ])
   project            = var.project_id
   service            = each.value
@@ -106,7 +107,8 @@ locals {
     "roles/container.admin",
     "roles/monitoring.admin",
     "roles/logging.admin",
-    "roles/iam.serviceAccountUser"
+    "roles/iam.serviceAccountUser",
+    "roles/iam.securityReviewer"
   ]
   operator_roles = [
     "roles/container.clusterViewer",
@@ -222,4 +224,71 @@ resource "google_pubsub_subscription_iam_member" "agent_viewer" {
   project      = var.project_id
   role         = "roles/pubsub.viewer"
   member       = "serviceAccount:${google_service_account.platform_agent.email}"
+}
+
+# ==============================================================================
+# 🤖 GitHub Token Minter Integration (Optional)
+# ==============================================================================
+
+resource "google_service_account" "github_minter" {
+  count        = var.github_org != "" ? 1 : 0
+  account_id   = var.github_minter_gsa_name
+  display_name = "GitHub Token Minter GSA"
+  project      = var.project_id
+}
+
+resource "google_service_account_iam_member" "github_minter_wi" {
+  count              = var.github_org != "" ? 1 : 0
+  service_account_id = google_service_account.github_minter[0].name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.namespace}/kubeagents-github-minter]"
+}
+
+resource "google_kms_key_ring" "github_minter" {
+  count    = var.github_org != "" ? 1 : 0
+  name     = var.kms_keyring_name
+  location = var.region
+  project  = var.project_id
+
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_kms_crypto_key" "github_minter" {
+  count    = var.github_org != "" ? 1 : 0
+  name     = var.kms_key_name
+  key_ring = google_kms_key_ring.github_minter[0].id
+  purpose  = "ASYMMETRIC_SIGNING"
+
+  version_template {
+    algorithm        = "RSA_SIGN_PKCS1_2048_SHA256"
+    protection_level = "SOFTWARE"
+  }
+
+  import_only = true
+}
+
+resource "google_kms_crypto_key_iam_member" "github_minter_signer" {
+  count         = var.github_org != "" ? 1 : 0
+  crypto_key_id = google_kms_crypto_key.github_minter[0].id
+  role          = "roles/cloudkms.signerVerifier"
+  member        = "serviceAccount:${google_service_account.github_minter[0].email}"
+}
+
+# ==============================================================================
+# 🤖 Outputs
+# ==============================================================================
+
+output "github_minter_gsa_email" {
+  value       = var.github_org != "" ? google_service_account.github_minter[0].email : ""
+  description = "The email of the GitHub Token Minter GSA."
+}
+
+output "kms_keyring" {
+  value       = var.github_org != "" ? google_kms_key_ring.github_minter[0].name : ""
+  description = "The name of the KMS Keyring."
+}
+
+output "kms_key" {
+  value       = var.github_org != "" ? google_kms_crypto_key.github_minter[0].name : ""
+  description = "The name of the KMS Key."
 }

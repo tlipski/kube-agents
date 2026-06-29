@@ -29,13 +29,16 @@ The GCP infrastructure layer is managed by Terraform. It enables target GCP APIs
    terraform init
    ```
 
-3. Provision the GCP resources. Make sure to specify your target Project ID, Region, Cluster Name, and Namespace:
+3. Provision the GCP resources. Make sure to specify your target Project ID, Region, Cluster Name, and Namespace. Optionally, specify your GitHub organization, repository, and App ID to provision resources for the GitHub Token Minter:
    ```bash
    terraform apply \
      -var="project_id=YOUR_PROJECT_ID" \
      -var="region=YOUR_GCP_REGION" \
      -var="cluster_name=YOUR_CLUSTER_NAME" \
-     -var="namespace=YOUR_NAMESPACE"
+     -var="namespace=YOUR_NAMESPACE" \
+     -var="github_org=OPTIONAL_GITHUB_ORG" \
+     -var="github_repo=OPTIONAL_GITHUB_REPO" \
+     -var="github_app_id=OPTIONAL_GITHUB_APP_ID"
    ```
    *Example:*
    ```bash
@@ -43,7 +46,10 @@ The GCP infrastructure layer is managed by Terraform. It enables target GCP APIs
      -var="project_id=tomeklipski-izrhgv" \
      -var="region=us-east4" \
      -var="cluster_name=kube-agents-dedicated-cluster" \
-     -var="namespace=kubeagents-system"
+     -var="namespace=kubeagents-system" \
+     -var="github_org=my-github-org" \
+     -var="github_repo=my-github-repo" \
+     -var="github_app_id=123456"
    ```
 
 4. Keep this terminal open or note down the **Outputs** displayed at the end of the `terraform apply` run. You will need them in Step 4.
@@ -89,7 +95,24 @@ We will generate a secure API Server Key, read the GCP Service Account emails fr
    terraform output
    ```
 
-3. Run the `helm upgrade --install` command to deploy the entire stack. Replace the GSA email outputs, project details, and your real API keys:
+3. If you enabled the GitHub Token Minter, you must import your GitHub App private key PEM into Google Cloud KMS before deploying the workloads. Run the following command:
+   ```bash
+   git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty
+   cd /tmp/minty
+   go run ./cmd/minty tools import-pk \
+     -project-id="YOUR_PROJECT_ID" \
+     -location="YOUR_GCP_REGION" \
+     -key-ring="OUTPUT_KMS_KEYRING" \
+     -key="OUTPUT_KMS_KEY" \
+     -private-key="@/path/to/your/github-app-private-key.pem"
+   ```
+   *Note:* After a successful import, resolve the active version number:
+   ```bash
+   gcloud kms keys versions list --key="OUTPUT_KMS_KEY" --keyring="OUTPUT_KMS_KEYRING" --location="YOUR_GCP_REGION" --project="YOUR_PROJECT_ID" --filter="state=ENABLED" --format="value(name)" | awk -F'/' '{print $NF}' | sort -n | tail -n 1
+   ```
+   This version number (usually `1` on first import) must be passed to Helm as `KMS_KEY_VERSION`.
+
+4. Run the `helm upgrade --install` command to deploy the entire stack. Replace the GSA email outputs, project details, and your real API keys. If the GitHub Token Minter is enabled, pass its configuration parameters:
    ```bash
    helm upgrade --install kube-agents ../helm/kube-agents \
      --namespace "YOUR_NAMESPACE" \
@@ -107,7 +130,15 @@ We will generate a secure API Server Key, read the GCP Service Account emails fr
      --set keys.geminiApiKey="YOUR_GEMINI_API_KEY" \
      --set keys.apiServerKey="${API_SERVER_KEY}" \
      --set gchat.topicName="platform-agent-chat-events" \
-     --set gchat.subscriptionName="platform-agent-chat-events-sub"
+     --set gchat.subscriptionName="platform-agent-chat-events-sub" \
+     --set githubMinter.enabled=true \
+     --set githubMinter.gsaEmail="OUTPUT_GITHUB_MINTER_GSA_EMAIL" \
+     --set githubMinter.kmsKeyring="OUTPUT_KMS_KEYRING" \
+     --set githubMinter.kmsKey="OUTPUT_KMS_KEY" \
+     --set githubMinter.kmsKeyVersion="KMS_KEY_VERSION" \
+     --set githubMinter.githubOrg="YOUR_GITHUB_ORG" \
+     --set githubMinter.githubRepo="YOUR_GITHUB_REPO" \
+     --set githubMinter.githubAppId="YOUR_GITHUB_APP_ID"
    ```
 
 ---
