@@ -43,7 +43,7 @@ The GCP infrastructure layer is managed by Terraform. It enables target GCP APIs
    *Example:*
    ```bash
    terraform apply \
-     -var="project_id=tomeklipski-izrhgv" \
+     -var="project_id=my-project-123" \
      -var="region=us-east4" \
      -var="cluster_name=kube-agents-dedicated-cluster" \
      -var="namespace=kubeagents-system" \
@@ -69,7 +69,7 @@ gcloud container clusters get-credentials YOUR_CLUSTER_NAME \
 ```bash
 gcloud container clusters get-credentials kube-agents-dedicated-cluster \
   --region us-east4 \
-  --project tomeklipski-izrhgv
+  --project my-project-123
 ```
 
 Verify you can connect to the cluster and list the nodes:
@@ -155,23 +155,3 @@ You should see the following pods in the `Running` state:
 * `kubeagents-controller-manager-...` (The operator)
 * `litellm-...` (LiteLLM gateway - 2 replicas)
 * `platform-agent-gateway-...` (The platform agent bot gateway - 2/2 containers running)
-
----
-
-## Step 6: Verify Agent Responsiveness (E2E API Test)
-
-You can easily test the entire stack end-to-end by running our verification script. This script automatically handles GKE authentication, establishes a secure port-forwarding tunnel to the internal agent service, and queries Gemini:
-
-```bash
-./scripts/verify_agents.py \
-  --cluster-name "YOUR_CLUSTER_NAME" \
-  --region "YOUR_GCP_REGION" \
-  --project-id "YOUR_PROJECT_ID"
-```
-*Example:*
-```bash
-./scripts/verify_agents.py \
-  --cluster-name "kube-agents-dedicated-cluster" \
-  --region "us-east4" \
-  --project-id "tomeklipski-izrhgv"
-```

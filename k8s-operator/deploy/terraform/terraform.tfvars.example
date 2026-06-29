@@ -1,5 +1,5 @@
 # Target Google Cloud Project and GKE settings
-project_id   = "tomeklipski-izrhgv"
+project_id   = "my-project-123"
 region       = "us-east4"
 cluster_name = "kube-agents-dedicated-cluster"
 
