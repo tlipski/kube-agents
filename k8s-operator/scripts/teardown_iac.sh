@@ -5,16 +5,6 @@
 set -euo pipefail
 
 # Google Environment Terraform Wrapper Function with state isolation
-terraform() {
-  local cmd="$1"
-  shift
-  if [[ "$cmd" == "apply" || "$cmd" == "output" || "$cmd" == "destroy" || "$cmd" == "plan" ]]; then
-    /google/bin/releases/g3terraform/runner_main --base_service_dir="$(pwd)" --tf_label='terraform_1_13_5' "$cmd" -state="terraform.tfstate.${CLUSTER_NAME}" "$@"
-  else
-    /google/bin/releases/g3terraform/runner_main --base_service_dir="$(pwd)" --tf_label='terraform_1_13_5' "$cmd" "$@"
-  fi
-}
-
 # Clear HTTP/HTTPS proxy variables
 export HTTP_PROXY=""
 export HTTPS_PROXY=""
@@ -157,6 +147,7 @@ cd "${TF_DIR}"
 # Run Terraform Destroy
 print_step "Running Terraform Destroy"
 terraform destroy -auto-approve \
+  -state="terraform.tfstate.${CLUSTER_NAME}" \
   -var="project_id=${PROJECT_ID}" \
   -var="region=${REGION}" \
   -var="cluster_name=${CLUSTER_NAME}" \

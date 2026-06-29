@@ -5,16 +5,6 @@
 set -euo pipefail
 
 # Google Environment Terraform Wrapper Function with state isolation
-terraform() {
-  local cmd="$1"
-  shift
-  if [[ "$cmd" == "apply" || "$cmd" == "output" || "$cmd" == "destroy" || "$cmd" == "plan" ]]; then
-    /google/bin/releases/g3terraform/runner_main --base_service_dir="$(pwd)" --tf_label='terraform_1_13_5' "$cmd" -state="terraform.tfstate.${CLUSTER_NAME}" "$@"
-  else
-    /google/bin/releases/g3terraform/runner_main --base_service_dir="$(pwd)" --tf_label='terraform_1_13_5' "$cmd" "$@"
-  fi
-}
-
 # Clear HTTP/HTTPS proxy variables for local commands to ensure direct connections
 # to GKE control plane endpoints bypass any corporate proxies.
 export HTTP_PROXY=""
@@ -182,6 +172,7 @@ terraform init
 # Step 2: Apply Terraform Configuration (Only GCP Infrastructure)
 print_step "Applying Terraform Configuration (GCP Resources & GKE Cluster)"
 terraform apply -auto-approve \
+  -state="terraform.tfstate.${CLUSTER_NAME}" \
   -var="project_id=${PROJECT_ID}" \
   -var="region=${REGION}" \
   -var="cluster_name=${CLUSTER_NAME}" \
@@ -200,15 +191,19 @@ terraform apply -auto-approve \
 
 # Step 3: Read Terraform Outputs
 print_step "Reading Terraform Outputs for Workload Configuration"
-CONTROLLER_GSA_EMAIL=$(terraform output -raw controller_gsa_email)
-PLATFORM_GSA_EMAIL=$(terraform output -raw platform_agent_gsa_email)
-OPERATOR_GSA_EMAIL=$(terraform output -raw operator_agent_gsa_email)
-DEVTEAM_GSA_EMAIL=$(terraform output -raw devteam_agent_gsa_email)
-GITHUB_MINTER_GSA_EMAIL=$(terraform output -raw github_minter_gsa_email || echo "")
-KMS_KEYRING=$(terraform output -raw kms_keyring || echo "")
-KMS_KEY=$(terraform output -raw kms_key || echo "")
-TOPIC_ID=$(terraform output -raw gchat_pubsub_topic)
-SUB_ID=$(terraform output -raw gchat_pubsub_subscription)
+tf_output() {
+  terraform output -state="terraform.tfstate.${CLUSTER_NAME}" "$@"
+}
+
+CONTROLLER_GSA_EMAIL=$(tf_output -raw controller_gsa_email)
+PLATFORM_GSA_EMAIL=$(tf_output -raw platform_agent_gsa_email)
+OPERATOR_GSA_EMAIL=$(tf_output -raw operator_agent_gsa_email)
+DEVTEAM_GSA_EMAIL=$(tf_output -raw devteam_agent_gsa_email)
+GITHUB_MINTER_GSA_EMAIL=$(tf_output -raw github_minter_gsa_email || echo "")
+KMS_KEYRING=$(tf_output -raw kms_keyring || echo "")
+KMS_KEY=$(tf_output -raw kms_key || echo "")
+TOPIC_ID=$(tf_output -raw gchat_pubsub_topic)
+SUB_ID=$(tf_output -raw gchat_pubsub_subscription)
 
 # Extract short resource names from the full GCP resource paths
 TOPIC_NAME=$(basename "${TOPIC_ID}")
