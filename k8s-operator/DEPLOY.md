@@ -1,0 +1,146 @@
+# Manual Deployment Guide: kube-agents
+
+This guide provides step-by-step instructions on how to manually deploy the GKE Platform Agent and Operator stack using **Terraform**, **Helm**, and **kubectl** directly, rather than using the automated `deploy_e2e_iac.sh` orchestrator.
+
+---
+
+## Prerequisites
+
+Ensure you have the following CLI tools installed on your local workstation:
+* [Google Cloud SDK (gcloud)](https://cloud.google.com/sdk/docs/install)
+* [Terraform (>= 1.3.0)](https://developer.hashicorp.com/terraform/downloads)
+* [Helm (>= 3.0.0)](https://helm.sh/docs/intro/install/)
+* [kubectl](https://kubernetes.io/docs/tasks/tools/)
+* [openssl](https://www.openssl.org/) (for generating API server keys)
+
+---
+
+## Step 1: Provision GCP Infrastructure with Terraform
+
+The GCP infrastructure layer is managed by Terraform. It enables target GCP APIs, provisions the dedicated GKE Standard cluster, creates the four Google Service Accounts (GSAs), configures Workload Identity bindings, and sets up the Google Chat Pub/Sub topic and subscription.
+
+1. Navigate to the Terraform directory:
+   ```bash
+   cd k8s-operator/deploy/terraform
+   ```
+
+2. Initialize the Terraform backend and provider plugins:
+   ```bash
+   terraform init
+   ```
+
+3. Provision the GCP resources. Make sure to specify your target Project ID, Region, Cluster Name, and Namespace:
+   ```bash
+   terraform apply \
+     -var="project_id=YOUR_PROJECT_ID" \
+     -var="region=YOUR_GCP_REGION" \
+     -var="cluster_name=YOUR_CLUSTER_NAME" \
+     -var="namespace=YOUR_NAMESPACE"
+   ```
+   *Example:*
+   ```bash
+   terraform apply \
+     -var="project_id=tomeklipski-izrhgv" \
+     -var="region=us-east4" \
+     -var="cluster_name=kube-agents-dedicated-cluster" \
+     -var="namespace=kubeagents-system"
+   ```
+
+4. Keep this terminal open or note down the **Outputs** displayed at the end of the `terraform apply` run. You will need them in Step 4.
+
+---
+
+## Step 2: Configure kubectl Credentials
+
+Connect your local `kubectl` client to the newly created GKE cluster:
+
+```bash
+gcloud container clusters get-credentials YOUR_CLUSTER_NAME \
+  --region YOUR_GCP_REGION \
+  --project YOUR_PROJECT_ID
+```
+*Example:*
+```bash
+gcloud container clusters get-credentials kube-agents-dedicated-cluster \
+  --region us-east4 \
+  --project tomeklipski-izrhgv
+```
+
+Verify you can connect to the cluster and list the nodes:
+```bash
+kubectl get nodes
+```
+
+## Step 3: Generate API Key & Deploy the Workloads via Helm
+
+Now, we deploy the Helm chart. The Helm chart will **automatically create and manage every single Kubernetes resource**, including the namespace (`kubeagents-system`) and the API secrets (`platform-agent-secrets`). There is no need to run manual `kubectl create` commands.
+
+We will generate a secure API Server Key, read the GCP Service Account emails from the **Terraform Outputs** (Step 1), and pass all credentials directly to Helm.
+
+1. Generate a secure, 16-byte random hex key locally:
+   ```bash
+   API_SERVER_KEY=$(openssl rand -hex 16)
+   echo "Your API Server Key is: ${API_SERVER_KEY}"
+   ```
+
+2. If you need to view the Terraform outputs again, run `terraform output` from the `deploy/terraform` directory:
+   ```bash
+   cd k8s-operator/deploy/terraform
+   terraform output
+   ```
+
+3. Run the `helm upgrade --install` command to deploy the entire stack. Replace the GSA email outputs, project details, and your real API keys:
+   ```bash
+   helm upgrade --install kube-agents ../helm/kube-agents \
+     --namespace "YOUR_NAMESPACE" \
+     --create-namespace \
+     --set projectId="YOUR_PROJECT_ID" \
+     --set clusterName="YOUR_CLUSTER_NAME" \
+     --set clusterLocation="YOUR_GCP_REGION" \
+     --set operator.controllerGsaEmail="OUTPUT_CONTROLLER_GSA_EMAIL" \
+     --set agents.platform.gsaName="kubeagents-platform-gsa" \
+     --set agents.platform.gsaEmail="OUTPUT_PLATFORM_AGENT_GSA_EMAIL" \
+     --set agents.operator.gsaEmail="OUTPUT_OPERATOR_AGENT_GSA_EMAIL" \
+     --set agents.devteam.gsaEmail="OUTPUT_DEVTEAM_AGENT_GSA_EMAIL" \
+     --set model.provider="gemini" \
+     --set model.defaultName="gemini-3.5-flash" \
+     --set keys.geminiApiKey="YOUR_GEMINI_API_KEY" \
+     --set keys.apiServerKey="${API_SERVER_KEY}" \
+     --set gchat.topicName="platform-agent-chat-events" \
+     --set gchat.subscriptionName="platform-agent-chat-events-sub"
+   ```
+
+---
+
+## Step 5: Verify the Rollout
+
+Verify that all pods are successfully created and running:
+
+```bash
+kubectl get pods -n YOUR_NAMESPACE
+```
+
+You should see the following pods in the `Running` state:
+* `kubeagents-controller-manager-...` (The operator)
+* `litellm-...` (LiteLLM gateway - 2 replicas)
+* `platform-agent-gateway-...` (The platform agent bot gateway - 2/2 containers running)
+
+---
+
+## Step 6: Verify Agent Responsiveness (E2E API Test)
+
+You can easily test the entire stack end-to-end by running our verification script. This script automatically handles GKE authentication, establishes a secure port-forwarding tunnel to the internal agent service, and queries Gemini:
+
+```bash
+./scripts/verify_agents.py \
+  --cluster-name "YOUR_CLUSTER_NAME" \
+  --region "YOUR_GCP_REGION" \
+  --project-id "YOUR_PROJECT_ID"
+```
+*Example:*
+```bash
+./scripts/verify_agents.py \
+  --cluster-name "kube-agents-dedicated-cluster" \
+  --region "us-east4" \
+  --project-id "tomeklipski-izrhgv"
+```
