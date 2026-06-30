@@ -37,3 +37,8 @@ output "devteam_agent_gsa_email" {
   value       = google_service_account.devteam_agent.email
   description = "The email of the DevTeam Agent GSA."
 }
+
+output "gke_cluster_ca_certificate" {
+  value       = google_container_cluster.primary.master_auth[0].cluster_ca_certificate
+  description = "The CA certificate of the GKE cluster."
+}

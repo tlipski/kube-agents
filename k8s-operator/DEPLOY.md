@@ -1,154 +1,262 @@
-# Manual Deployment Guide: kube-agents
+# Deployment Guide: kube-agents
 
-This guide provides step-by-step instructions on how to manually deploy the GKE Platform Agent and Operator stack using **Terraform**, **Helm**, and **kubectl** directly, rather than using the automated `deploy_e2e_iac.sh` orchestrator.
+This guide provides instructions on how to deploy the GKE Platform Agent and Operator stack. 
+
+Depending on your development environment and security constraints, you can choose from five different deployment methods.
 
 ---
 
-## Prerequisites
+## Choosing Your Deployment Method
 
-Ensure you have the following CLI tools installed on your local workstation:
+| Method | Best For | State Management | Prerequisites |
+| :--- | :--- | :--- | :--- |
+| **[1. Google Cloud Shell (Baseline)](#method-1-google-cloud-shell-baseline-scripts)** | Quick, simple procedural deployment in Google Cloud Shell without Terraform. | **None** (Procedural `gcloud` and `helm` calls) | Google Cloud Shell. |
+| **[2. IaC Scripts (Local Workstation)](#method-2-iac-scripts-local-workstation)** | Unrestricted workstations (no CAA) wanting fast local iteration using Terraform. | **Local File** (Stored in `deploy/terraform/`) | Local `gcloud`, `terraform`, `helm`, `kubectl`. |
+| **[3. Manual Step-by-Step](#method-3-manual-step-by-step-deployment-alternative)** | Debugging, learning the architecture, or custom fine-grained resource changes. | **Local File** (Must be managed manually) | Local `gcloud`, `terraform`, `helm`, `kubectl`. |
+| **[4. Cloud Shell (IaC Wrapper)](#method-4-automated-deployment-via-google-cloud-shell-iac-wrapper)** | Working from Cloud Shell with Terraform, utilizing an existing host cluster for state. | **Automated** (Stored in GKE host cluster Secret) | Google Cloud Shell, `kubectl` access to host cluster. |
+| **[5. Cloud Shell (Raw IaC Scripts)](#method-5-google-cloud-shell-raw-iac-scripts)** | Bootstrapping your very first GKE cluster from Cloud Shell using Terraform (no host cluster yet). | **Local File** (Stored on Cloud Shell VM home directory) | Google Cloud Shell. |
+
+---
+
+## Method 1: Google Cloud Shell (Baseline Scripts)
+
+This is the simplest way to deploy the stack if you are working from **Google Cloud Shell** and do not want to use Terraform. It uses a series of procedural bash scripts to bootstrap the GKE cluster, configure IAM, and deploy the workloads via Helm.
+
+### Step 1.1: Clone the Repository
+
+Open Google Cloud Shell and clone the repository:
+
+```bash
+git clone https://github.com/gke-labs/kube-agents.git
+cd kube-agents
+```
+
+### Step 1.2: Run the Provisioning Script
+
+Run the master provisioner script:
+
+```bash
+# Ensure your GEMINI_API_KEY is set
+export GEMINI_API_KEY="your-api-key"
+
+./k8s-operator/scripts/provision.sh [arguments]
+```
+
+This script will sequentially execute the bootstrap scripts (`provision_01_...` through `provision_08_...`) to set up the GKE cluster, build the operator image, configure IAM, Pub/Sub, and deploy the Helm chart.
+
+### Step 1.3: Run the Teardown Script (Optional)
+
+To destroy the cluster and all associated resources, run:
+
+```bash
+./k8s-operator/scripts/teardown.sh [arguments]
+```
+
+---
+
+## Method 2: IaC Scripts (Local Workstation)
+
+If your local workstation does not have security policies (like CAA) blocking GCP API calls, you can run the IaC scripts directly from your terminal. This uses Terraform to manage the GKE cluster and IAM, and Helm for the workloads.
+
+*Note: The Terraform state is stored as a local file on your machine.*
+
+### Step 2.1: Run the Provisioning Script
+
+Run [provision_iac.sh](scripts/provision_iac.sh) directly:
+
+```bash
+# Ensure your GEMINI_API_KEY is set
+export GEMINI_API_KEY="your-api-key"
+
+./k8s-operator/scripts/provision_iac.sh [arguments]
+```
+
+#### Required Arguments:
+*   `-p, --project-id VALUE`: Target GCP Project ID.
+*   `-r, --region VALUE`: GCP Region for the target GKE cluster (e.g., `us-east4`).
+*   `-c, --cluster-name VALUE`: Target GKE Cluster Name.
+*   `-n, --namespace VALUE`: Kubernetes namespace for the workloads (e.g., `kubeagents-system`).
+
+#### Optional Arguments:
+*   `-m, --model-provider VALUE`: Model Provider: `gemini`, `anthropic`, `openai`, `chatgpt` (default: `gemini`).
+*   `-d, --model-default-name VALUE`: Default Model Name (default: `gemini-3.5-flash`).
+*   `-u, --allowed-users VALUE`: Comma-separated list of allowed Google Chat users.
+*   `-go, --github-org VALUE`, `-gr, --github-repo VALUE`, `-ga, --github-app-id VALUE`, `-gp, --github-pem-path VALUE`: GitHub integration settings.
+
+*Example:*
+```bash
+./k8s-operator/scripts/provision_iac.sh \
+  -p your-project-id \
+  -r us-east4 \
+  -c kube-agents-dedicated-cluster \
+  -n kubeagents-system
+```
+
+### Step 2.2: Run the Teardown Script (Optional)
+
+To destroy the target GKE cluster and all associated GCP resources, run [teardown_iac.sh](scripts/teardown_iac.sh):
+
+```bash
+./k8s-operator/scripts/teardown_iac.sh [arguments]
+```
+
+*Note: You must keep the local `terraform.tfstate.<cluster-name>` file located in `deploy/terraform/` safe.*
+
+---
+
+## Method 3: Manual Step-by-Step Deployment (Alternative)
+
+This section provides step-by-step instructions on how to manually deploy the stack using Terraform and Helm directly from your local workstation. This is useful for debugging or custom configurations.
+
+### Prerequisites
+
+Ensure you have the following CLI tools installed locally:
 * [Google Cloud SDK (gcloud)](https://cloud.google.com/sdk/docs/install)
 * [Terraform (>= 1.3.0)](https://developer.hashicorp.com/terraform/downloads)
 * [Helm (>= 3.0.0)](https://helm.sh/docs/intro/install/)
 * [kubectl](https://kubernetes.io/docs/tasks/tools/)
-* [openssl](https://www.openssl.org/) (for generating API server keys)
+* [openssl](https://www.openssl.org/) (for generating API keys)
 
----
-
-## Step 1: Provision GCP Infrastructure with Terraform
-
-The GCP infrastructure layer is managed by Terraform. It enables target GCP APIs, provisions the dedicated GKE Standard cluster, creates the four Google Service Accounts (GSAs), configures Workload Identity bindings, and sets up the Google Chat Pub/Sub topic and subscription.
+### Step 3.1: Provision GCP Infrastructure with Terraform
 
 1. Navigate to the Terraform directory:
    ```bash
    cd k8s-operator/deploy/terraform
    ```
 
-2. Initialize the Terraform backend and provider plugins:
+2. Initialize and apply:
    ```bash
    terraform init
-   ```
-
-3. Provision the GCP resources. Make sure to specify your target Project ID, Region, Cluster Name, and Namespace. Optionally, specify your GitHub organization, repository, and App ID to provision resources for the GitHub Token Minter:
-   ```bash
    terraform apply \
-     -var="project_id=YOUR_PROJECT_ID" \
-     -var="region=YOUR_GCP_REGION" \
-     -var="cluster_name=YOUR_CLUSTER_NAME" \
-     -var="namespace=YOUR_NAMESPACE" \
-     -var="github_org=OPTIONAL_GITHUB_ORG" \
-     -var="github_repo=OPTIONAL_GITHUB_REPO" \
-     -var="github_app_id=OPTIONAL_GITHUB_APP_ID"
-   ```
-   *Example:*
-   ```bash
-   terraform apply \
-     -var="project_id=my-project-123" \
+     -var="project_id=your-project-id" \
      -var="region=us-east4" \
      -var="cluster_name=kube-agents-dedicated-cluster" \
-     -var="namespace=kubeagents-system" \
-     -var="github_org=my-github-org" \
-     -var="github_repo=my-github-repo" \
-     -var="github_app_id=123456"
+     -var="namespace=kubeagents-system"
    ```
 
-4. Keep this terminal open or note down the **Outputs** displayed at the end of the `terraform apply` run. You will need them in Step 4.
+### Step 3.2: Configure kubectl Credentials
 
----
-
-## Step 2: Configure kubectl Credentials
-
-Connect your local `kubectl` client to the newly created GKE cluster:
-
-```bash
-gcloud container clusters get-credentials YOUR_CLUSTER_NAME \
-  --region YOUR_GCP_REGION \
-  --project YOUR_PROJECT_ID
-```
-*Example:*
 ```bash
 gcloud container clusters get-credentials kube-agents-dedicated-cluster \
   --region us-east4 \
-  --project my-project-123
+  --project your-project-id
 ```
 
-Verify you can connect to the cluster and list the nodes:
-```bash
-kubectl get nodes
-```
+### Step 3.3: Deploy the Workloads via Helm
 
-## Step 3: Generate API Key & Deploy the Workloads via Helm
-
-Now, we deploy the Helm chart. The Helm chart will **automatically create and manage every single Kubernetes resource**, including the namespace (`kubeagents-system`) and the API secrets (`platform-agent-secrets`). There is no need to run manual `kubectl create` commands.
-
-We will generate a secure API Server Key, read the GCP Service Account emails from the **Terraform Outputs** (Step 1), and pass all credentials directly to Helm.
-
-1. Generate a secure, 16-byte random hex key locally:
+1. Generate a secure API Server Key:
    ```bash
    API_SERVER_KEY=$(openssl rand -hex 16)
-   echo "Your API Server Key is: ${API_SERVER_KEY}"
    ```
 
-2. If you need to view the Terraform outputs again, run `terraform output` from the `deploy/terraform` directory:
-   ```bash
-   cd k8s-operator/deploy/terraform
-   terraform output
-   ```
-
-3. If you enabled the GitHub Token Minter, you must import your GitHub App private key PEM into Google Cloud KMS before deploying the workloads. Run the following command:
-   ```bash
-   git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty
-   cd /tmp/minty
-   go run ./cmd/minty tools import-pk \
-     -project-id="YOUR_PROJECT_ID" \
-     -location="YOUR_GCP_REGION" \
-     -key-ring="OUTPUT_KMS_KEYRING" \
-     -key="OUTPUT_KMS_KEY" \
-     -private-key="@/path/to/your/github-app-private-key.pem"
-   ```
-   *Note:* After a successful import, resolve the active version number:
-   ```bash
-   gcloud kms keys versions list --key="OUTPUT_KMS_KEY" --keyring="OUTPUT_KMS_KEYRING" --location="YOUR_GCP_REGION" --project="YOUR_PROJECT_ID" --filter="state=ENABLED" --format="value(name)" | awk -F'/' '{print $NF}' | sort -n | tail -n 1
-   ```
-   This version number (usually `1` on first import) must be passed to Helm as `KMS_KEY_VERSION`.
-
-4. Run the `helm upgrade --install` command to deploy the entire stack. Replace the GSA email outputs, project details, and your real API keys. If the GitHub Token Minter is enabled, pass its configuration parameters:
+2. Run Helm:
    ```bash
    helm upgrade --install kube-agents ../helm/kube-agents \
-     --namespace "YOUR_NAMESPACE" \
+     --namespace "kubeagents-system" \
      --create-namespace \
-     --set projectId="YOUR_PROJECT_ID" \
-     --set clusterName="YOUR_CLUSTER_NAME" \
-     --set clusterLocation="YOUR_GCP_REGION" \
+     --set projectId="your-project-id" \
+     --set clusterName="kube-agents-dedicated-cluster" \
+     --set clusterLocation="us-east4" \
      --set operator.controllerGsaEmail="OUTPUT_CONTROLLER_GSA_EMAIL" \
-     --set agents.platform.gsaName="kubeagents-platform-gsa" \
      --set agents.platform.gsaEmail="OUTPUT_PLATFORM_AGENT_GSA_EMAIL" \
      --set agents.operator.gsaEmail="OUTPUT_OPERATOR_AGENT_GSA_EMAIL" \
      --set agents.devteam.gsaEmail="OUTPUT_DEVTEAM_AGENT_GSA_EMAIL" \
-     --set model.provider="gemini" \
-     --set model.defaultName="gemini-3.5-flash" \
      --set keys.geminiApiKey="YOUR_GEMINI_API_KEY" \
-     --set keys.apiServerKey="${API_SERVER_KEY}" \
-     --set gchat.topicName="platform-agent-chat-events" \
-     --set gchat.subscriptionName="platform-agent-chat-events-sub" \
-     --set githubMinter.enabled=true \
-     --set githubMinter.gsaEmail="OUTPUT_GITHUB_MINTER_GSA_EMAIL" \
-     --set githubMinter.kmsKeyring="OUTPUT_KMS_KEYRING" \
-     --set githubMinter.kmsKey="OUTPUT_KMS_KEY" \
-     --set githubMinter.kmsKeyVersion="KMS_KEY_VERSION" \
-     --set githubMinter.githubOrg="YOUR_GITHUB_ORG" \
-     --set githubMinter.githubRepo="YOUR_GITHUB_REPO" \
-     --set githubMinter.githubAppId="YOUR_GITHUB_APP_ID"
+     --set keys.apiServerKey="${API_SERVER_KEY}"
    ```
 
 ---
 
-## Step 5: Verify the Rollout
+## Method 4: Automated Deployment via Google Cloud Shell (IaC Wrapper)
 
-Verify that all pods are successfully created and running:
+If you want to use Terraform IaC from **Google Cloud Shell** while maintaining state persistence in the host cluster's Secret, use the [deploy_from_cloud_shell.sh](scripts/deploy_from_cloud_shell.sh) wrapper script.
+
+### Step 4.1: Clone the Repository
+
+Open Google Cloud Shell and clone the repository:
 
 ```bash
-kubectl get pods -n YOUR_NAMESPACE
+git clone https://github.com/gke-labs/kube-agents.git
+cd kube-agents
+```
+
+### Step 4.2: Run the Wrapper Script
+
+```bash
+# Ensure your GEMINI_API_KEY is set
+export GEMINI_API_KEY="your-api-key"
+
+./k8s-operator/scripts/deploy_from_cloud_shell.sh [provision|teardown] [arguments]
+```
+
+*Example (Provisioning):*
+```bash
+./k8s-operator/scripts/deploy_from_cloud_shell.sh provision \
+  -p your-project-id \
+  -r us-east4 \
+  -c kube-agents-dedicated-cluster \
+  -n kubeagents-system
+```
+
+*Note:*
+*   **Context**: Before running the script, ensure your local `kubectl` context is set to the **host cluster** (where the state Secret is stored, e.g., `autopilot-cluster-1`).
+*   **Permissions**: Since this runs directly on the Cloud Shell VM, it uses your active `gcloud` credentials, bypassing any container-related token restrictions.
+
+---
+
+## Method 5: Google Cloud Shell (Raw IaC Scripts)
+
+If you are working in **Google Cloud Shell** but do not have an existing "host" GKE cluster yet (for example, you are bootstrapping your very first GKE cluster in the project), you cannot use Method 4. Instead, you can run the raw IaC scripts directly on the Cloud Shell VM.
+
+The Terraform state will be stored locally in the Cloud Shell VM's persistent home directory.
+
+### Step 5.1: Clone the Repository
+
+Open Google Cloud Shell and clone the repository:
+
+```bash
+git clone https://github.com/gke-labs/kube-agents.git
+cd kube-agents
+```
+
+### Step 5.2: Run the Provisioning Script
+
+Run [provision_iac.sh](scripts/provision_iac.sh) directly:
+
+```bash
+# Ensure your GEMINI_API_KEY is set
+export GEMINI_API_KEY="your-api-key"
+
+./k8s-operator/scripts/provision_iac.sh [arguments]
+```
+
+*Example:*
+```bash
+./k8s-operator/scripts/provision_iac.sh \
+  -p your-project-id \
+  -r us-east4 \
+  -c kube-agents-dedicated-cluster \
+  -n kubeagents-system
+```
+
+### Step 5.3: Run the Teardown Script (Optional)
+
+To destroy the cluster, run [teardown_iac.sh](scripts/teardown_iac.sh):
+
+```bash
+./k8s-operator/scripts/teardown_iac.sh [arguments]
+```
+
+*Note: The state file `terraform.tfstate.<cluster-name>` will be saved in `deploy/terraform/` on your Cloud Shell VM. Since Cloud Shell home directories are persistent, the state will be preserved across sessions, but it is not backed up in the cluster.*
+
+---
+
+## Step 6: Verify the Rollout
+
+Regardless of the method used, verify that all pods are successfully created and running in the target namespace:
+
+```bash
+kubectl get pods -n kubeagents-system
 ```
 
 You should see the following pods in the `Running` state:

@@ -129,7 +129,7 @@ else
   GITHUB_MINTER_GSA="kubeagents-github-minter-gsa"
   TOPIC_NAME="platform-agent-chat-events"
   SUB_NAME="platform-agent-chat-events-sub"
-  DELETION_PROTECTION="true"
+  DELETION_PROTECTION="false"
 fi
 
 # Check if the state file exists
@@ -144,7 +144,28 @@ print_step "Starting Teardown of Kube-Agents IaC Environment: ${CLUSTER_NAME}"
 
 cd "${TF_DIR}"
 
-# Run Terraform Destroy
+# Step 1: Disable deletion protection in Terraform state
+print_step "Disabling GKE Cluster deletion protection in Terraform state"
+terraform apply -auto-approve \
+  -target=google_container_cluster.primary \
+  -state="terraform.tfstate.${CLUSTER_NAME}" \
+  -var="project_id=${PROJECT_ID}" \
+  -var="region=${REGION}" \
+  -var="cluster_name=${CLUSTER_NAME}" \
+  -var="namespace=${NAMESPACE}" \
+  -var="controller_gsa_name=${CONTROLLER_GSA}" \
+  -var="platform_gsa_name=${PLATFORM_GSA}" \
+  -var="operator_gsa_name=${OPERATOR_GSA}" \
+  -var="devteam_gsa_name=${DEVTEAM_GSA}" \
+  -var="github_minter_gsa_name=${GITHUB_MINTER_GSA}" \
+  -var="github_org=${GITHUB_ORG:-}" \
+  -var="github_repo=${GITHUB_REPO:-}" \
+  -var="github_app_id=${GITHUB_APP_ID:-}" \
+  -var="gchat_topic_name=${TOPIC_NAME}" \
+  -var="gchat_subscription_name=${SUB_NAME}" \
+  -var="deletion_protection=false"
+
+# Step 2: Run Terraform Destroy
 print_step "Running Terraform Destroy"
 terraform destroy -auto-approve \
   -state="terraform.tfstate.${CLUSTER_NAME}" \

@@ -167,6 +167,12 @@ fi
 # Step 1: Initialize Terraform
 print_step "Initializing Terraform"
 cd "${TF_DIR}"
+echo "=== DEBUG: Current Directory ==="
+pwd
+echo "=== DEBUG: Files in TF_DIR ==="
+ls -la
+echo "=== DEBUG: Contents of variables.tf ==="
+cat variables.tf
 terraform init
 
 # Step 2: Apply Terraform Configuration (Only GCP Infrastructure)
@@ -225,8 +231,29 @@ print_success "API Server Key generated successfully."
 
 # Step 5: Fetch GKE Credentials
 print_step "Connecting kubectl to the GKE cluster"
-gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}" --quiet
-KUBE_CONTEXT="gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}"
+if [ -n "${GOOGLE_OAUTH_ACCESS_TOKEN:-}" ]; then
+  print_info "Generating static kubeconfig using OAuth token to bypass CAA..."
+  GKE_ENDPOINT=$(terraform output -state="terraform.tfstate.${CLUSTER_NAME}" -raw gke_cluster_endpoint)
+  GKE_CA=$(terraform output -state="terraform.tfstate.${CLUSTER_NAME}" -raw gke_cluster_ca_certificate)
+  
+  tmp_ca=$(mktemp)
+  echo "${GKE_CA}" | base64 -d > "${tmp_ca}"
+  
+  kubectl config set-cluster "${CLUSTER_NAME}" \
+    --server="https://${GKE_ENDPOINT}" \
+    --certificate-authority="${tmp_ca}" \
+    --embed-certs=true
+  
+  rm -f "${tmp_ca}"
+  
+  kubectl config set-credentials iac-user --token="${GOOGLE_OAUTH_ACCESS_TOKEN}"
+  kubectl config set-context iac-context --cluster="${CLUSTER_NAME}" --user=iac-user
+  kubectl config use-context iac-context
+  KUBE_CONTEXT="iac-context"
+else
+  gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}" --quiet
+  KUBE_CONTEXT="gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}"
+fi
 
 # Step 5.5: Apply Custom Resource Definitions (CRDs)
 print_step "Applying Custom Resource Definitions (CRDs) from config/crd/bases"
