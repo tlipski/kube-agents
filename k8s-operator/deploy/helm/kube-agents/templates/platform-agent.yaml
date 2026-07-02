@@ -20,10 +20,6 @@ spec:
     imagePullPolicy: {{ .Values.agents.platform.image.pullPolicy }}
   security:
     serviceAccountName: kubeagents-platform-agent
-    workloadIdentity:
-      gcp:
-        gsaName: {{ required "agents.platform.gsaName is required" .Values.agents.platform.gsaName | quote }}
-        projectId: {{ required "projectId is required" .Values.projectId | quote }}
   integration:
     googleChat:
       enabled: true
