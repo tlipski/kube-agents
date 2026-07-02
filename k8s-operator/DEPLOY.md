@@ -11,7 +11,7 @@ Depending on your development environment and security constraints, you can choo
 | Method | Best For | State Management | Prerequisites |
 | :--- | :--- | :--- | :--- |
 | **[1. Google Cloud Shell (Baseline)](#method-1-google-cloud-shell-baseline-scripts)** | Quick, simple procedural deployment in Google Cloud Shell without Terraform. | **None** (Procedural `gcloud` and `helm` calls) | Google Cloud Shell. |
-| **[2. IaC Scripts (Local Workstation)](#method-2-iac-scripts-local-workstation)** | Unrestricted workstations (no CAA) wanting fast local iteration using Terraform. | **Local File** (Stored in `deploy/terraform/`) | Local `gcloud`, `terraform`, `helm`, `kubectl`. |
+| **[2. IaC Scripts (Local Workstation)](#method-2-iac-scripts-local-workstation)** | Workstations wanting fast local iteration using Terraform. | **Local File** (Stored in `deploy/terraform/`) | Local `gcloud`, `terraform`, `helm`, `kubectl`. |
 | **[3. Manual Step-by-Step](#method-3-manual-step-by-step-deployment-alternative)** | Debugging, learning the architecture, or custom fine-grained resource changes. | **Local File** (Must be managed manually) | Local `gcloud`, `terraform`, `helm`, `kubectl`. |
 | **[4. Cloud Shell (IaC Wrapper)](#method-4-automated-deployment-via-google-cloud-shell-iac-wrapper)** | Working from Cloud Shell with Terraform, utilizing an existing host cluster for state. | **Automated** (Stored in GKE host cluster Secret) | Google Cloud Shell, `kubectl` access to host cluster. |
 | **[5. Cloud Shell (Raw IaC Scripts)](#method-5-google-cloud-shell-raw-iac-scripts)** | Bootstrapping your very first GKE cluster from Cloud Shell using Terraform (no host cluster yet). | **Local File** (Stored on Cloud Shell VM home directory) | Google Cloud Shell. |
@@ -56,7 +56,7 @@ To destroy the cluster and all associated resources, run:
 
 ## Method 2: IaC Scripts (Local Workstation)
 
-If your local workstation does not have security policies (like CAA) blocking GCP API calls, you can run the IaC scripts directly from your terminal. This uses Terraform to manage the GKE cluster and IAM, and Helm for the workloads.
+If you are deploying from a local workstation, you can run the IaC scripts directly from your terminal. This uses Terraform to manage the GKE cluster and IAM, and Helm for the workloads.
 
 *Note: The Terraform state is stored as a local file on your machine.*
 

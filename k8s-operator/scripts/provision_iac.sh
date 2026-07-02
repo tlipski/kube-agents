@@ -232,7 +232,7 @@ print_success "API Server Key generated successfully."
 # Step 5: Fetch GKE Credentials
 print_step "Connecting kubectl to the GKE cluster"
 if [ -n "${GOOGLE_OAUTH_ACCESS_TOKEN:-}" ]; then
-  print_info "Generating static kubeconfig using OAuth token to bypass CAA..."
+  print_info "Generating static kubeconfig using OAuth token..."
   GKE_ENDPOINT=$(terraform output -state="terraform.tfstate.${CLUSTER_NAME}" -raw gke_cluster_endpoint)
   GKE_CA=$(terraform output -state="terraform.tfstate.${CLUSTER_NAME}" -raw gke_cluster_ca_certificate)
   
