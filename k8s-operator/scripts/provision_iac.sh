@@ -164,6 +164,113 @@ else
   DELETION_PROTECTION="true"
 fi
 
+# Pre-flight Check: Verify required GCP APIs are enabled in the project
+print_step "Pre-flight Check: Verifying Required GCP APIs"
+
+# 1. Extract APIs to be used from Terraform configuration
+print_info "Extracting required APIs from Terraform files in ${TF_DIR}..."
+apis=()
+# Loop through all .tf files in the directory
+for tf_file in "${TF_DIR}"/*.tf; do
+  if [ -f "${tf_file}" ]; then
+    while read -r line; do
+      # Regex to match double-quoted googleapis.com strings (like "container.googleapis.com")
+      if [[ "$line" =~ \"([a-zA-Z0-9.-]+\.googleapis\.com)\" ]]; then
+        apis+=("${BASH_REMATCH[1]}")
+      fi
+    done < "${tf_file}"
+  fi
+done
+
+if [ ${#apis[@]} -eq 0 ]; then
+  print_error "No APIs extracted from Terraform files. Check if TF_DIR is correct."
+  exit 1
+fi
+
+unique_apis=($(echo "${apis[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+print_info "Required APIs: $(echo "${unique_apis[@]}" | tr ' ' ', ')"
+
+# 2. Check if gcloud is installed and authenticated
+if ! command -v gcloud &>/dev/null; then
+  print_error "gcloud CLI is not installed. Cannot verify enabled APIs."
+  exit 1
+fi
+
+# 3. Query GCloud for enabled services in the project (including policytroubleshooter)
+filter_str=$(echo "${unique_apis[@]}" | tr ' ' ',')
+extended_filter="${filter_str},policytroubleshooter.googleapis.com"
+print_info "Checking API status in project ${PROJECT_ID}..."
+if ! enabled_apis=$(gcloud services list --enabled --project="${PROJECT_ID}" --filter="config.name:(${extended_filter})" --format="value(config.name)" 2>&1); then
+  print_error "Failed to query enabled services. Ensure you are authenticated and have permissions to view services."
+  print_error "Details: ${enabled_apis}"
+  exit 1
+fi
+
+# 4. Verify all required APIs are enabled
+missing_apis=()
+for api in "${unique_apis[@]}"; do
+  if ! echo "${enabled_apis}" | grep -q "^${api}$"; then
+    missing_apis+=("${api}")
+  fi
+done
+
+if [ ${#missing_apis[@]} -gt 0 ]; then
+  print_error "The following required APIs are not enabled in project ${PROJECT_ID}:"
+  for api in "${missing_apis[@]}"; do
+    print_error "  - ${api}"
+  done
+  print_error "Please enable them using 'gcloud services enable <api_name>' or via the GCP Console."
+  exit 1
+else
+  print_success "All required APIs are enabled in project ${PROJECT_ID}."
+fi
+
+# 5. Verify credential permissions (IAM Policy Troubleshooter, conditionally)
+if echo "${enabled_apis}" | grep -q "^policytroubleshooter.googleapis.com$"; then
+  print_info "policytroubleshooter.googleapis.com is enabled. Running IAM permission checks..."
+  ACTIVE_ACCOUNT=$(gcloud config get-value core/account 2>/dev/null || echo "")
+  if [ -z "${ACTIVE_ACCOUNT}" ]; then
+    print_error "No active gcloud identity found. Run 'gcloud auth login' first."
+    exit 1
+  fi
+  print_info "Active Identity: ${ACTIVE_ACCOUNT}"
+  
+  required_permissions=(
+    "container.clusters.create"
+    "iam.serviceAccounts.create"
+    "resourcemanager.projects.setIamPolicy"
+  )
+  
+  missing_permissions=()
+  for permission in "${required_permissions[@]}"; do
+    print_info "Checking permission: ${permission}..."
+    if ! permission_status=$(gcloud policy-troubleshoot iam //cloudresourcemanager.googleapis.com/projects/${PROJECT_ID} \
+        --principal-email="${ACTIVE_ACCOUNT}" \
+        --permission="${permission}" --format="value(access)" 2>&1); then
+      print_error "Troubleshooter failed to verify ${permission}."
+      print_error "Details: ${permission_status}"
+      exit 1
+    fi
+    if [ "${permission_status}" != "GRANTED" ]; then
+      missing_permissions+=("${permission}")
+    fi
+  done
+  
+  if [ ${#missing_permissions[@]} -gt 0 ]; then
+    print_error "The active credentials do not have the following required permissions in project ${PROJECT_ID}:"
+    for permission in "${missing_permissions[@]}"; do
+      print_error "  - ${permission}"
+    done
+    print_error "Please ensure you have Owner, Editor, or GKE Admin + IAM Admin permissions on the project."
+    exit 1
+  else
+    print_success "All required IAM permissions verified successfully for ${ACTIVE_ACCOUNT}."
+  fi
+else
+  print_info "policytroubleshooter.googleapis.com is not enabled in project ${PROJECT_ID}."
+  print_info "Skipping automated IAM credential permission checks. (To enable these checks, run: gcloud services enable policytroubleshooter.googleapis.com)"
+fi
+
 # Step 1: Initialize Terraform
 print_step "Initializing Terraform"
 cd "${TF_DIR}"
