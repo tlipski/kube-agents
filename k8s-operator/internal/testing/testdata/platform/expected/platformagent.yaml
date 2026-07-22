@@ -182,6 +182,7 @@ data:
       - session_store
       - session_otel_bridge
       - tool_call_audit
+      - incident_context
     terminal:
       backend: local
       cwd: /opt/data
@@ -300,7 +301,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 268343ffef4f80b81b57e301ed60eff3d7f738da032b97d0644d60b15d88d3ad
+        kubeagents.x-k8s.io/config-hash: 7ca1c2642614b81bebaffedf427abe947f0e7f30c028f3047bd6ee083a2b101f
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null
@@ -446,6 +447,35 @@ spec:
               subPath: parsers.conf
             - mountPath: /fluent-bit/state
               name: fluent-bit-state
+        - args:
+            - --cluster-name=cluster-a
+            - --daemon-url=http://127.0.0.1:8699
+            - --token-env=API_SERVER_KEY
+            - --owner=platform
+            - --reason=FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled
+          command:
+            - /usr/local/bin/k8s-event-watcher
+          env:
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: platformagent-secrets
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          imagePullPolicy: IfNotPresent
+          name: event-watcher
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
