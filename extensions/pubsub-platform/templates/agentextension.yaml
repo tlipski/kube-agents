@@ -1,0 +1,28 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentExtension
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  agentRef: {{ .Values.agentRef | quote }}
+  config: |
+    platform_toolsets:
+      pubsub:
+        - hermes-cli
+        - hermes-api-server
+        - mcp-agent_common
+        - mcp-platform_control
+        - mcp-developer_knowledge
+
+    platforms:
+      pubsub:
+        enabled: true
+  files:
+    platforms/pubsub/adapter.py: |-
+{{ .Files.Get "files/platforms/pubsub/adapter.py" | indent 6 }}
+    platforms/pubsub/plugin.yaml: |-
+{{ .Files.Get "files/platforms/pubsub/plugin.yaml" | indent 6 }}
+    platforms/pubsub/__init__.py: |-
+{{ .Files.Get "files/platforms/pubsub/__init__.py" | indent 6 }}

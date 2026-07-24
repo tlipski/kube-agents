@@ -1,0 +1,3 @@
+# Default values for pubsub-platform.
+
+agentRef: "platform-agent"
