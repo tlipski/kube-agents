@@ -1,0 +1,17 @@
+# Default values for gke-stockout-handler.
+
+agentRef: "platform-agent"
+
+clusterName: "ka-production"
+
+pubsub:
+  topic: "gke-stockout-alerts-topic"
+  subscription: "gke-stockout-alerts-sub"
+  thresholdCount: 1
+  thresholdWindowSeconds: 300
+
+# Optional Secret reference for GCP credentials
+secret:
+  create: false
+  name: ""
+  gcpServiceAccountKey: ""

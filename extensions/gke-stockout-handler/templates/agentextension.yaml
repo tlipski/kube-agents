@@ -1,0 +1,45 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentExtension
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  agentRef: {{ .Values.agentRef | quote }}
+  config: |
+    approvals:
+      mode: off
+
+    agent:
+      api_max_retries: 25
+
+    platforms:
+      pubsub:
+        enabled: true
+        extra:
+          subscriptions:
+            gke_stockout_alerts:
+              deliver: log
+              prompt: 'GKE Scale-up Failure Alert:
+                An out-of-resources or quota-exceeded scale-up failure has occurred in GKE.
+                First, follow the instructions in the `gke-stockout-handler` skill to verify if this is a real, active issue or a false signal/duplicate.
+                If it is a real active issue, diagnose the failure and propose a GitOps remediation PR following the `gke-stockout-handler` and `gke-compute-classes` skills.
+                
+                Alert Details:
+                {__raw__}'
+              query: '(log_id("test-stockout") OR log_id("container.googleapis.com/cluster-autoscaler-visibility")) AND (jsonPayload.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up") OR jsonPayload.noDecisionStatus.noScaleUp:*)'
+              filter: "resource.labels.cluster_name == '{{ .Values.clusterName }}' or jsonPayload.resource.labels.cluster_name == '{{ .Values.clusterName }}'"
+              threshold_count: {{ .Values.pubsub.thresholdCount }}
+              threshold_window_seconds: {{ .Values.pubsub.thresholdWindowSeconds }}
+              deduplicate_fields:
+              - resource.labels.cluster_name
+              - jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.namespace
+              - jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.name
+              skills:
+              - gke-stockout-handler
+              subscription: {{ .Values.pubsub.subscription | quote }}
+              topic: {{ .Values.pubsub.topic | quote }}
+  files:
+    skills/gke-stockout-handler/SKILL.md: |-
+{{ .Files.Get "files/skills/gke-stockout-handler/SKILL.md" | indent 6 }}
