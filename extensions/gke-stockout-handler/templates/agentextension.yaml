@@ -28,7 +28,7 @@ spec:
                 
                 Alert Details:
                 {__raw__}'
-              query: '(log_id("test-stockout") OR log_id("container.googleapis.com/cluster-autoscaler-visibility")) AND (jsonPayload.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up") OR jsonPayload.noDecisionStatus.noScaleUp:*)'
+              query: '(log_id("test-stockout") OR log_id("container.googleapis.com/cluster-autoscaler-visibility")) AND (jsonPayload.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up") OR jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up"))'
               filter: "resource.labels.cluster_name == '{{ .Values.clusterName }}' or jsonPayload.resource.labels.cluster_name == '{{ .Values.clusterName }}'"
               threshold_count: {{ .Values.pubsub.thresholdCount }}
               threshold_window_seconds: {{ .Values.pubsub.thresholdWindowSeconds }}

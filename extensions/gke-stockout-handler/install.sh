@@ -28,7 +28,7 @@ CLUSTER_NAME="${TARGET_CLUSTER_NAME:-ka-production}"
 TOPIC="gke-stockout-alerts-topic"
 SUBSCRIPTION="gke-stockout-alerts-sub"
 SINK_NAME="gke-stockout-alerts-sink"
-FILTER='(log_id("test-stockout") OR log_id("container.googleapis.com/cluster-autoscaler-visibility")) AND (jsonPayload.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up") OR jsonPayload.noDecisionStatus.noScaleUp:*)'
+FILTER='(log_id("test-stockout") OR log_id("container.googleapis.com/cluster-autoscaler-visibility")) AND (jsonPayload.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up") OR jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up"))'
 
 echo "============================================================"
 echo "Installing GKE Stockout Handler Extension Module"
