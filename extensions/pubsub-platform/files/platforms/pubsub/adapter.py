@@ -107,101 +107,85 @@ class PubSubAdapter(BasePlatformAdapter):
             return sub_input
         return f"projects/{project_id}/subscriptions/{sub_input}"
 
-    def _ensure_topic_exists(self, publisher, topic_path: str) -> None:
-        """Verify the Pub/Sub topic exists or create it if not found."""
-        from google.api_core.exceptions import NotFound
+    def _check_topic_exists(self, publisher, topic_path: str) -> bool:
+        """Verify if the Pub/Sub topic exists and log clearly if not present."""
+        try:
+            from google.api_core.exceptions import NotFound
+        except Exception:
+            class NotFound(Exception):
+                pass
         try:
             publisher.get_topic(request={"topic": topic_path})
-            logger.info("PubSub: Topic '%s' already exists", topic_path)
+            logger.info("PubSub: Topic '%s' exists", topic_path)
+            return True
         except NotFound:
-            logger.info("PubSub: Creating topic '%s'", topic_path)
-            publisher.create_topic(request={"name": topic_path})
+            logger.warning("PubSub: Topic '%s' is NOT present in GCP. Please ensure it is created prior to running.", topic_path)
+            return False
+        except Exception as e:
+            logger.warning("PubSub: Could not verify topic '%s': %s", topic_path, e)
+            return False
 
-    def _ensure_subscription_exists(self, subscriber, sub_path: str, topic_path: str) -> None:
-        """Verify the subscription exists on the topic or create it if not found."""
-        from google.api_core.exceptions import NotFound
+    def _check_subscription_exists(self, subscriber, sub_path: str) -> bool:
+        """Verify if the subscription exists and log clearly if not present."""
+        try:
+            from google.api_core.exceptions import NotFound
+        except Exception:
+            class NotFound(Exception):
+                pass
         try:
             subscriber.get_subscription(request={"subscription": sub_path})
-            logger.info("PubSub: Subscription '%s' already exists", sub_path)
+            logger.info("PubSub: Subscription '%s' exists", sub_path)
+            return True
         except NotFound:
-            logger.info("PubSub: Creating subscription '%s' on topic '%s'", sub_path, topic_path)
-            subscriber.create_subscription(request={"name": sub_path, "topic": topic_path})
-
-    def _ensure_log_sink(self, project_id: str, name: str, topic_path: str, query: str) -> Optional[str]:
-        """Ensure GCP Log Sink exists and routes log entries matching the query to the topic."""
-        from google.cloud import logging as gcp_logging
-        logging_client = gcp_logging.Client(project=project_id)
-        sink_name = f"hermes-pubsub-{name}-sink"
-        destination = f"pubsub.googleapis.com/{topic_path}"
-        sink = logging_client.sink(sink_name, filter_=query, destination=destination)
-        
-        try:
-            if sink.exists():
-                logger.info("PubSub: Log sink '%s' already exists", sink_name)
-                sink.reload()
-                if sink.filter_ != query or sink.destination != destination:
-                    logger.info("PubSub: Updating log sink '%s' with filter '%s'", sink_name, query)
-                    sink.filter_ = query
-                    sink.destination = destination
-                    sink.update()
-            else:
-                logger.info("PubSub: Creating log sink '%s'", sink_name)
-                sink.create()
-            return sink.writer_identity
+            logger.warning("PubSub: Subscription '%s' is NOT present in GCP. Please ensure it is created prior to running.", sub_path)
+            return False
         except Exception as e:
-            logger.error("PubSub: Failed to ensure Log Sink '%s': %s", sink_name, e)
-            raise e
+            logger.warning("PubSub: Could not verify subscription '%s': %s", sub_path, e)
+            return False
 
-    def _grant_sink_publisher_role(self, publisher, topic_path: str, writer_identity: str) -> None:
-        """Grant Pub/Sub Publisher role to the log sink's service account identity."""
-        logger.info("PubSub: Granting pubsub.publisher to log sink identity: %s", writer_identity)
-        policy = publisher.get_iam_policy(request={"resource": topic_path})
-        
-        binding_found = False
-        for binding in policy.bindings:
-            if binding.role == "roles/pubsub.publisher":
-                if writer_identity in binding.members:
-                    binding_found = True
-                    break
-                else:
-                    binding.members.append(writer_identity)
-                    binding_found = True
-                    publisher.set_iam_policy(request={"resource": topic_path, "policy": policy})
-                    break
-                    
-        if not binding_found:
-            from google.iam.v1 import policy_pb2
-            binding = policy_pb2.Binding(
-                role="roles/pubsub.publisher",
-                members=[writer_identity]
-            )
-            policy.bindings.append(binding)
-            publisher.set_iam_policy(request={"resource": topic_path, "policy": policy})
+    def _check_log_sink_exists(self, project_id: str, name: str, topic_path: str, query: str) -> bool:
+        """Check if GCP Log Sink exists and log clearly if not present."""
+        try:
+            from google.cloud import logging as gcp_logging
+            logging_client = gcp_logging.Client(project=project_id)
+            sink_name = f"hermes-pubsub-{name}-sink"
+            destination = f"pubsub.googleapis.com/{topic_path}"
+            sink = logging_client.sink(sink_name, filter_=query, destination=destination)
+            if sink.exists():
+                logger.info("PubSub: Log sink '%s' exists", sink_name)
+                return True
+            else:
+                logger.warning("PubSub: Log sink '%s' is NOT present in GCP.", sink_name)
+                return False
+        except Exception as e:
+            logger.warning("PubSub: Could not verify Log Sink 'hermes-pubsub-%s-sink': %s", name, e)
+            return False
 
-    def _ensure_resources(self, name: str, sub_cfg: dict, project_id: str) -> str:
-        """Provision or auto-verify GCP Pub/Sub topics, subscriptions, and stack log sinks."""
+    def _check_resources(self, name: str, sub_cfg: dict, project_id: str) -> str:
+        """Check presence of GCP Pub/Sub topics, subscriptions, and log sinks without creating them."""
         from google.cloud import pubsub_v1
-        
+
         topic_info = self._parse_topic_config(sub_cfg, project_id, name)
         if not topic_info:
-            logger.info("PubSub: No 'topic' configured for route '%s', skipping GCP resource provisioning.", name)
+            logger.info("PubSub: No 'topic' configured for route '%s'. Skipping resource checks.", name)
             return self._parse_subscription_config(sub_cfg, project_id, None)
-            
+
         topic_path, topic_name = topic_info
         sub_path = self._parse_subscription_config(sub_cfg, project_id, topic_name)
 
-        publisher = pubsub_v1.PublisherClient()
-        subscriber = pubsub_v1.SubscriberClient()
-        
-        self._ensure_topic_exists(publisher, topic_path)
-        self._ensure_subscription_exists(subscriber, sub_path, topic_path)
-            
-        query = sub_cfg.get("query")
-        if query:
-            writer_identity = self._ensure_log_sink(project_id, name, topic_path, query)
-            if writer_identity:
-                self._grant_sink_publisher_role(publisher, topic_path, writer_identity)
-                    
+        try:
+            publisher = pubsub_v1.PublisherClient()
+            subscriber = pubsub_v1.SubscriberClient()
+
+            self._check_topic_exists(publisher, topic_path)
+            self._check_subscription_exists(subscriber, sub_path)
+
+            query = sub_cfg.get("query")
+            if query:
+                self._check_log_sink_exists(project_id, name, topic_path, query)
+        except Exception as e:
+            logger.warning("PubSub: Resource presence check failed for '%s': %s", name, e)
+
         return sub_path
 
     def _resolve_subscription_path(self, name: str, sub_cfg: dict, project_id: Optional[str]) -> Optional[str]:
@@ -209,10 +193,10 @@ class PubSubAdapter(BasePlatformAdapter):
         subscription_path = None
         if project_id:
             try:
-                subscription_path = self._ensure_resources(name, sub_cfg, project_id)
+                subscription_path = self._check_resources(name, sub_cfg, project_id)
             except Exception as e:
-                logger.warning("PubSub: Resource auto-provisioning failed for '%s': %s. Falling back to configured path.", name, e)
-        
+                logger.warning("PubSub: Resource check failed for '%s': %s. Falling back to configured path.", name, e)
+
         if not subscription_path:
             subscription_path = sub_cfg.get("subscription")
             if subscription_path and not subscription_path.startswith("projects/") and project_id:
@@ -477,67 +461,42 @@ class PubSubAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("PubSub: Failed to save registry: %s", e)
 
-    def _is_false_signal(self, payload: dict, subscription_config: dict) -> bool:
-        """Programmatically check if the alert is a false signal (no active pending pods)."""
-        import subprocess
-        # Extract namespace and workload name using the configured deduplicate fields
-        dedup_fields = subscription_config.get("deduplicate_fields", [])
-        if not dedup_fields or len(dedup_fields) < 3:
-            return False  # Cannot check without dedup fields
-            
-        ns_field = dedup_fields[1]
-        workload_field = dedup_fields[2]
-        
-        namespace = _get_nested_value(payload, ns_field)
-        workload_name = _get_nested_value(payload, workload_field)
-        
-        if not namespace or not workload_name:
-            logger.info("PubSub: Could not extract namespace or workload name from payload for false signal check.")
-            return False
-            
-        logger.info("PubSub: Running programmatic false signal check for workload '%s' in namespace '%s'...", workload_name, namespace)
-        
+    def _validate_message(self, payload: dict, route_config: dict, route_name: str) -> bool:
+        """Programmatically validate the message payload using configured validation_code (if provided).
+
+        Returns True if valid (process message), False if invalid (skip message).
+        """
+        validation_code = route_config.get("validation_code")
+        if not validation_code:
+            return True
+
+        logger.info("PubSub: Running programmatic validation_code for route '%s'...", route_name)
         try:
-            cmd = ["kubectl", "get", "pods", "-n", namespace, "-o", "json"]
-            env = os.environ.copy()
-            env["KUBECONFIG"] = "/dev/null"
-            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-            if result.returncode != 0:
-                logger.warning("PubSub: kubectl command failed during false signal check: %s", result.stderr)
-                return False
-                
-            pods_data = json.loads(result.stdout)
-            items = pods_data.get("items", [])
-            
-            active_pending = False
-            workload_found = False
-            
-            for pod in items:
-                pod_name = pod.get("metadata", {}).get("name", "")
-                if pod_name.startswith(workload_name):
-                    workload_found = True
-                    phase = pod.get("status", {}).get("phase", "")
-                    if phase == "Pending":
-                        active_pending = True
-                        break
-            
-            if not workload_found:
-                logger.warning("PubSub: Workload '%s' not found in local namespace '%s'. Proceeding with agent trigger.", workload_name, namespace)
-                return False
-                
-            if not active_pending:
-                logger.warning("PubSub: Workload '%s' has no pending pods in namespace '%s'. Treating as false/resolved signal.", workload_name, namespace)
-                return True
-                
-            logger.warning("PubSub: Workload '%s' has active pending pods. Proceeding with agent trigger.", workload_name)
-            return False
-            
+            local_scope = {
+                "payload": payload,
+                "route_config": route_config,
+                "route_name": route_name,
+                "logger": logger,
+                "is_valid": True,
+                "result": None,
+                "get_nested_value": _get_nested_value,
+            }
+            exec(validation_code, globals(), local_scope)
+
+            if "validate" in local_scope and callable(local_scope["validate"]):
+                res = local_scope["validate"](payload, route_config)
+                return bool(res)
+
+            if local_scope["result"] is not None:
+                return bool(local_scope["result"])
+
+            return bool(local_scope.get("is_valid", True))
         except Exception as e:
-            logger.warning("PubSub: Exception during programmatic false signal check: %s", e)
-            return False
+            logger.warning("PubSub: Exception during validation_code execution on route '%s': %s", route_name, e)
+            return True
 
     async def _process_message(self, route_name: str, route_config: dict, message):
-        """Asynchronously process incoming raw pub/sub pull messages with threshold, lock, and deduplication."""
+        """Asynchronously process incoming raw pub/sub pull messages with threshold, lock, deduplication, and validation."""
         try:
             # Acknowledge immediately to prevent redeliveries during long agent run
             message.ack()
@@ -584,6 +543,14 @@ class PubSubAdapter(BasePlatformAdapter):
                 self._locks[route_name] = asyncio.Lock()
 
             async with self._locks[route_name]:
+                # --- Level 3: Programmatic Message Validation ---
+                if not self._validate_message(payload, route_config, route_name):
+                    logger.warning(
+                        "PubSub: Message on route '%s' invalidated by programmatic validation_code. Skipping prompt triggering.",
+                        route_name
+                    )
+                    return
+
                 dedup_fields = route_config.get("deduplicate_fields")
                 if dedup_fields and not os.environ.get("DISABLE_PUBSUB_DEDUP", "false").lower() == "true":
                     current_values = {}
@@ -609,22 +576,6 @@ class PubSubAdapter(BasePlatformAdapter):
                             "PubSub: Duplicate message detected on route '%s' using fields %s. Skipping prompt triggering.",
                             route_name, dedup_fields
                         )
-                        self._save_registry(cleaned_registry)
-                        return
-
-                    # --- Level 3: Programmatic False Signal Check ---
-                    if self._is_false_signal(payload, route_config):
-                        logger.warning(
-                            "PubSub: Message on route '%s' identified as a false signal and the workload pods are currently healthy. Skipping prompt triggering.",
-                            route_name
-                        )
-                        # Register it so that subsequent duplicates of this false signal are also ignored
-                        new_entry = {
-                            "route_name": route_name,
-                            "timestamp": now,
-                            "field_values": current_values
-                        }
-                        cleaned_registry.append(new_entry)
                         self._save_registry(cleaned_registry)
                         return
 
