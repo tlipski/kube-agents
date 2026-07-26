@@ -36,10 +36,19 @@ graph TD
 
 ## Key Features
 
-1. **Auto-Provisioning**: If specified in the subscription configuration, the adapter can automatically verify and create Pub/Sub topics, subscriptions, and stack log sinks, as well as grant necessary IAM permissions (`roles/pubsub.publisher`) to the log sink writer identity.
-2. **Dynamic Prompt Rendering**: Supports template syntax (e.g. `{incident.summary}`) to format raw JSON message payloads into readable, context-rich prompts.
-3. **Skill Wrapping**: Directly routes incoming alerts to specific agent skills by mapping route paths to skill names (e.g. wrapping stockout alerts with `/gke-stockout-handler`).
-4. **Cross-Platform Response Delivery**: Agents can respond to other messaging channels (e.g., Google Chat space or a specific thread) from incoming alert logs.
+1. **Resource Presence Verification**: The adapter checks for the presence of configured GCP Pub/Sub topics, subscriptions, and log sinks upon connecting and logs clearly if any required resources are missing.
+2. **Programmatic Payload Validation**: Allows setups to provide custom Python code (`validation_code`) to programmatically validate message payloads before spawning agent prompts.
+3. **Dynamic Prompt Rendering**: Supports template syntax (e.g. `{incident.summary}`) to format raw JSON message payloads into readable, context-rich prompts.
+4. **Skill Wrapping**: Directly routes incoming alerts to specific agent skills by mapping route paths to skill names (e.g. wrapping stockout alerts with `/gke-stockout-handler`).
+5. **Cross-Platform Response Delivery**: Agents can respond to other messaging channels (e.g., Google Chat space or a specific thread) from incoming alert logs.
+
+## Installation
+
+An installation shell script is provided to apply the `AgentExtension` CRD and deploy the chart:
+
+```bash
+bash extensions/pubsub-platform/install.sh --context <your-kubectl-context> --namespace kubeagents-system
+```
 
 ## Configuration Guide
 
@@ -54,12 +63,14 @@ platforms:
     extra:
       subscriptions:
         gke_alerts:
-          # (Optional) If topic/query is provided, the plugin auto-provisions GCP resources
           topic: "gke-alerts"
-          query: 'resource.type="gke_cluster" AND severity>=WARNING'
-
-          # Subscription path or name. If name is used, it resolves to projects/<project-id>/subscriptions/<subscription-name>
           subscription: "gke-alerts-sub"
+
+          # Optional programmatic validation snippet
+          validation_code: |
+            def validate(payload, config):
+                # Custom validation logic returning True (process) or False (skip)
+                return payload.get("severity") in ["WARNING", "ERROR", "CRITICAL"]
 
           # Template for formatting incoming message payload
           prompt: |
@@ -83,12 +94,14 @@ platforms:
 
 ### Configuration Parameters
 
-| Parameter       | Type           | Required | Description                                                                                                                                          |
-| :-------------- | :------------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `topic`         | `string`       | No       | Simple topic name or full GCP resource path (`projects/<project>/topics/<name>`).                                                                    |
-| `subscription`  | `string`       | Yes      | Simple subscription name or full GCP path (`projects/<project>/subscriptions/<name>`).                                                               |
-| `query`         | `string`       | No       | GCP Cloud Logging filter query. If specified, a log sink is created/updated to route matching logs to the topic.                                     |
-| `prompt`        | `string`       | Yes      | Markdown template. Supports placeholder substitution using dot-notation (e.g., `{incident.summary}`). Use `{__raw__}` for a raw JSON payload string. |
-| `skills`        | `list[string]` | No       | List of skill command aliases (without leading `/`) that the agent should execute with the rendered prompt.                                          |
-| `deliver`       | `string`       | Yes      | Destination platform for the response. Can be `log` (default) or any active platform adapter name (e.g., `google_chat`, `discord`).                  |
-| `deliver_extra` | `dict`         | No       | Extra configuration variables for the target delivery adapter (e.g., `chat_id`, `thread_id`). Values support placeholder rendering.                  |
+| Parameter          | Type           | Required | Description                                                                                                                                          |
+| :----------------- | :------------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `topic`            | `string`       | No       | Simple topic name or full GCP resource path (`projects/<project>/topics/<name>`).                                                                    |
+| `subscription`     | `string`       | Yes      | Simple subscription name or full GCP path (`projects/<project>/subscriptions/<name>`).                                                               |
+| `query`            | `string`       | No       | GCP Cloud Logging filter query. Used to verify presence of the corresponding log sink.                                                               |
+| `validation_code`  | `string`       | No       | Python code snippet to programmatically validate payload. Can define `validate(payload, config)` returning boolean `True` or `False`.               |
+| `prompt`           | `string`       | Yes      | Markdown template. Supports placeholder substitution using dot-notation (e.g., `{incident.summary}`). Use `{__raw__}` for a raw JSON payload string. |
+| `skills`           | `list[string]` | No       | List of skill command aliases (without leading `/`) that the agent should execute with the rendered prompt.                                          |
+| `deliver`          | `string`       | Yes      | Destination platform for the response. Can be `log` (default) or any active platform adapter name (e.g., `google_chat`, `discord`).                  |
+| `deliver_extra`    | `dict`         | No       | Extra configuration variables for the target delivery adapter (e.g., `chat_id`, `thread_id`). Values support placeholder rendering.                  |
+
