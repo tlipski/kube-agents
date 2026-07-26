@@ -209,10 +209,25 @@ class PubSubAdapter(BasePlatformAdapter):
 
         def make_callback(route_name=name, cfg=sub_cfg):
             def callback(message):
-                asyncio.run_coroutine_threadsafe(
-                    self._process_message(route_name, cfg, message),
-                    loop
-                )
+                logger.warning("PubSub: Callback entry received message on route '%s', msg_id=%s", route_name, getattr(message, 'message_id', 'unknown'))
+                try:
+                    target_loop = getattr(self, "_main_loop", None) or loop
+                    if target_loop.is_closed():
+                        try:
+                            target_loop = asyncio.get_event_loop()
+                        except Exception:
+                            pass
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self._process_message(route_name, cfg, message),
+                        target_loop
+                    )
+                    def _on_coro_done(f):
+                        exc = f.exception()
+                        if exc:
+                            logger.error("PubSub: _process_message failed for route '%s': %s", route_name, exc)
+                    fut.add_done_callback(_on_coro_done)
+                except Exception as e:
+                    logger.error("PubSub: Exception scheduling message callback for route '%s': %s", route_name, e)
             return callback
 
         try:
@@ -220,12 +235,18 @@ class PubSubAdapter(BasePlatformAdapter):
                 subscription_path,
                 callback=make_callback(name, sub_cfg)
             )
+            def _on_future_done(f):
+                exc = f.exception()
+                if exc:
+                    logger.error("PubSub: StreamingPullFuture for route '%s' terminated with error: %s", name, exc)
+            future.add_done_callback(_on_future_done)
             self._streaming_pull_futures.append(future)
         except Exception as e:
             logger.error("PubSub: Failed to subscribe to '%s': %s", subscription_path, e)
 
     async def connect(self, is_reconnect: bool = False, **kwargs) -> bool:
         """Establish connection and start listening to all configured Pub/Sub subscriptions."""
+        self._main_loop = asyncio.get_running_loop()
         if not self._subscriptions_config:
             logger.warning("PubSub: No subscriptions configured in config.yaml under platforms.pubsub.extra.subscriptions")
             return True
