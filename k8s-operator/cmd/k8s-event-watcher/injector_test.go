@@ -112,7 +112,7 @@ func TestInjectorInject(t *testing.T) {
 		t.Fatalf("failed to build injector: %v", err)
 	}
 
-	err = inj.Inject(context.Background(), sessionID, payload)
+	err = inj.InjectPrompt(context.Background(), sessionID, expectedPrompt, "🚨 Test Alert")
 	if err != nil {
 		t.Fatalf("Inject call failed: %v", err)
 	}
