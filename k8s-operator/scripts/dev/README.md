@@ -38,3 +38,17 @@ chmod +x setup-gcp-github-wif.sh
 ```
 
 When the script finishes, it will print three variables (`GCP_PROJECT_ID`, `GCP_SERVICE_ACCOUNT`, and `GCP_WORKLOAD_IDENTITY_PROVIDER`). To complete the setup, copy those three values and add them to your GitHub Repository > Settings > Environments as Environment Variables.
+
+## `deploy_k8s_event_watcher.sh`
+
+### Purpose
+
+Deploys or updates `k8s-event-watcher` as a standalone Kubernetes Deployment in namespace `kubeagents-system`.
+
+### Usage
+
+```bash
+./k8s-operator/scripts/dev/deploy_k8s_event_watcher.sh
+```
+
+
