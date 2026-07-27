@@ -1084,8 +1084,8 @@ func TestBuildPlatformService(t *testing.T) {
 			t.Errorf("expected Service namespace test-ns, got %s", svc.Namespace)
 		}
 
-		if len(svc.Spec.Ports) != 2 {
-			t.Errorf("expected 2 service ports when dashboard enabled, got %d", len(svc.Spec.Ports))
+		if len(svc.Spec.Ports) != 3 {
+			t.Errorf("expected 3 service ports when dashboard enabled, got %d", len(svc.Spec.Ports))
 		}
 
 		portsMap := make(map[string]int32)
@@ -1095,6 +1095,9 @@ func TestBuildPlatformService(t *testing.T) {
 
 		if portsMap["api"] != 8642 {
 			t.Errorf("expected api port 8642, got %d", portsMap["api"])
+		}
+		if portsMap["session-kv"] != 8699 {
+			t.Errorf("expected session-kv port 8699, got %d", portsMap["session-kv"])
 		}
 		if portsMap["dashboard"] != 9119 {
 			t.Errorf("expected dashboard port 9119, got %d", portsMap["dashboard"])
@@ -1124,8 +1127,8 @@ func TestBuildPlatformService(t *testing.T) {
 		}
 
 		svc := buildPlatformService(agent)
-		if len(svc.Spec.Ports) != 1 {
-			t.Errorf("expected 1 service port when dashboard disabled, got %d", len(svc.Spec.Ports))
+		if len(svc.Spec.Ports) != 2 {
+			t.Errorf("expected 2 service ports when dashboard disabled, got %d", len(svc.Spec.Ports))
 		}
 	})
 
@@ -1145,8 +1148,8 @@ func TestBuildPlatformService(t *testing.T) {
 		}
 
 		svc := buildPlatformService(agent)
-		if len(svc.Spec.Ports) != 2 {
-			t.Errorf("expected 2 service ports when dashboard enabled, got %d", len(svc.Spec.Ports))
+		if len(svc.Spec.Ports) != 3 {
+			t.Errorf("expected 3 service ports when dashboard enabled, got %d", len(svc.Spec.Ports))
 		}
 
 		portsMap := make(map[string]int32)
@@ -1296,12 +1299,12 @@ func TestBuildPlatformExplorerRole(t *testing.T) {
 		t.Errorf("expected APIGroups [''], got %v", rule.APIGroups)
 	}
 
-	expectedResources := []string{"nodes", "pods", "namespaces"}
+	expectedResources := []string{"nodes", "pods", "namespaces", "events"}
 	if len(rule.Resources) != len(expectedResources) {
 		t.Errorf("expected Resources %v, got %v", expectedResources, rule.Resources)
 	}
 
-	expectedVerbs := []string{"get", "list"}
+	expectedVerbs := []string{"get", "list", "watch"}
 	if len(rule.Verbs) != len(expectedVerbs) {
 		t.Errorf("expected Verbs %v, got %v", expectedVerbs, rule.Verbs)
 	}
@@ -1316,8 +1319,8 @@ func TestBuildPlatformExplorerRole(t *testing.T) {
 		t.Errorf("expected Resources %v, got %v", expectedResources2, rule2.Resources)
 	}
 
-	if len(rule2.Verbs) != len(expectedVerbs) {
-		t.Errorf("expected Verbs %v, got %v", expectedVerbs, rule2.Verbs)
+	if len(rule2.Verbs) != 2 {
+		t.Errorf("expected 2 Verbs for rule2, got %v", rule2.Verbs)
 	}
 }
 

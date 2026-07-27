@@ -1565,8 +1565,8 @@ func buildPlatformExplorerRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Clust
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
-				Resources: []string{"nodes", "pods", "namespaces"},
-				Verbs:     []string{"get", "list"},
+				Resources: []string{"nodes", "pods", "namespaces", "events"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"apiextensions.k8s.io"},
@@ -1695,6 +1695,11 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 			Name:       "api",
 			Port:       8642,
 			TargetPort: intstr.FromInt32(8643),
+		},
+		{
+			Name:       "session-kv",
+			Port:       8699,
+			TargetPort: intstr.FromInt32(8699),
 		},
 	}
 
