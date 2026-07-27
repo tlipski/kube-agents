@@ -94,5 +94,5 @@ const (
 // PromptPayload represents the prompt and alert summary inside the inject message request payload.
 type PromptPayload struct {
 	Prompt   string `json:"prompt"`
-	AlertMsg string `json:"alert_msg,omitempty"`
+	AlertMsg string `json:"alertMsg,omitempty"`
 }

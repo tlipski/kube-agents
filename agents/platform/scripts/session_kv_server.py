@@ -336,14 +336,15 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     if isinstance(msg, dict):
         prompt_text = msg.get("prompt") or msg.get("message") or ""
         alert_msg = (
-            msg.get("alert_msg")
-            or msg.get("alertMsg")
+            msg.get("alertMsg")
+            or msg.get("alert_msg")
+            or request_data.get("alertMsg")
             or request_data.get("alert_msg")
             or "🟡 Alert event received"
         )
     else:
         prompt_text = str(msg)
-        alert_msg = request_data.get("alert_msg") or "🟡 Alert event received"
+        alert_msg = request_data.get("alertMsg") or request_data.get("alert_msg") or "🟡 Alert event received"
 
     if not prompt_text:
         raise HTTPException(status_code=400, detail="Failed to extract prompt from message payload")
