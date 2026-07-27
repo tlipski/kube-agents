@@ -183,7 +183,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         payload = {
             "message": {
                 "prompt": "Analyze Kubernetes event warning for test-pod",
-                "alert_msg": "🚨 Kubernetes Event: ImagePullBackOff on Pod default/test-pod"
+                "alertMsg": "🚨 Kubernetes Event: ImagePullBackOff on Pod default/test-pod"
             }
         }
         resp = self.client.post("/sessions/test-session-123/inject", json=payload)
