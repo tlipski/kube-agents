@@ -9,6 +9,8 @@ import re
 import sqlite3
 import subprocess
 import sys
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 import urllib.error
 import urllib.request
 import uuid
