@@ -328,9 +328,11 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
 
 @app.post("/sessions/{session_id}/inject")
 def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
-    """Receive the event payload and notify the Platform Agent via Google Chat."""
-    raw_message = request_data.get("message", "")
-    if not raw_message:
+    """Receive the event prompt payload and notify the Platform Agent."""
+    logger.info(f"POST /sessions/{session_id}/inject received request_data: {json.dumps(request_data)}")
+    msg = request_data.get("message")
+    if not msg:
+        logger.error(f"POST /sessions/{session_id}/inject missing message field")
         raise HTTPException(status_code=400, detail="message field is required")
 
     if isinstance(msg, dict):
@@ -341,7 +343,10 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
         alert_msg = "🟡 Alert event received"
 
     if not prompt_text:
+        logger.error(f"POST /sessions/{session_id}/inject failed to extract prompt from message payload")
         raise HTTPException(status_code=400, detail="Failed to extract prompt from message payload")
+
+    logger.info(f"POST /sessions/{session_id}/inject extracted alert_msg={alert_msg!r}, prompt_length={len(prompt_text)}")
 
     # Delegate agent trigger to FastAPI BackgroundTasks
     background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, prompt_text)
