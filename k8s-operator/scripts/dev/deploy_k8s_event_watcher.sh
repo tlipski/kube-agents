@@ -35,9 +35,37 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" --region="${REGION}"
 # 2. Ensure Namespace exists
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# 3. Apply standalone k8s-event-watcher Deployment manifest
-echo -e "📦 Applying k8s-event-watcher Deployment manifest..."
+# 3. Apply standalone k8s-event-watcher Deployment & RBAC manifests
+echo -e "📦 Applying k8s-event-watcher RBAC & Deployment manifests..."
 cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-event-watcher
+  namespace: ${NAMESPACE}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-event-watcher
+rules:
+- apiGroups: [""]
+  resources: ["events", "pods", "nodes", "namespaces"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-event-watcher
+subjects:
+- kind: ServiceAccount
+  name: k8s-event-watcher
+  namespace: ${NAMESPACE}
+roleRef:
+  kind: ClusterRole
+  name: k8s-event-watcher
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -56,7 +84,7 @@ spec:
       labels:
         app.kubernetes.io/name: k8s-event-watcher
     spec:
-      serviceAccountName: default
+      serviceAccountName: k8s-event-watcher
       containers:
       - name: event-watcher
         image: ${IMAGE_URI}
@@ -65,7 +93,7 @@ spec:
         - /usr/local/bin/k8s-event-watcher
         args:
         - --cluster-name=${CLUSTER_NAME}
-        - --daemon-url=http://platform-agent-gateway:8699
+        - --daemon-url=http://platform-agent:8699
         - --token-env=API_SERVER_KEY
         - --owner=platform
         - --mode=per-incident
