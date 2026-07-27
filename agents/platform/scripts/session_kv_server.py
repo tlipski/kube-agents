@@ -358,6 +358,7 @@ def _parse_inject_message(raw_message: Any) -> tuple[str, str]:
 @app.post("/sessions/{session_id}/inject")
 def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
     """Receive the event prompt payload and notify the Platform Agent."""
+    print(f"[session_kv_server] POST /sessions/{session_id}/inject received request_data: {json.dumps(request_data)}", file=sys.stderr, flush=True)
     logger.info(f"POST /sessions/{session_id}/inject received request_data: {json.dumps(request_data)}")
     raw_message = request_data.get("message")
     if raw_message is None:
@@ -370,6 +371,7 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
         logger.error(f"POST /sessions/{session_id}/inject failed to extract prompt from message payload")
         raise HTTPException(status_code=400, detail="Failed to extract prompt from message payload")
 
+    print(f"[session_kv_server] POST /sessions/{session_id}/inject extracted alert_msg={alert_msg!r}, prompt_length={len(prompt_text)}", file=sys.stderr, flush=True)
     logger.info(f"POST /sessions/{session_id}/inject extracted alert_msg={alert_msg!r}, prompt_length={len(prompt_text)}")
 
     # Delegate agent trigger to FastAPI BackgroundTasks
