@@ -332,33 +332,24 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     raw_message = request_data.get("message", "")
     if not raw_message:
         raise HTTPException(status_code=400, detail="message field is required")
-        
-    try:
-        payload = json.loads(raw_message)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to parse inner payload JSON: {exc}")
-        
-    event_reason = payload.get("reason") or "Unknown"
-    namespace = payload.get("namespace") or "default"
-    object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
-    object_name = payload.get("name") or ""
-    message = payload.get("message") or ""
-    count = payload.get("count") if payload.get("count") is not None else 1
-    event_type = payload.get("type") or "Warning"
 
-    severity_emoji, severity_label = get_severity_details(event_type, event_reason)
-    clean_name = clean_workload_name(object_kind, object_name)
-    clean_reason = clean_reason_label(event_reason)
-    clean_msg = clean_event_message(message)
+    if isinstance(msg, dict):
+        prompt_text = msg.get("prompt") or msg.get("message") or ""
+        alert_msg = (
+            msg.get("alert_msg")
+            or msg.get("alertMsg")
+            or request_data.get("alert_msg")
+            or "🟡 Alert event received"
+        )
+    else:
+        prompt_text = str(msg)
+        alert_msg = request_data.get("alert_msg") or "🟡 Alert event received"
 
-    # Construct a pretty notification alert
-    alert_msg = (
-        f"{severity_emoji} *{severity_label}:* {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
-        f"🌱 _Digging down to the root cause..._"
-    )
-    
-    # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond
-    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload)
+    if not prompt_text:
+        raise HTTPException(status_code=400, detail="Failed to extract prompt from message payload")
+
+    # Delegate agent trigger to FastAPI BackgroundTasks
+    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, prompt_text)
     
     return {"status": "injected"}
 

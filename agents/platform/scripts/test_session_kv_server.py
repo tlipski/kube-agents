@@ -173,34 +173,24 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
-        self.assertIn("project=test-project-id", query)
-        self.assertNotIn("jayantid-gkedemos", query)
+        resp = self.client.post("/sessions/test-session-123/inject", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"status": "injected"})
+        mock_trigger.assert_called_once_with("test-session-123", "🟡 Alert event received", "Analyze Kubernetes event warning for test-pod")
 
-    @patch.dict(os.environ, {"GCP_PROJECT": "test-project-legacy"})
-    def test_build_agent_query_with_legacy_project(self):
+    @patch("session_kv_server.trigger_agent_troubleshooter")
+    def test_inject_message_with_alert_msg(self, mock_trigger):
         payload = {
-            "reason": "FailedMount",
-            "namespace": "test-ns",
-            "kind_of_object": "Pod",
-            "name": "test-pod",
-            "message": "some message"
+            "message": {
+                "prompt": "Analyze Kubernetes event warning for test-pod",
+                "alert_msg": "🚨 Kubernetes Event: ImagePullBackOff on Pod default/test-pod"
+            }
         }
-        with patch.dict(os.environ, {"GCP_PROJECT_ID": ""}):
-            query = session_kv_server._build_agent_query("test-session", payload)
-            self.assertIn("project=test-project-legacy", query)
+        resp = self.client.post("/sessions/test-session-123/inject", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"status": "injected"})
+        mock_trigger.assert_called_once_with("test-session-123", "🚨 Kubernetes Event: ImagePullBackOff on Pod default/test-pod", "Analyze Kubernetes event warning for test-pod")
 
-    def test_build_agent_query_no_project(self):
-        payload = {
-            "reason": "FailedMount",
-            "namespace": "test-ns",
-            "kind_of_object": "Pod",
-            "name": "test-pod",
-            "message": "some message"
-        }
-        with patch.dict(os.environ, {"GCP_PROJECT_ID": "", "GCP_PROJECT": ""}):
-            query = session_kv_server._build_agent_query("test-session", payload)
-            self.assertIn("project=", query)
 
 
 if __name__ == "__main__":

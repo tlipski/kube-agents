@@ -50,6 +50,41 @@ def _get_nested_value(payload: Any, path: str) -> Any:
 
 
 
+def _create_session_sync(daemon_url: str, bearer_token: str, owner: str) -> str:
+    url = f"{daemon_url.rstrip('/')}/sessions"
+    req = urllib.request.Request(url, data=b"", method="POST")
+    if bearer_token:
+        req.add_header("Authorization", f"Bearer {bearer_token}")
+    if owner:
+        req.add_header("X-Asserted-Caller", owner)
+    with urllib.request.urlopen(req, timeout=10.0) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        session_id = data.get("sessionID", "")
+        if not session_id:
+            raise RuntimeError("POST /sessions returned empty sessionID")
+        return session_id
+
+
+def _inject_prompt_sync(daemon_url: str, session_id: str, prompt: str, bearer_token: str, owner: str, alert_msg: Optional[str] = None) -> None:
+    url = f"{daemon_url.rstrip('/')}/sessions/{session_id}/inject"
+    msg_payload = {"prompt": prompt}
+    if alert_msg:
+        msg_payload["alert_msg"] = alert_msg
+    payload = {"message": msg_payload}
+    data_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data_bytes, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    if bearer_token:
+        req.add_header("Authorization", f"Bearer {bearer_token}")
+    if owner:
+        req.add_header("X-Asserted-Caller", owner)
+    with urllib.request.urlopen(req, timeout=10.0) as resp:
+        if resp.status < 200 or resp.status >= 300:
+            resp_body = resp.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"POST inject status {resp.status}: {resp_body}")
+
+
 class PubSubAdapter(BasePlatformAdapter):
     """Google Cloud Pub/Sub pull subscriber adapter for Hermes Agent.
     
