@@ -16,7 +16,7 @@ os.environ["SESSION_KV_DB_PATH"] = temp_db_path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import session_kv_server
-from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details, _append_routing_instruction
+from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details, _append_routing_instruction, _parse_inject_message
 
 class TestSessionKvServerUtils(unittest.TestCase):
 
@@ -67,6 +67,19 @@ class TestSessionKvServerUtils(unittest.TestCase):
         # Re-applying when session_id is already present should not duplicate
         re_amended = _append_routing_instruction(amended, session_id)
         self.assertEqual(amended, re_amended)
+
+    def test_parse_inject_message(self):
+        # Dict payload with alertMsg
+        dict_payload = {"prompt": "Fix scale up", "alertMsg": "🚨 GKE Alert"}
+        prompt, alert_msg = _parse_inject_message(dict_payload)
+        self.assertEqual(prompt, "Fix scale up")
+        self.assertEqual(alert_msg, "🚨 GKE Alert")
+
+        # Plain string payload
+        plain_payload = "Simple prompt string"
+        prompt, alert_msg = _parse_inject_message(plain_payload)
+        self.assertEqual(prompt, "Simple prompt string")
+        self.assertEqual(alert_msg, "🟡 Alert event received")
 
 
 class TestSessionKvServerApi(unittest.TestCase):

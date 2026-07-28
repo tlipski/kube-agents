@@ -107,7 +107,7 @@ func (i *injector) CreateSession(ctx context.Context) (string, error) {
 
 // injectMessageRequest wraps the event details payload for session ingestion.
 type injectMessageRequest struct {
-	Message PromptPayload `json:"message"`
+	Message AlertPayload `json:"message"`
 }
 
 // InjectPrompt posts the formatted prompt string and optional alert summary to the specified session's queue.
@@ -115,12 +115,8 @@ func (i *injector) InjectPrompt(ctx context.Context, sessionID string, prompt st
 	if sessionID == "" {
 		return errors.New("injector: Inject: sessionID is required")
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("injector: marshal payload: %w", err)
-	}
 	wrapped, err := json.Marshal(injectMessageRequest{
-		Message: PromptPayload{
+		Message: AlertPayload{
 			Prompt:   prompt,
 			AlertMsg: alertMsg,
 		},

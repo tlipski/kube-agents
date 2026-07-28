@@ -26,7 +26,7 @@ import (
 func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 	sessionID := "active-session-123"
 	var createCount, injectCount int
-	var lastInjectPayload InjectPayload
+	var lastPrompt, lastAlertMsg string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -44,9 +44,8 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Fatalf("failed to decode body: %v", err)
 			}
-			if err := json.Unmarshal([]byte(req.Message), &lastInjectPayload); err != nil {
-				t.Fatalf("failed to unmarshal message payload: %v", err)
-			}
+			lastPrompt = req.Message.Prompt
+			lastAlertMsg = req.Message.AlertMsg
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -97,8 +96,11 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 	if injectCount != 1 {
 		t.Errorf("expected 1 injection, got %d", injectCount)
 	}
-	if lastInjectPayload.Kind != injectKindEvent {
-		t.Errorf("expected first event kind to be %q, got %q", injectKindEvent, lastInjectPayload.Kind)
+	if lastPrompt == "" {
+		t.Errorf("expected non-empty lastPrompt")
+	}
+	if lastAlertMsg == "" {
+		t.Errorf("expected non-empty lastAlertMsg")
 	}
 
 	// 2. Dispatch same event again -> should not create session and should suppress injection

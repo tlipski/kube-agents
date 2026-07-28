@@ -340,21 +340,31 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, prompt_text: s
 
 
 
+def _parse_inject_message(raw_message: Any) -> tuple[str, str]:
+    """Parse raw_message payload into (prompt_text, alert_msg) according to Python standards."""
+    default_alert_msg = "🟡 Alert event received"
+
+    if isinstance(raw_message, dict):
+        prompt_text = raw_message.get("prompt") or raw_message.get("message") or ""
+        alert_msg = raw_message.get("alertMsg") or raw_message.get("alert_msg") or default_alert_msg
+        return str(prompt_text), str(alert_msg)
+
+    if raw_message is not None:
+        return str(raw_message), default_alert_msg
+
+    return "", default_alert_msg
+
+
 @app.post("/sessions/{session_id}/inject")
 def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
     """Receive the event prompt payload and notify the Platform Agent."""
     logger.info(f"POST /sessions/{session_id}/inject received request_data: {json.dumps(request_data)}")
-    msg = request_data.get("message")
-    if not msg:
+    raw_message = request_data.get("message")
+    if raw_message is None:
         logger.error(f"POST /sessions/{session_id}/inject missing message field")
         raise HTTPException(status_code=400, detail="message field is required")
 
-    if isinstance(msg, dict):
-        prompt_text = msg.get("prompt") or msg.get("message") or ""
-        alert_msg = msg.get("alertMsg") or "🟡 Alert event received"
-    else:
-        prompt_text = str(msg)
-        alert_msg = "🟡 Alert event received"
+    prompt_text, alert_msg = _parse_inject_message(raw_message)
 
     if not prompt_text:
         logger.error(f"POST /sessions/{session_id}/inject failed to extract prompt from message payload")
