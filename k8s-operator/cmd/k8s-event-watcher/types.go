@@ -90,3 +90,9 @@ const (
 	injectKindEvent    = "k8s-event"
 	injectKindFollowup = "k8s-event-followup"
 )
+
+// AlertPayload represents the prompt and alert summary inside the inject message request payload.
+type AlertPayload struct {
+	Prompt   string `json:"prompt"`
+	AlertMsg string `json:"alertMsg,omitempty"`
+}
