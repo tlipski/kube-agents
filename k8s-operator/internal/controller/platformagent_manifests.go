@@ -21,6 +21,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"path"
 	"strings"
 
@@ -933,12 +934,7 @@ func buildStatefulSet(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitH
 }
 
 func isValidExtensionFilePath(cleaned string) bool {
-	return !path.IsAbs(cleaned) &&
-		cleaned != "." &&
-		cleaned != ".." &&
-		!strings.HasPrefix(cleaned, "../") &&
-		!strings.Contains(cleaned, "/../") &&
-		!strings.HasSuffix(cleaned, "/..")
+	return cleaned != "." && fs.ValidPath(cleaned)
 }
 
 func extractExtensionPlatformNames(extensions []*agentv1alpha1.AgentExtension) []string {
@@ -1026,6 +1022,16 @@ func buildSandboxCredentialCleanup(image string, pullPolicy corev1.PullPolicy) c
 			AllowPrivilegeEscalation: ptr.To(false),
 			ReadOnlyRootFilesystem:   ptr.To(true),
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		},
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("200m"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
 		},
 	}
 }
@@ -1887,12 +1893,11 @@ func buildExtensionsConfigMap(agent *agentv1alpha1.PlatformAgent, extensions []*
 }
 
 func buildExtensionInstallerContainer(image string, pullPolicy corev1.PullPolicy, homeDir string) corev1.Container {
-	script := fmt.Sprintf("if [ -d /etc/agent-extensions-raw ]; then for f in /etc/agent-extensions-raw/*; do if [ -f \"$f\" ]; then rel=$(basename \"$f\" | sed \"s/___/\\//g\"); dir=$(dirname \"%s/$rel\"); mkdir -p \"$dir\"; cp \"$f\" \"%s/$rel\"; chmod 644 \"%s/$rel\"; fi; done; fi", homeDir, homeDir, homeDir)
 	return corev1.Container{
 		Name:            "extension-installer",
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		Command:         []string{"/bin/sh", "-c", script},
+		Command:         []string{"/bin/sh", "-c", extensionInstallerScript, "--", homeDir},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "platform-agent-data-vol",
@@ -1922,6 +1927,9 @@ func buildExtensionInstallerContainer(image string, pullPolicy corev1.PullPolicy
 		},
 	}
 }
+
+//go:embed extension_installer.sh
+var extensionInstallerScript string
 
 //go:embed leader_elect.py
 var leaderElectScript string
