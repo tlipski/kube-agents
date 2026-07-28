@@ -297,7 +297,19 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
         logger.error(f"Failed to call gateway API chat execution: {exc}")
 
 
-def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[str, Any]) -> None:
+def _append_routing_instruction(prompt_text: str, session_id: str) -> str:
+    """Amend prompt with send_notification MCP tool reference and session_id for thread routing."""
+    if session_id and session_id not in prompt_text:
+        routing_instruction = (
+            f"\n\n---\n"
+            f"When calling your `send_notification` tool to report findings, you MUST pass this exact session ID: "
+            f"'{session_id}' as the `session_id` argument so it routes as a threaded reply to the warning alert."
+        )
+        return prompt_text + routing_instruction
+    return prompt_text
+
+
+def trigger_agent_troubleshooter(session_id: str, alert_msg: str, prompt_text: str) -> None:
     """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background."""
     active_platform = get_active_platform()
     
@@ -307,6 +319,8 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     # 2. Register thread-to-session mappings for two-way chat routing
     if thread_id:
         _register_session_routing(session_id, active_platform, thread_id)
+        prompt_text = _append_routing_instruction(prompt_text, session_id)
+
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
@@ -321,9 +335,9 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
         logger.error(f"Aborting troubleshooting trigger: session creation failed for {session_id}")
         return
 
-    # 5. Formulate instructions query and execute the agent turn
-    agent_query = _build_agent_query(session_id, payload)
-    _start_agent_turn(api_url, session_id, agent_query, headers)
+    # 5. Execute the agent turn with the prompt query
+    _start_agent_turn(api_url, session_id, prompt_text, headers)
+
 
 
 @app.post("/sessions/{session_id}/inject")

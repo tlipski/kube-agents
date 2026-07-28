@@ -16,7 +16,7 @@ os.environ["SESSION_KV_DB_PATH"] = temp_db_path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import session_kv_server
-from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
+from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details, _append_routing_instruction
 
 class TestSessionKvServerUtils(unittest.TestCase):
 
@@ -56,8 +56,21 @@ class TestSessionKvServerUtils(unittest.TestCase):
         # Normal events -> Info
         self.assertEqual(get_severity_details("Normal", "Scheduled"), ("🔵", "Info"))
 
+    def test_append_routing_instruction(self):
+        prompt = "Original prompt text"
+        session_id = "k8s-evt-12345"
+        amended = _append_routing_instruction(prompt, session_id)
+        self.assertIn("Original prompt text", amended)
+        self.assertIn("k8s-evt-12345", amended)
+        self.assertIn("send_notification", amended)
+
+        # Re-applying when session_id is already present should not duplicate
+        re_amended = _append_routing_instruction(amended, session_id)
+        self.assertEqual(amended, re_amended)
+
 
 class TestSessionKvServerApi(unittest.TestCase):
+
 
     def setUp(self):
         # Set up fastapi TestClient
