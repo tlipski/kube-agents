@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 # Ensure repo root and extensions path are in sys.path
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-EXT_PATH = os.path.join(REPO_ROOT, "extensions", "platforms", "pubsub")
+EXT_PATH = os.path.join(REPO_ROOT, "extensions", "pubsub-platform", "files", "platforms", "pubsub")
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 if EXT_PATH not in sys.path:

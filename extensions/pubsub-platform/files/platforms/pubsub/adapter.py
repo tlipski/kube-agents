@@ -721,16 +721,12 @@ class PubSubAdapter(BasePlatformAdapter):
                     thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
                 )
 
-                await self.handle_message(event)
+                daemon_url = route_config.get("daemon_url") or self._daemon_url
+                mode = route_config.get("mode") or self._mode
+                route_owner = route_config.get("owner") or self._owner
 
-                task = self._session_tasks.get(session_key)
-                if task:
-                    logger.info("PubSub: Awaiting agent processing task for session %s under subscription lock...", session_key)
-                    try:
-                        await task
-                        logger.info("PubSub: Agent processing task for session %s completed.", session_key)
-                    except Exception as ex:
-                        logger.error("PubSub: Agent processing task for session %s failed: %s", session_key, ex)
+                if mode == "per-incident":
+                    session_id = await self._create_session(owner=route_owner)
                 else:
                     session_id = route_config.get("target_session") or self._target_session
                     if not session_id:
