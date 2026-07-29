@@ -1,0 +1,22 @@
+============================================================
+Installing GKE Stockout Handler Extension Module
+GCP Project ID:  tomeklipski-izrhgv
+Kubectl Context: gke_tomeklipski-izrhgv_europe-west1_ka-dev-mgmt
+Target Cluster:  ka-production
+Namespace:       kubeagents-system
+PubSub Topic:    gke-stockout-alerts-topic
+Subscription:    gke-stockout-alerts-sub
+============================================================
+Step 1: Enabling required GCP APIs for GKE Stockout Handler extension...
+ERROR: (gcloud.services.enable) There was a problem refreshing your current auth tokens: Access was blocked by Context Aware Access. To resolve this, please visit go/gcloud-caa-error and follow the provided instructions.
+Please run:
+
+  $ gcloud auth login
+
+to obtain new credentials.
+
+If you have already logged in with a different account, run:
+
+  $ gcloud config set account ACCOUNT
+
+to select an already authenticated account to use.

@@ -1,5 +1,5 @@
 apiVersion: kubeagents.x-k8s.io/v1alpha1
-kind: AgentExtension
+kind: AgentPlugin
 metadata:
   name: {{ .Release.Name }}
   labels:
@@ -7,6 +7,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   agentRef: {{ .Values.agentRef | quote }}
+  image: {{ .Values.image | quote }}
   config: |
     approvals:
       mode: off
@@ -40,6 +41,3 @@ spec:
               - gke-stockout-handler
               subscription: {{ .Values.pubsub.subscription | quote }}
               topic: {{ .Values.pubsub.topic | quote }}
-  files:
-    skills/gke-stockout-handler/SKILL.md: |-
-{{ .Files.Get "files/skills/gke-stockout-handler/SKILL.md" | indent 6 }}

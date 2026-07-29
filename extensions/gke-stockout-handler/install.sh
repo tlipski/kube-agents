@@ -4,7 +4,7 @@ set -euo pipefail
 # ==============================================================================
 # GKE Stockout Handler Extension Installation Script
 # Ensures GCP APIs, IAM permissions (least privilege), PubSub topic/subscription,
-# Log Sink, Platform Agent IAM bindings, and Helm AgentExtension deployment.
+# Log Sink, Platform Agent IAM bindings, and Helm AgentPlugin deployment.
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -122,8 +122,13 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --condition=None \
     --project="$PROJECT_ID" --quiet >/dev/null
 
-# Step 5: Deploy AgentExtension via Helm
-echo "Step 5: Deploying GKE Stockout Handler AgentExtension via Helm..."
+# Step 5: Build and Publish Plugin OCI Image
+echo "Step 5: Building and publishing GKE Stockout Handler OCI image..."
+IMAGE="gcr.io/tomeklipski-izrhgv/gke-stockout-handler:latest"
+gcloud builds submit --tag "$IMAGE" "$SCRIPT_DIR"
+
+# Step 6: Deploy AgentPlugin via Helm
+echo "Step 6: Deploying GKE Stockout Handler AgentPlugin via Helm..."
 helm upgrade --install gke-stockout-handler "$SCRIPT_DIR" \
     --kube-context "$CONTEXT" \
     --namespace "$NAMESPACE" \
@@ -132,8 +137,8 @@ helm upgrade --install gke-stockout-handler "$SCRIPT_DIR" \
     --set pubsub.topic="$TOPIC" \
     --set pubsub.subscription="$SUBSCRIPTION"
 
-echo "Step 6: Verifying AgentExtension status in cluster..."
-kubectl --context="$CONTEXT" get agentextension gke-stockout-handler -n "$NAMESPACE"
+echo "Step 7: Verifying AgentPlugin status in cluster..."
+kubectl --context="$CONTEXT" get agentplugin gke-stockout-handler -n "$NAMESPACE"
 
 echo "============================================================"
 echo "GKE Stockout Handler Extension installation complete!"

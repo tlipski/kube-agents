@@ -1,5 +1,5 @@
 apiVersion: kubeagents.x-k8s.io/v1alpha1
-kind: AgentExtension
+kind: AgentPlugin
 metadata:
   name: {{ .Release.Name }}
   labels:
@@ -7,6 +7,7 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   agentRef: {{ .Values.agentRef | quote }}
+  image: {{ .Values.image | quote }}
   config: |
     platform_toolsets:
       pubsub:
@@ -19,10 +20,3 @@ spec:
     platforms:
       pubsub:
         enabled: true
-  files:
-    platforms/pubsub/adapter.py: |-
-{{ .Files.Get "files/platforms/pubsub/adapter.py" | indent 6 }}
-    platforms/pubsub/plugin.yaml: |-
-{{ .Files.Get "files/platforms/pubsub/plugin.yaml" | indent 6 }}
-    platforms/pubsub/__init__.py: |-
-{{ .Files.Get "files/platforms/pubsub/__init__.py" | indent 6 }}

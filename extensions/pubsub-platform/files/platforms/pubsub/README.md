@@ -44,7 +44,7 @@ graph TD
 
 ## Installation
 
-An installation shell script is provided to apply the `AgentExtension` CRD and deploy the chart:
+An installation shell script is provided to apply the `AgentPlugin` CRD and deploy the chart:
 
 ```bash
 bash extensions/pubsub-platform/install.sh --context <your-kubectl-context> --namespace kubeagents-system

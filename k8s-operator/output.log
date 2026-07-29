@@ -1,0 +1,12 @@
+ERROR: (gcloud.builds.submit) There was a problem refreshing your current auth tokens: Access was blocked by Context Aware Access. To resolve this, please visit go/gcloud-caa-error and follow the provided instructions.
+Please run:
+
+  $ gcloud auth login
+
+to obtain new credentials.
+
+If you have already logged in with a different account, run:
+
+  $ gcloud config set account ACCOUNT
+
+to select an already authenticated account to use.

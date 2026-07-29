@@ -1,0 +1,4 @@
+agentRef: "platform-agent"
+topic: "platform-agent-e2e-topic"
+subscription: "platform-agent-e2e-sub"
+image: "gcr.io/tomeklipski-izrhgv/test-pubsub-extension:latest"

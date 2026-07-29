@@ -1,0 +1,22 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: test-validation-extension
+  namespace: kubeagents-system
+spec:
+  agentRef: platform-agent
+  config: |
+    platforms:
+      pubsub:
+        enabled: true
+        extra:
+          subscriptions:
+            test_validation_route:
+              topic: test-validation-topic
+              deliver: chat
+              filter: "event_name == 'validation_test'"
+              validation_code: |
+                is_valid = payload.get('severity') == 'CRITICAL'
+                if not is_valid:
+                    logger.info("Validation failed: severity is not CRITICAL")
+              prompt: "Validation Test Passed: {test_id}"

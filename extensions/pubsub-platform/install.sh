@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Installation script for pubsub-platform extension module.
-# Applies the AgentExtension CRD and installs the pubsub-platform extension.
+# Applies the AgentPlugin CRD and installs the pubsub-platform extension.
 # Respects User Rule 15: Always uses a dedicated kubectl context.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,9 +48,14 @@ echo "Kubectl Context: ${CONTEXT}"
 echo "Namespace: ${NAMESPACE}"
 echo "============================================================"
 
-# Apply the AgentExtension CRD
-echo "Applying AgentExtension CRD..."
-kubectl --context="$CONTEXT" apply -f "${REPO_ROOT}/k8s-operator/config/crd/bases/kubeagents.x-k8s.io_agentextensions.yaml"
+# Apply the AgentPlugin CRD
+echo "Applying AgentPlugin CRD..."
+kubectl --context="$CONTEXT" apply -f "${REPO_ROOT}/k8s-operator/config/crd/bases/kubeagents.x-k8s.io_agentplugins.yaml"
+
+# Build and publish the OCI image
+echo "Building and publishing pubsub-platform OCI image..."
+IMAGE="gcr.io/tomeklipski-izrhgv/pubsub-platform:latest"
+gcloud builds submit --tag "$IMAGE" "$SCRIPT_DIR"
 
 # Deploy extension via deploy_extension.sh
 echo "Deploying pubsub-platform extension via Helm chart..."

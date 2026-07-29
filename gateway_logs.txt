@@ -1,0 +1,35 @@
+[stage2] Fixing ownership of /opt/data (targeted) to hermes (10000)
+[stage2] Warning: chown /opt/data failed (rootless container?) — continuing
+[stage2] Warning: chown /opt/data/home failed (rootless container?) — continuing
+[stage2] Warning: docker_config_migrate.py failed; continuing
+/opt/hermes/docker/stage2-hook.sh: 429: s6-setuidgid: not found
+Syncing bundled skills into ~/.hermes/skills/ ...
+
+Done: 0 new, 0 updated, 93 unchanged. 93 total bundled.
+[stage2] Setup complete; starting user services
+Starting Session KV server on port 8699...
+Configuring default kubectl context to host cluster: ka-dev-mgmt (europe-west1)...
+[MOCK-EXTENSION-PLUGIN] Registering Mock Extension Plugin...
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:50:21.193071
+[hermes-otel] ✓ gke-managed-otel at http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces
+[hermes-otel] ✓ Live dashboard store active
+[hermes-otel] Registered 13 hooks
+┌─────────────────────────────────────────────────────────┐
+│           ⚕ Hermes Gateway Starting...                 │
+├─────────────────────────────────────────────────────────┤
+│  Messaging platforms + cron scheduler                    │
+│  Press Ctrl+C to stop                                   │
+└─────────────────────────────────────────────────────────┘
+
+WARNING gateway.run: No env user allowlists configured. Messaging platforms default to pairing/allowlist policies and will deny unknown senders unless you configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id) or explicitly opt in with GATEWAY_ALLOW_ALL_USERS=true plus dm_policy/group_policy: open on the platform.
+[hooks] Loaded hook 'chat_message_audit' for events: ['agent:start', 'agent:end', 'agent:step']
+WARNING hermes_plugins.pubsub_platform.adapter: PubSub: Could not verify Log Sink 'hermes-pubsub-gke_stockout_alerts-sink': cannot import name 'logging' from 'google.cloud' (unknown location)
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:50:51.193395
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:51:21.193840
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:51:51.194420
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:52:21.194876
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:52:51.195292
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:53:21.195728
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:53:51.196185
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:54:21.196646
+[MOCK-EXTENSION-PLUGIN] hello worldDDDDDDDDDDD 2026-07-26 19:54:51.197144

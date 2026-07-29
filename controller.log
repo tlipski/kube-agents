@@ -1,0 +1,44 @@
+2026-07-29T07:05:30Z	INFO	controller-runtime.builder	Registering a mutating webhook	{"GVK": "kubeagents.x-k8s.io/v1alpha1, Kind=PlatformAgent", "path": "/mutate-kubeagents-x-k8s-io-v1alpha1-platformagent"}
+2026-07-29T07:05:30Z	INFO	controller-runtime.webhook	Registering webhook	{"path": "/mutate-kubeagents-x-k8s-io-v1alpha1-platformagent"}
+2026-07-29T07:05:30Z	INFO	controller-runtime.builder	Registering a validating webhook	{"GVK": "kubeagents.x-k8s.io/v1alpha1, Kind=PlatformAgent", "path": "/validate-kubeagents-x-k8s-io-v1alpha1-platformagent"}
+2026-07-29T07:05:30Z	INFO	controller-runtime.webhook	Registering webhook	{"path": "/validate-kubeagents-x-k8s-io-v1alpha1-platformagent"}
+2026-07-29T07:05:30Z	INFO	setup	Starting manager
+2026-07-29T07:05:30Z	INFO	controller-runtime.webhook	Starting webhook server
+2026-07-29T07:05:30Z	INFO	setup	Disabling HTTP/2
+2026-07-29T07:05:30Z	INFO	starting server	{"name": "health probe", "addr": "[::]:8081"}
+2026-07-29T07:05:30Z	INFO	controller-runtime.certwatcher	Updated current TLS certificate
+I0729 07:05:30.930212       1 leaderelection.go:254] attempting to acquire leader lease kubeagents-system/c5a0294c.kubeagents.x-k8s.io...
+2026-07-29T07:05:30Z	INFO	controller-runtime.webhook	Serving webhook server	{"host": "", "port": 9443}
+2026-07-29T07:05:30Z	INFO	controller-runtime.certwatcher	Starting certificate watcher
+I0729 07:05:59.749454       1 leaderelection.go:268] successfully acquired lease kubeagents-system/c5a0294c.kubeagents.x-k8s.io
+2026-07-29T07:05:59Z	DEBUG	events	kubeagents-controller-manager-7cdcd5c979-xqn4m_466a2c82-9406-45c9-8d40-da6ee4b61516 became leader	{"type": "Normal", "object": {"kind":"Lease","namespace":"kubeagents-system","name":"c5a0294c.kubeagents.x-k8s.io","uid":"178c61d8-a001-4bab-a640-f46e394e5525","apiVersion":"coordination.k8s.io/v1","resourceVersion":"1785308759745007005"}, "reason": "LeaderElection"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1alpha1.PlatformAgent"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.Deployment"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.StatefulSet"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.ServiceAccount"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.PersistentVolumeClaim"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.ConfigMap"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.Service"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.NetworkPolicy"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1alpha1.AgentExtension"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.ClusterRoleBinding"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.ClusterRole"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.RoleBinding"}
+2026-07-29T07:05:59Z	INFO	Starting EventSource	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "source": "kind source: *v1.Role"}
+2026-07-29T07:05:59Z	INFO	Starting Controller	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent"}
+2026-07-29T07:05:59Z	INFO	Starting workers	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "worker count": 1}
+2026-07-29T07:05:59Z	INFO	Reconciling PlatformAgent	{"controller": "platformagent", "controllerGroup": "kubeagents.x-k8s.io", "controllerKind": "PlatformAgent", "PlatformAgent": {"name":"platform-agent","namespace":"kubeagents-system"}, "namespace": "kubeagents-system", "name": "platform-agent", "reconcileID": "8e07da00-1b8f-49bf-bf4f-04e447229118", "name": "platform-agent", "namespace": "kubeagents-system"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "pubsub-platform", "filePath": "platforms/pubsub/__init__.py", "cleanedPath": "platforms/pubsub/__init__.py"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "pubsub-platform", "filePath": "platforms/pubsub/adapter.py", "cleanedPath": "platforms/pubsub/adapter.py"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "pubsub-platform", "filePath": "platforms/pubsub/plugin.yaml", "cleanedPath": "platforms/pubsub/plugin.yaml"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "test-hello-world-extension", "filePath": "platforms/mock_hello_world/__init__.py", "cleanedPath": "platforms/mock_hello_world/__init__.py"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "test-hello-world-extension", "filePath": "platforms/mock_hello_world/plugin.yaml", "cleanedPath": "platforms/mock_hello_world/plugin.yaml"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "test-invalid-paths-extension", "filePath": "../malicious/path.txt", "cleanedPath": "../malicious/path.txt"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "test-invalid-paths-extension", "filePath": "platforms/../../../../../etc/password", "cleanedPath": "../../../../etc/password"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "pubsub-platform", "filePath": "platforms/pubsub/__init__.py", "cleanedPath": "platforms/pubsub/__init__.py"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "pubsub-platform", "filePath": "platforms/pubsub/adapter.py", "cleanedPath": "platforms/pubsub/adapter.py"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "pubsub-platform", "filePath": "platforms/pubsub/plugin.yaml", "cleanedPath": "platforms/pubsub/plugin.yaml"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "test-hello-world-extension", "filePath": "platforms/mock_hello_world/__init__.py", "cleanedPath": "platforms/mock_hello_world/__init__.py"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "test-hello-world-extension", "filePath": "platforms/mock_hello_world/plugin.yaml", "cleanedPath": "platforms/mock_hello_world/plugin.yaml"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "test-invalid-paths-extension", "filePath": "../malicious/path.txt", "cleanedPath": "../malicious/path.txt"}
+2026-07-29T07:06:00Z	INFO	platformagent-manifests	WARNING: Skipping invalid extension file path	{"extension": "test-invalid-paths-extension", "filePath": "platforms/../../../../../etc/password", "cleanedPath": "../../../../etc/password"}

@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"path"
 	"strings"
 	"testing"
 
@@ -306,7 +305,7 @@ func TestBuildDeployment(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", "", nil)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil)
 
 	if dep.Name != "my-agent-gateway" {
 		t.Errorf("expected deployment name my-agent-gateway, got %s", dep.Name)
@@ -712,7 +711,7 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 				t.Errorf("expected isDashboardEnabled to be true")
 			}
 
-			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", "", nil)
+			dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil)
 			if dep.Spec.Template.Spec.ShareProcessNamespace == nil || !*dep.Spec.Template.Spec.ShareProcessNamespace {
 				t.Errorf("expected ShareProcessNamespace to be true, got %v", dep.Spec.Template.Spec.ShareProcessNamespace)
 			}
@@ -769,7 +768,7 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 		t.Errorf("expected isDashboardEnabled to be false")
 	}
 
-	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", "", nil)
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil)
 	if dep.Spec.Template.Spec.ShareProcessNamespace != nil {
 		t.Errorf("expected ShareProcessNamespace to be nil, got %v", *dep.Spec.Template.Spec.ShareProcessNamespace)
 	}
@@ -912,7 +911,7 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", "", nil)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil)
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -953,7 +952,7 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", "", nil)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil)
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -1007,7 +1006,7 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", "", nil)
+	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil)
 	container := dep.Spec.Template.Spec.Containers[0]
 	envMap := make(map[string]corev1.EnvVar)
 	for _, env := range container.Env {
@@ -1415,155 +1414,6 @@ func TestGetConfigMapHash(t *testing.T) {
 	}
 }
 
-func TestIsValidExtensionFilePath(t *testing.T) {
-	testCases := []struct {
-		name     string
-		path     string
-		expected bool
-	}{
-		{
-			name:     "valid skill path",
-			path:     "skills/gke-stockout-handler/SKILL.md",
-			expected: true,
-		},
-		{
-			name:     "valid platform path",
-			path:     "platforms/gke/config.yaml",
-			expected: true,
-		},
-		{
-			name:     "empty path",
-			path:     "",
-			expected: false,
-		},
-		{
-			name:     "absolute path",
-			path:     "/etc/passwd",
-			expected: false,
-		},
-		{
-			name:     "starts with ..",
-			path:     "../etc/passwd",
-			expected: false,
-		},
-		{
-			name:     "equals ..",
-			path:     "..",
-			expected: false,
-		},
-		{
-			name:     "contains /../ directory traversal",
-			path:     "platforms/../../../../../etc/password",
-			expected: false,
-		},
-		{
-			name:     "contains /../ collapsing to valid subpath",
-			path:     "a/b/../../c",
-			expected: true,
-		},
-		{
-			name:     "contains /../ escaping root",
-			path:     "a/b/../../../c",
-			expected: false,
-		},
-		{
-			name:     "ends with /.. collapsing to current dir",
-			path:     "a/..",
-			expected: false,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			cleaned := path.Clean(tc.path)
-			got := isValidExtensionFilePath(cleaned)
-			if got != tc.expected {
-				t.Errorf("isValidExtensionFilePath(path.Clean(%q)) = %v; want %v", tc.path, got, tc.expected)
-			}
-		})
-	}
-}
-
-func TestExtractExtensionPlatformNames_PathTraversal(t *testing.T) {
-	ext := &agentv1alpha1.AgentExtension{
-		Spec: agentv1alpha1.AgentExtensionSpec{
-			Files: map[string]string{
-				"platforms/../../../../../etc/password": "malicious",
-				"../etc/password":                       "malicious",
-				"platforms/valid-platform/config.yaml":  "valid",
-			},
-		},
-	}
-	names := extractExtensionPlatformNames([]*agentv1alpha1.AgentExtension{ext})
-	if len(names) != 1 || names[0] != "valid-platform" {
-		t.Errorf("expected [valid-platform], got %v", names)
-	}
-}
-
-func TestHasExtensionFiles_PathTraversal(t *testing.T) {
-	extOnlyMalicious := &agentv1alpha1.AgentExtension{
-		Spec: agentv1alpha1.AgentExtensionSpec{
-			Files: map[string]string{
-				"platforms/../../../../../etc/password": "malicious",
-				"../etc/password":                       "malicious",
-			},
-		},
-	}
-	if hasExtensionFiles([]*agentv1alpha1.AgentExtension{extOnlyMalicious}) {
-		t.Errorf("expected hasExtensionFiles to return false for extension with only path traversal files")
-	}
-
-	extValid := &agentv1alpha1.AgentExtension{
-		Spec: agentv1alpha1.AgentExtensionSpec{
-			Files: map[string]string{
-				"skills/my-skill/SKILL.md": "content",
-			},
-		},
-	}
-	if !hasExtensionFiles([]*agentv1alpha1.AgentExtension{extValid}) {
-		t.Errorf("expected hasExtensionFiles to return true for extension with valid files")
-	}
-}
-
-func TestBuildExtensionInstallerContainer(t *testing.T) {
-	c := buildExtensionInstallerContainer("my-image:latest", corev1.PullAlways, "/custom/home")
-	if c.Name != "extension-installer" {
-		t.Errorf("expected container name extension-installer, got %s", c.Name)
-	}
-	if len(c.Command) != 5 || c.Command[0] != "/bin/sh" || c.Command[1] != "-c" || c.Command[3] != "--" || c.Command[4] != "/custom/home" {
-		t.Errorf("expected command [/bin/sh -c <script> -- /custom/home], got %v", c.Command)
-	}
-	if c.Command[2] != extensionInstallerScript {
-		t.Errorf("expected script in command[2] to match embedded extensionInstallerScript")
-	}
-}
-
-func TestBuildExtensionsConfigMap_PathTraversal(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-agent",
-			Namespace: "default",
-		},
-	}
-	ext := &agentv1alpha1.AgentExtension{
-		Spec: agentv1alpha1.AgentExtensionSpec{
-			Files: map[string]string{
-				"platforms/../../../../../etc/password": "malicious",
-				"skills/my-skill/SKILL.md":              "valid content",
-			},
-		},
-	}
-
-	cm := buildExtensionsConfigMap(agent, []*agentv1alpha1.AgentExtension{ext})
-	if len(cm.Data) != 1 {
-		t.Errorf("expected 1 file in ConfigMap data, got %d", len(cm.Data))
-	}
-	expectedKey := encodeFilePath("skills/my-skill/SKILL.md")
-	if content, ok := cm.Data[expectedKey]; !ok || content != "valid content" {
-		t.Errorf("expected key %s with 'valid content', got data: %v", expectedKey, cm.Data)
-	}
-}
-
 func TestBuildDeploymentHA(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1581,7 +1431,7 @@ func TestBuildDeploymentHA(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", "", nil)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil)
 	if *dep.Spec.Replicas != 2 {
 		t.Errorf("expected 2 replicas for HA deployment, got %d", *dep.Spec.Replicas)
 	}
@@ -1681,7 +1531,7 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 		},
 	}
 
-	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", "", nil)
+	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil)
 	if *dep.Spec.Replicas != 3 {
 		t.Errorf("expected 3 replicas when explicitly set, got %d", *dep.Spec.Replicas)
 	}
@@ -1748,7 +1598,7 @@ func TestRWOStoragePerReplica(t *testing.T) {
 		t.Errorf("expected 0 custom storage volumes in pod spec when using StatefulSet RWO, got %d", len(vols))
 	}
 
-	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4", "", nil)
+	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4", nil)
 	if *sts.Spec.Replicas != 2 {
 		t.Errorf("expected 2 replicas in StatefulSet, got %d", *sts.Spec.Replicas)
 	}

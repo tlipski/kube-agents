@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Helper script to deploy AgentExtension modules using Helm charts.
+# Helper script to deploy AgentPlugin modules using Helm charts.
 # Respects User Rule 15: Always uses a dedicated kubectl context.
 
 EXTENSION=""
@@ -72,7 +72,7 @@ if [ -z "$CONTEXT" ]; then
 fi
 
 echo "============================================================"
-echo "Deploying AgentExtension module: ${EXTENSION}"
+echo "Deploying AgentPlugin module: ${EXTENSION}"
 echo "Helm Release: ${RELEASE_NAME}"
 echo "Kubectl Context: ${CONTEXT}"
 echo "Namespace: ${NAMESPACE}"
@@ -80,10 +80,10 @@ echo "Chart Path: ${CHART_DIR}"
 echo "============================================================"
 
 # Verify CRD is installed
-echo "Verifying AgentExtension CRD presence in cluster..."
-if ! kubectl --context="$CONTEXT" get crd agentextensions.kubeagents.x-k8s.io >/dev/null 2>&1; then
-    echo "AgentExtension CRD not found. Applying operator CRDs..."
-    kubectl --context="$CONTEXT" apply -f "${REPO_ROOT}/k8s-operator/config/crd/bases/kubeagents.x-k8s.io_agentextensions.yaml"
+echo "Verifying AgentPlugin CRD presence in cluster..."
+if ! kubectl --context="$CONTEXT" get crd agentplugins.kubeagents.x-k8s.io >/dev/null 2>&1; then
+    echo "AgentPlugin CRD not found. Applying operator CRDs..."
+    kubectl --context="$CONTEXT" apply -f "${REPO_ROOT}/k8s-operator/config/crd/bases/kubeagents.x-k8s.io_agentplugins.yaml"
 fi
 
 # Run Helm upgrade --install
@@ -94,7 +94,7 @@ helm upgrade --install "$RELEASE_NAME" "$CHART_DIR" \
     --create-namespace \
     "${HELM_EXTRA_ARGS[@]}"
 
-echo "Verifying AgentExtension status..."
-kubectl --context="$CONTEXT" get agentextensions -n "$NAMESPACE"
+echo "Verifying AgentPlugin status..."
+kubectl --context="$CONTEXT" get agentplugins -n "$NAMESPACE"
 
 echo "Successfully deployed ${EXTENSION} extension module!"

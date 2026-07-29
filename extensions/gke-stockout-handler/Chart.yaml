@@ -1,6 +1,6 @@
 apiVersion: v2
 name: gke-stockout-handler
-description: Helm chart to deploy GKE Stockout Handler AgentExtension for k8s-operator
+description: Helm chart to deploy GKE Stockout Handler AgentPlugin for k8s-operator
 type: application
 version: 0.1.0
 appVersion: "1.0.0"

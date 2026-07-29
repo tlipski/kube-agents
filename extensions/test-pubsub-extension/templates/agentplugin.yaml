@@ -1,0 +1,21 @@
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  agentRef: {{ .Values.agentRef | quote }}
+  image: {{ .Values.image | quote }}
+  config: |
+    platforms:
+      pubsub:
+        enabled: true
+        extra:
+          subscriptions:
+            e2e_pubsub_test:
+              topic: {{ .Values.topic | quote }}
+              subscription: {{ .Values.subscription | quote }}
+              prompt: "[PUB/SUB E2E TEST ALERT] Event: {event_name} Message: {message} Details: {__raw__}"
+              deliver: "log"

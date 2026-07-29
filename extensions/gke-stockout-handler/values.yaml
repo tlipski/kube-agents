@@ -4,6 +4,8 @@ agentRef: "platform-agent"
 
 clusterName: "ka-production"
 
+image: "gcr.io/tomeklipski-izrhgv/gke-stockout-handler:latest"
+
 pubsub:
   topic: "gke-stockout-alerts-topic"
   subscription: "gke-stockout-alerts-sub"

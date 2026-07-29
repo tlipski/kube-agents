@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-hog-workload
+  namespace: gpu-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-hog
+  template:
+    metadata:
+      labels:
+        app: gpu-hog
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-a100-80gb
+      containers:
+      - name: sleep
+        image: ubuntu
+        command: ["sleep", "infinity"]
+        resources:
+          requests:
+            cpu: "2"
+            memory: "8Gi"
+            nvidia.com/gpu: "4"
+          limits:
+            cpu: "2"
+            memory: "8Gi"
+            nvidia.com/gpu: "4"
