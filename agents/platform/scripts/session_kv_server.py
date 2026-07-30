@@ -9,6 +9,8 @@ import re
 import sqlite3
 import subprocess
 import sys
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 import urllib.error
 import urllib.request
 import uuid
@@ -297,7 +299,19 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
         logger.error(f"Failed to call gateway API chat execution: {exc}")
 
 
-def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[str, Any]) -> None:
+def _append_routing_instruction(prompt_text: str, session_id: str) -> str:
+    """Amend prompt with send_notification MCP tool reference and session_id for thread routing."""
+    if session_id and session_id not in prompt_text:
+        routing_instruction = (
+            f"\n\n---\n"
+            f"When calling your `send_notification` tool to report findings, you MUST pass this exact session ID: "
+            f"'{session_id}' as the `session_id` argument so it routes as a threaded reply to the warning alert."
+        )
+        return prompt_text + routing_instruction
+    return prompt_text
+
+
+def trigger_agent_troubleshooter(session_id: str, alert_msg: str, prompt_text: str) -> None:
     """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background."""
     active_platform = get_active_platform()
     
@@ -307,6 +321,8 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     # 2. Register thread-to-session mappings for two-way chat routing
     if thread_id:
         _register_session_routing(session_id, active_platform, thread_id)
+        prompt_text = _append_routing_instruction(prompt_text, session_id)
+
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
@@ -321,44 +337,47 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
         logger.error(f"Aborting troubleshooting trigger: session creation failed for {session_id}")
         return
 
-    # 5. Formulate instructions query and execute the agent turn
-    agent_query = _build_agent_query(session_id, payload)
-    _start_agent_turn(api_url, session_id, agent_query, headers)
+    # 5. Execute the agent turn with the prompt query
+    _start_agent_turn(api_url, session_id, prompt_text, headers)
+
+
+
+def _parse_inject_message(raw_message: Any) -> tuple[str, str]:
+    """Parse raw_message payload into (prompt_text, alert_msg) according to Python standards."""
+    default_alert_msg = "🟡 Alert event received"
+
+    if isinstance(raw_message, dict):
+        prompt_text = raw_message.get("prompt") or raw_message.get("message") or ""
+        alert_msg = raw_message.get("alertMsg") or raw_message.get("alert_msg") or default_alert_msg
+        return str(prompt_text), str(alert_msg)
+
+    if raw_message is not None:
+        return str(raw_message), default_alert_msg
+
+    return "", default_alert_msg
 
 
 @app.post("/sessions/{session_id}/inject")
 def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
-    """Receive the event payload and notify the Platform Agent via Google Chat."""
-    raw_message = request_data.get("message", "")
-    if not raw_message:
+    """Receive the event prompt payload and notify the Platform Agent."""
+    print(f"[session_kv_server] POST /sessions/{session_id}/inject received request_data: {json.dumps(request_data)}", file=sys.stderr, flush=True)
+    logger.info(f"POST /sessions/{session_id}/inject received request_data: {json.dumps(request_data)}")
+    raw_message = request_data.get("message")
+    if raw_message is None:
+        logger.error(f"POST /sessions/{session_id}/inject missing message field")
         raise HTTPException(status_code=400, detail="message field is required")
-        
-    try:
-        payload = json.loads(raw_message)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to parse inner payload JSON: {exc}")
-        
-    event_reason = payload.get("reason") or "Unknown"
-    namespace = payload.get("namespace") or "default"
-    object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
-    object_name = payload.get("name") or ""
-    message = payload.get("message") or ""
-    count = payload.get("count") if payload.get("count") is not None else 1
-    event_type = payload.get("type") or "Warning"
 
-    severity_emoji, severity_label = get_severity_details(event_type, event_reason)
-    clean_name = clean_workload_name(object_kind, object_name)
-    clean_reason = clean_reason_label(event_reason)
-    clean_msg = clean_event_message(message)
+    prompt_text, alert_msg = _parse_inject_message(raw_message)
 
-    # Construct a pretty notification alert
-    alert_msg = (
-        f"{severity_emoji} *{severity_label}:* {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
-        f"🌱 _Digging down to the root cause..._"
-    )
-    
-    # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond
-    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload)
+    if not prompt_text:
+        logger.error(f"POST /sessions/{session_id}/inject failed to extract prompt from message payload")
+        raise HTTPException(status_code=400, detail="Failed to extract prompt from message payload")
+
+    print(f"[session_kv_server] POST /sessions/{session_id}/inject extracted alert_msg={alert_msg!r}, prompt_length={len(prompt_text)}", file=sys.stderr, flush=True)
+    logger.info(f"POST /sessions/{session_id}/inject extracted alert_msg={alert_msg!r}, prompt_length={len(prompt_text)}")
+
+    # Delegate agent trigger to FastAPI BackgroundTasks
+    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, prompt_text)
     
     return {"status": "injected"}
 

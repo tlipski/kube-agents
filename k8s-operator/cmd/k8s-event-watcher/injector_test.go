@@ -91,7 +91,7 @@ func TestInjectorInject(t *testing.T) {
 		}
 
 		var parsedPayload InjectPayload
-		if err := json.Unmarshal([]byte(req.Message), &parsedPayload); err != nil {
+		if err := json.Unmarshal([]byte(req.Message.Prompt), &parsedPayload); err != nil {
 			t.Fatalf("failed to unmarshal message payload: %v", err)
 		}
 
@@ -112,7 +112,9 @@ func TestInjectorInject(t *testing.T) {
 		t.Fatalf("failed to build injector: %v", err)
 	}
 
-	err = inj.Inject(context.Background(), sessionID, payload)
+	payloadBytes, _ := json.Marshal(payload)
+	expectedPrompt := string(payloadBytes)
+	err = inj.InjectPrompt(context.Background(), sessionID, expectedPrompt, "🚨 Test Alert")
 	if err != nil {
 		t.Fatalf("Inject call failed: %v", err)
 	}

@@ -107,19 +107,20 @@ func (i *injector) CreateSession(ctx context.Context) (string, error) {
 
 // injectMessageRequest wraps the event details payload for session ingestion.
 type injectMessageRequest struct {
-	Message string `json:"message"`
+	Message AlertPayload `json:"message"`
 }
 
-// Inject posts the triage event details to the specified session's queue.
-func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) error {
+// InjectPrompt posts the formatted prompt string and optional alert summary to the specified session's queue.
+func (i *injector) InjectPrompt(ctx context.Context, sessionID string, prompt string, alertMsg string) error {
 	if sessionID == "" {
 		return errors.New("injector: Inject: sessionID is required")
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("injector: marshal payload: %w", err)
-	}
-	wrapped, err := json.Marshal(injectMessageRequest{Message: string(body)})
+	wrapped, err := json.Marshal(injectMessageRequest{
+		Message: AlertPayload{
+			Prompt:   prompt,
+			AlertMsg: alertMsg,
+		},
+	})
 	if err != nil {
 		return fmt.Errorf("injector: wrap inject envelope: %w", err)
 	}
@@ -143,4 +144,14 @@ func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectP
 		return fmt.Errorf("injector: POST inject: status %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil
+}
+
+// Inject posts the triage event details to the specified session's queue.
+func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("injector: marshal payload: %w", err)
+	}
+	alertMsg := fmt.Sprintf("🚨 Kubernetes Event: %s on %s %s/%s", payload.Reason, payload.KindOfObject, payload.Namespace, payload.Name)
+	return i.InjectPrompt(ctx, sessionID, string(body), alertMsg)
 }

@@ -246,15 +246,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			Labels:        ev.Labels,
 		},
 	}
+	prompt := BuildAgentQuery(ev, d.cluster, sid)
+	alertMsg := fmt.Sprintf("🚨 Kubernetes Event: %s on %s %s/%s", ev.Key.Reason, ev.KindOfObject, ev.Namespace, ev.Name)
 	if d.dryRun {
 		out, _ := json.MarshalIndent(payload, "", "  ")
-		fmt.Printf("--- dry-run payload for session %q ---\n%s\n", sid, string(out))
+		fmt.Printf("--- dry-run payload for session %q ---\nPrompt:\n%s\nPayload:\n%s\nAlertMsg:\n%s\n", sid, prompt, string(out), alertMsg)
 		d.metrics.eventsInjected.WithLabelValues(ev.Key.Reason, ev.Namespace).Inc()
 		log.Printf("would-fire %s pod=%s/%s (sid=%s, mode=%s, dry-run)",
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
-	if err := d.injector.Inject(ctx, sid, payload); err != nil {
+	if err := d.injector.InjectPrompt(ctx, sid, prompt, alertMsg); err != nil {
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
 		d.metrics.injectErrors.WithLabelValues(ev.Key.Reason, "inject").Inc()
 		return

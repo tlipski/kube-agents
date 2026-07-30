@@ -50,6 +50,41 @@ def _get_nested_value(payload: Any, path: str) -> Any:
 
 
 
+def _create_session_sync(daemon_url: str, bearer_token: str, owner: str) -> str:
+    url = f"{daemon_url.rstrip('/')}/sessions"
+    req = urllib.request.Request(url, data=b"", method="POST")
+    if bearer_token:
+        req.add_header("Authorization", f"Bearer {bearer_token}")
+    if owner:
+        req.add_header("X-Asserted-Caller", owner)
+    with urllib.request.urlopen(req, timeout=10.0) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        session_id = data.get("sessionID", "")
+        if not session_id:
+            raise RuntimeError("POST /sessions returned empty sessionID")
+        return session_id
+
+
+def _inject_prompt_sync(daemon_url: str, session_id: str, prompt: str, bearer_token: str, owner: str, alert_msg: Optional[str] = None) -> None:
+    url = f"{daemon_url.rstrip('/')}/sessions/{session_id}/inject"
+    msg_payload = {"prompt": prompt}
+    if alert_msg:
+        msg_payload["alertMsg"] = alert_msg
+    payload = {"message": msg_payload}
+    data_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data_bytes, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    if bearer_token:
+        req.add_header("Authorization", f"Bearer {bearer_token}")
+    if owner:
+        req.add_header("X-Asserted-Caller", owner)
+    with urllib.request.urlopen(req, timeout=10.0) as resp:
+        if resp.status < 200 or resp.status >= 300:
+            resp_body = resp.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"POST inject status {resp.status}: {resp_body}")
+
+
 class PubSubAdapter(BasePlatformAdapter):
     """Google Cloud Pub/Sub pull subscriber adapter for Hermes Agent.
     
@@ -73,6 +108,42 @@ class PubSubAdapter(BasePlatformAdapter):
         self.gateway_runner = None
         self._locks: Dict[str, asyncio.Lock] = {}
         self._message_timestamps: Dict[str, List[float]] = {}
+        self._daemon_url: str = (
+            extra.get("daemon_url")
+            or os.environ.get("DAEMON_URL")
+            or os.environ.get("PLATFORM_DAEMON_URL")
+            or "http://localhost:8699"
+        )
+
+        token_env_var = extra.get("token_env", "")
+        token_from_env = os.environ.get(token_env_var, "") if token_env_var else ""
+        self._bearer_token: str = (
+            extra.get("bearer_token")
+            or token_from_env
+            or os.environ.get("AGENT_BEARER_TOKEN", "")
+        )
+        self._owner: str = (
+            extra.get("owner")
+            or extra.get("asserted_caller")
+            or os.environ.get("ASSERTED_CALLER", "")
+        )
+        self._mode: str = extra.get("mode", "per-incident")
+        self._target_session: str = extra.get("target_session", "")
+
+    async def _create_session(self, owner: Optional[str] = None) -> str:
+        """Call POST /sessions to create a new session ID via daemon HTTP API."""
+        daemon_url = self._daemon_url
+        bearer_token = self._bearer_token
+        asserted_owner = owner or self._owner
+        return await asyncio.to_thread(_create_session_sync, daemon_url, bearer_token, asserted_owner)
+
+    async def _inject_prompt(self, session_id: str, prompt: str, owner: Optional[str] = None, alert_msg: Optional[str] = None) -> None:
+        """Call POST /sessions/{session_id}/inject with prompt payload via daemon HTTP API."""
+        daemon_url = self._daemon_url
+        bearer_token = self._bearer_token
+        asserted_owner = owner or self._owner
+        await asyncio.to_thread(_inject_prompt_sync, daemon_url, session_id, prompt, bearer_token, asserted_owner, alert_msg)
+
 
     def _get_project_id(self) -> Optional[str]:
         """Detect GCP Project ID from auth credentials or environment variables."""
@@ -650,18 +721,25 @@ class PubSubAdapter(BasePlatformAdapter):
                     thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
                 )
 
-                await self.handle_message(event)
+                daemon_url = route_config.get("daemon_url") or self._daemon_url
+                mode = route_config.get("mode") or self._mode
+                route_owner = route_config.get("owner") or self._owner
 
-                task = self._session_tasks.get(session_key)
-                if task:
-                    logger.info("PubSub: Awaiting agent processing task for session %s under subscription lock...", session_key)
-                    try:
-                        await task
-                        logger.info("PubSub: Agent processing task for session %s completed.", session_key)
-                    except Exception as ex:
-                        logger.error("PubSub: Agent processing task for session %s failed: %s", session_key, ex)
+                if mode == "per-incident":
+                    session_id = await self._create_session(owner=route_owner)
                 else:
-                    logger.warning("PubSub: No active session task found for session %s to await.", session_key)
+                    session_id = route_config.get("target_session") or self._target_session
+                    if not session_id:
+                        raise ValueError("PubSub: 'target_session' is required when mode is 'shared'")
+
+                alert_msg = route_config.get("alert_msg") or payload.get("event_name")
+                if alert_msg and isinstance(alert_msg, str):
+                    alert_msg = self._render_prompt(alert_msg, payload, route_name)
+
+                logger.info("PubSub: Injecting prompt to session %s on daemon %s (mode=%s)", session_id, daemon_url, mode)
+                await self._inject_prompt(session_id, prompt, owner=route_owner, alert_msg=alert_msg)
+
+
 
         except Exception as e:
             logger.exception("PubSub: Error in _process_message on route %s: %s", route_name, e)

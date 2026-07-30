@@ -16,7 +16,7 @@ os.environ["SESSION_KV_DB_PATH"] = temp_db_path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import session_kv_server
-from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
+from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details, _append_routing_instruction, _parse_inject_message
 
 class TestSessionKvServerUtils(unittest.TestCase):
 
@@ -56,8 +56,34 @@ class TestSessionKvServerUtils(unittest.TestCase):
         # Normal events -> Info
         self.assertEqual(get_severity_details("Normal", "Scheduled"), ("🔵", "Info"))
 
+    def test_append_routing_instruction(self):
+        prompt = "Original prompt text"
+        session_id = "k8s-evt-12345"
+        amended = _append_routing_instruction(prompt, session_id)
+        self.assertIn("Original prompt text", amended)
+        self.assertIn("k8s-evt-12345", amended)
+        self.assertIn("send_notification", amended)
+
+        # Re-applying when session_id is already present should not duplicate
+        re_amended = _append_routing_instruction(amended, session_id)
+        self.assertEqual(amended, re_amended)
+
+    def test_parse_inject_message(self):
+        # Dict payload with alertMsg
+        dict_payload = {"prompt": "Fix scale up", "alertMsg": "🚨 GKE Alert"}
+        prompt, alert_msg = _parse_inject_message(dict_payload)
+        self.assertEqual(prompt, "Fix scale up")
+        self.assertEqual(alert_msg, "🚨 GKE Alert")
+
+        # Plain string payload
+        plain_payload = "Simple prompt string"
+        prompt, alert_msg = _parse_inject_message(plain_payload)
+        self.assertEqual(prompt, "Simple prompt string")
+        self.assertEqual(alert_msg, "🟡 Alert event received")
+
 
 class TestSessionKvServerApi(unittest.TestCase):
+
 
     def setUp(self):
         # Set up fastapi TestClient
@@ -173,34 +199,24 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "name": "test-pod",
             "message": "some message"
         }
-        query = session_kv_server._build_agent_query("test-session", payload)
-        self.assertIn("project=test-project-id", query)
-        self.assertNotIn("jayantid-gkedemos", query)
+        resp = self.client.post("/sessions/test-session-123/inject", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"status": "injected"})
+        mock_trigger.assert_called_once_with("test-session-123", "🟡 Alert event received", "Analyze Kubernetes event warning for test-pod")
 
-    @patch.dict(os.environ, {"GCP_PROJECT": "test-project-legacy"})
-    def test_build_agent_query_with_legacy_project(self):
+    @patch("session_kv_server.trigger_agent_troubleshooter")
+    def test_inject_message_with_alert_msg(self, mock_trigger):
         payload = {
-            "reason": "FailedMount",
-            "namespace": "test-ns",
-            "kind_of_object": "Pod",
-            "name": "test-pod",
-            "message": "some message"
+            "message": {
+                "prompt": "Analyze Kubernetes event warning for test-pod",
+                "alertMsg": "🚨 Kubernetes Event: ImagePullBackOff on Pod default/test-pod"
+            }
         }
-        with patch.dict(os.environ, {"GCP_PROJECT_ID": ""}):
-            query = session_kv_server._build_agent_query("test-session", payload)
-            self.assertIn("project=test-project-legacy", query)
+        resp = self.client.post("/sessions/test-session-123/inject", json=payload)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"status": "injected"})
+        mock_trigger.assert_called_once_with("test-session-123", "🚨 Kubernetes Event: ImagePullBackOff on Pod default/test-pod", "Analyze Kubernetes event warning for test-pod")
 
-    def test_build_agent_query_no_project(self):
-        payload = {
-            "reason": "FailedMount",
-            "namespace": "test-ns",
-            "kind_of_object": "Pod",
-            "name": "test-pod",
-            "message": "some message"
-        }
-        with patch.dict(os.environ, {"GCP_PROJECT_ID": "", "GCP_PROJECT": ""}):
-            query = session_kv_server._build_agent_query("test-session", payload)
-            self.assertIn("project=", query)
 
 
 if __name__ == "__main__":
