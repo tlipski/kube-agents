@@ -21,7 +21,7 @@ retention policy ownership, and the leader-gated single-writer contract.
 
 - The container's process model — what starts a long-lived process, restarts it, and reports its
   health. [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) owns that, and this design
-  depends on it: the KV server becomes a supervised child there, and the readiness signal, the
+  depends on it: the KV server becomes a supervised process there, and the readiness signal, the
   restart policy, and the lease timing guarantee at failover are all cited from it rather than
   restated here. **Its phases S1–S3 are prerequisites for phase 3 below.**
 - The Google Chat attribution path, which
@@ -230,15 +230,15 @@ for, and it is now the most serious one open.
   `agents/platform/scripts/` is copied into the image. A package placed there is importable from
   the Chat Agent's plugins, the Platform Agent's plugins, and the MCP servers alike. This is what
   makes a single shared storage library possible without vendoring.
-- **The election supervises a child, but not everywhere.** `leader_elect.py:138` starts
+- **The election supervises a process, but not everywhere.** `leader_elect.py:138` starts
   `hermes gateway run` on acquire and terminates it on loss (L143-153); it labels the pod
   `kubeagents.io/is-leader=true` and the Service selects on that label
-  (`platformagent_manifests.go:2730`). A second child process gets single-writer semantics and a
+  (`platformagent_manifests.go:2730`). A second supervised process gets single-writer semantics and a
   leader-routed network path for free — **but only at `replicas > 1`**, because the operator makes
   the script the container's exec target only in that branch
   (`platformagent_manifests.go:2209-2212`), and the script itself `execvp`s the gateway when the
   lease environment is absent (`leader_elect.py:60-61`). At the default single replica there is
-  no supervisor to be a child of.
+  no supervisor to be supervised by.
   [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) closes that; this design assumes
   its S1–S3 have shipped.
 - **The pod's one key is not a set of caller identities.** #616 gives every container the same
@@ -683,7 +683,7 @@ at-least-once across restarts (R2).
 **The drainer runs inside the API process, not beside it.** Seam A's rule is that one process
 opens the file, and section 4's journal mode enforces it with `locking_mode=EXCLUSIVE`; a
 separate worker process would be a second opener and could not open it at all. So the drainer is
-a task started on app startup and stopped on shutdown, and the supervisor has one KV child rather
+a task started on app startup and stopped on shutdown, and the supervisor has one KV process rather
 than two. It gets **its own executor**, not the shared 40-slot AnyIO threadpool — otherwise R4
 returns through the worker instead of through `_start_agent_turn`, which is the failure the
 outbox exists to prevent. The bound on that executor is what stops an alert burst from starving
@@ -722,20 +722,20 @@ sequenceDiagram
 
     SV->>Lease: acquire
     SV->>SV: label pod is-leader=true
-    SV->>KV: start child (one process)
+    SV->>KV: start (one process, not two)
     KV->>KV: open DB with retry until the outgoing leader releases
     W->>Lease: watch; holder == $HOSTNAME ?
     Note over W: followers idle here — block, never exit
     W->>KV: POST /v1/alerts (127.0.0.1, bearer)
     SV->>Lease: renew every 5s
-    Note over SV: on loss: stop children, drop label
+    Note over SV: on loss: stop processes, drop label
     Note over W: on loss: stop watching, resume idling
 ```
 
 Concretely:
 
-- The supervisor starts the KV server as a second child on acquire and stops it on loss, exactly
-  as it already does for the gateway. **One child, not two** — the outbox drainer is a task inside
+- The supervisor starts the KV server as a second process on acquire and stops it on loss, exactly
+  as it already does for the gateway. **One process, not two** — the outbox drainer is a task inside
   the API process, for the reason Seam D gives.
 - **Delete entrypoint step 5** (`docker-entrypoint.sh:960-967`) and
   `start_session_kv_server()` (`platform_mcp_server.py:613-654`). One owner, no TOCTOU (R7). This
@@ -805,22 +805,22 @@ variable the server reads.
 `locking_mode=EXCLUSIVE` means the incoming leader's KV server cannot open the database until the
 outgoing one has closed it. [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) §3.5
 makes that ordering hold in the absence of a partition, by requiring
-`lease_duration > max_poll + child_grace`; it explicitly does not fence a partitioned-but-live
+`lease_duration > max_poll + process_grace`; it explicitly does not fence a partitioned-but-live
 leader, and on a network filesystem a hard-killed holder's locks clear on the file server's
 schedule rather than the pod's.
 
 So the server retries. Startup acquires the lock with exponential backoff over a bounded window —
 60 s — logging each attempt, and fails only past it. Two constraints tie that number down at both
 ends: it must be shorter than the supervisor's restart cap, or a slow handover looks like a
-crash-looping child; and the readiness probe's `failureThreshold × periodSeconds` must be longer
+crash-looping process; and the readiness probe's `failureThreshold × periodSeconds` must be longer
 than it, or a slow handover restarts the pod. Section 7 checks the inequality rather than trusting
 the prose.
 
 ### 4.3 The watcher runs on the leader too — so every caller is loopback
 
 `session_store`, `session_otel_bridge`, `incident_context`, and the MCP servers all live in or
-below the gateway process, which only the leader runs, and the KV server is a sibling child of
-the same supervisor. They are therefore always co-located with the server they call.
+below the gateway process, which only the leader runs, and the KV server is a sibling under the
+same supervisor. They are therefore always co-located with the server they call.
 
 One caller is not in that list and has to be accounted for: the **dashboard container**. The
 operator gives it `SESSION_KV_DB_PATH` (`platformagent_manifests.go:2280-2282`) and mounts
@@ -1018,7 +1018,7 @@ for phase 3 here and are not repeated in this table.
 | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1     | Internal only: split into `session_kv/server/` — including `quota.py` for the third table — schema versioning (with the unstamped-database case), indices, `BEGIN IMMEDIATE`, unified retention, subprocess timeouts, leaf-module extraction. **`journal_mode=TRUNCATE` set identically in every opener.** Dashboard env/mount settled either way. Consumers untouched. | Low — pure refactor, existing tests cover it                                                                                                                                                                        |
 | 2     | **Lease-gate the watcher**, with connection-refused backoff. Fixes N-duplicate alerts on its own, and must precede phase 3 — after that, a follower's watcher has no local listener.                                                                                                                                                                                    | Medium — Go change; failover behaviour needs soaking                                                                                                                                                                |
-| 3     | **Survivability.** KV server becomes a supervised child; delete entrypoint step 5 and the MCP launcher, and rewrite the `IS_BOOTSTRAP_PRIMARY` comment §4 quotes. Retires the salt asymmetry in R7.                                                                                                                                                                     | Medium — entrypoint + operator, loopback-only throughout                                                                                                                                                            |
+| 3     | **Survivability.** KV server becomes a supervised process; delete entrypoint step 5 and the MCP launcher, and rewrite the `IS_BOOTSTRAP_PRIMARY` comment §4 quotes. Retires the salt asymmetry in R7.                                                                                                                                                                   | Medium — entrypoint + operator, loopback-only throughout                                                                                                                                                            |
 | 4     | Trust **zones and scopes** on top of the single key #616 shipped; per-identity tokens added to the existing chart-generated Secret; generalise `POST /v1/sessions` (idempotency key, prompt, skill) and widen its index to cover event dedup; publish `client.py`; old routes kept as deprecated aliases.                                                               | Medium — but smaller than first scoped: authentication, the token plumbing, and the loopback bind already exist. `SESSION_KV_API_KEY` stays valid for one release, so the watcher no longer has to move in lockstep |
 | 5     | **Port the three direct openers to `client.py`**, with the write-through cache and fail-open miss behaviour.                                                                                                                                                                                                                                                            | Medium — only now is this safe                                                                                                                                                                                      |
 | 6     | **`locking_mode=EXCLUSIVE` on RWX**, with the startup lock retry. Only now is the server the last opener.                                                                                                                                                                                                                                                               | Medium — first change that can fail at failover                                                                                                                                                                     |
@@ -1175,7 +1175,7 @@ each.
   closing the gap entirely would need a standby watcher holding warm streams without injecting,
   which is more machinery than the problem justifies.
 - **No metrics endpoint on the KV server** (R13's second half). The logging half is fixed as a
-  side effect of the supervisor owning the child — output goes to inherited stderr and reaches
+  side effect of the supervisor owning the process — output goes to inherited stderr and reaches
   fluent-bit, instead of an unbounded file on the PVC — but nothing here exports series. The
   watcher's own registry is dormant for the same reason (`--metrics-addr` unset), so adding one
   here would be the first, and it belongs with that decision rather than inside this
