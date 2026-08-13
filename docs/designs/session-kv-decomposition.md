@@ -208,7 +208,7 @@ for, and it is now the most serious one open.
 
 | ID  | Severity | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | --- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| R1  | High     | **Unsupervised and unmonitored.** Started with `&` (`docker-entrypoint.sh:960-967`) and never restarted. The gateway container has **no readiness or liveness probe at all** (`platformagent_manifests.go:2248-2270`), so `/healthz` is dead code and a dead KV server is invisible.                                                                                                                                                                                                                                                                                                                                                                               |
+| R1  | High     | **Unsupervised and unmonitored.** Started with `&` (`docker-entrypoint.sh:960-967`) and never restarted. The gateway container has **no readiness or liveness probe at all** (`platformagent_manifests.go:2248-2270`), so `/healthz` is never called and a stopped KV server is invisible.                                                                                                                                                                                                                                                                                                                                                                         |
 | R2  | High     | **At-most-once triage.** `BackgroundTasks` (L666) holds the whole flow in memory. A restart between `200 {"status":"injected"}` and the gateway call loses the incident silently — and the watcher, having got its 200, dedup-suppresses the retry for the dedup window, widened to 24h by #640.                                                                                                                                                                                                                                                                                                                                                                   |
 | R3  | High     | **Multi-writer SQLite on NFS.** At `replicas > 1` the operator moves the volume to RWX / `standard-rwx` (`platformagent_manifests.go:100-112`). SQLite WAL requires shared memory and is unsupported on network filesystems. `journal_mode=WAL` is still set by both openers (`session_kv_server.py:221`, `store.py:179`). Every replica runs its own KV server, because entrypoint step 5 precedes `exec "$@"` and so never sees the election.                                                                                                                                                                                                                    |
 | R4  | Medium   | **Threadpool starvation.** Sync endpoints share AnyIO's 40-slot pool. `_start_agent_turn` holds a slot for up to 300 s (`urlopen(..., timeout=300.0)`, L567) and `hermes send` has **no timeout at all** (L375-381). One hang blocks `/v1/incidents/by-thread`, whose caller gives up at 2 s and fails open (`incident_context/__init__.py:47`) — users' replies silently lose context.                                                                                                                                                                                                                                                                            |
@@ -446,7 +446,7 @@ fail-open exactly as the current implementation already is.
 
 #### What this costs
 
-Today a dead KV server degrades gracefully: `session_store` keeps persisting and OTel
+Today a stopped KV server degrades gracefully: `session_store` keeps persisting and OTel
 attribution keeps working, because both bypass it. Under an API-only rule they stop — the blast
 radius of the server being down grows from "no incident triage" to "no session persistence and
 no attribution either."
@@ -667,7 +667,7 @@ CREATE TABLE outbox (
   payload         TEXT NOT NULL,
   step            TEXT NOT NULL DEFAULT 'post_alert',
   step_result     TEXT,
-  state           TEXT NOT NULL DEFAULT 'pending',   -- pending | running | done | dead
+  state           TEXT NOT NULL DEFAULT 'pending',   -- pending | running | done | failed
   attempts        INTEGER NOT NULL DEFAULT 0,
   max_attempts    INTEGER NOT NULL DEFAULT 8,
   last_error      TEXT,
@@ -703,7 +703,7 @@ binding, and the flow degrades gracefully without one — the triage turn still 
 thread (`platform_mcp_server.py:569-581`). The row is marked with `last_error` so the ambiguity is
 visible rather than inferred.
 
-Rows that exhaust `max_attempts` become `state = 'dead'` with their last error, and
+Rows that exhaust `max_attempts` become `state = 'failed'` with their last error, and
 `GET /v1/outbox/stats` (zone 1) reports the state and attempt distribution. That endpoint is not
 a convenience: it is the only way to inspect the queue once the database is opened exclusively,
 and section 7's end-to-end check uses it in place of the `sqlite3` shell it would otherwise
@@ -769,7 +769,7 @@ phase 3.
 - The watcher's `--daemon-url` **stays** `127.0.0.1:8699`, because section 4.3 gates the watcher
   on the same lease. It gains a real token and bounded retry with backoff. Nothing needs to be
   published on the Service, and 8699 never leaves the pod.
-- R1's "a dead KV server is invisible" is closed by the supervisor's health endpoint and the
+- R1's "a stopped KV server is invisible" is closed by the supervisor's health endpoint and the
   readiness probe that reads it, specified in
   [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) §3.4. Probing `/healthz` on 8699
   directly would be wrong: followers do not run a KV server, so every follower would be
@@ -827,7 +827,7 @@ operator gives it `SESSION_KV_DB_PATH` (`platformagent_manifests.go:2280-2282`) 
 `system-metadata` at the database directory (`:2345-2349`), and unlike everything above it runs
 on every replica — including followers, which have no KV server. Whether `hermes dashboard`
 actually opens the file is the open question, and it decides which of two things phase 1 does:
-if it does not, the environment variable and the mount are dead configuration and get deleted
+if it does not, the environment variable and the mount are unused configuration and get deleted
 early with a golden-file assertion pinning their absence; if it does, it becomes an API caller
 that fails open on followers, which is acceptable precisely because the Service selects the
 leader and a follower's dashboard is not serving anyone. What it must not be is discovered during
@@ -1023,7 +1023,7 @@ for phase 3 here and are not repeated in this table.
 | 5     | **Port the three direct openers to `client.py`**, with the write-through cache and fail-open miss behaviour.                                                                                                                                                                                                                                                            | Medium — only now is this safe                                                                                                                                                                                      |
 | 6     | **`locking_mode=EXCLUSIVE` on RWX**, with the startup lock retry. Only now is the server the last opener.                                                                                                                                                                                                                                                               | Medium — first change that can fail at failover                                                                                                                                                                     |
 | 7     | Add the `incident-triage` skill; shrink `_build_agent_query` to an invocation; extract `render.py`, `notify.py`, `triage.py`.                                                                                                                                                                                                                                           | Medium — changes agent-visible prompt text                                                                                                                                                                          |
-| 8     | Outbox replaces `BackgroundTasks`: in-process drainer, step-wise recovery, dead-letter, `GET /v1/outbox/stats`.                                                                                                                                                                                                                                                         | Medium                                                                                                                                                                                                              |
+| 8     | Outbox replaces `BackgroundTasks`: in-process drainer, step-wise recovery, a terminal `failed` state, `GET /v1/outbox/stats`.                                                                                                                                                                                                                                           | Medium                                                                                                                                                                                                              |
 | 9     | Delete the deprecated aliases. Drop `SESSION_KV_DB_PATH` and the `system-metadata` mount from every container that no longer opens the file.                                                                                                                                                                                                                            | Low — but see below                                                                                                                                                                                                 |
 
 Phase 2 is what removes the need for a Service-exposed 8699 and the cross-pod hop that came
