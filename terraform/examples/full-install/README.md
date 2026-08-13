@@ -9,10 +9,10 @@ same cluster, service accounts, and IAM bindings.
 ## What it provisions
 
 - The required Google APIs (`google_project_service`, never disabled on
-  destroy), including the Chat and KMS APIs only when the matching feature is
-  enabled.
+  destroy), including the Cloud KMS API for GKE database encryption and the Chat
+  API when Google Chat is enabled.
 - A GKE Autopilot cluster ([`gke-cluster`](../../modules/gke-cluster) module)
-  with Workload Identity enabled.
+  with Workload Identity and Cloud KMS database encryption (CMEK) enabled.
 - The agent's GCP identity ([`kube-agents-iam`](../../modules/kube-agents-iam)
   module): the `kubeagents-platform-gsa` service account, its read-only
   project roles, and the Workload Identity binding to the
@@ -31,11 +31,19 @@ same cluster, service accounts, and IAM bindings.
   composed from your variables. `model_provider` selects which provider
   LiteLLM routes `model-default` to (set the matching `*_api_key` variable);
   `model_default_name` overrides the per-provider default model.
+- Two `random_password` values added to that Secret rather than asked for:
+  `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
+  and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
+  Generated here rather than left to the chart so `terraform apply` stays
+  idempotent without reading the cluster — and because rotating the salt
+  re-anonymises every user, severing their past sessions from their future
+  ones.
 
 > [!WARNING]
 > The credential variables (`api_server_key`, `*_api_key`, Slack tokens) are
 > marked `sensitive`, which redacts plan output — but like every secret passed
 > through Terraform they are stored **in plaintext in the Terraform state**.
+> The two generated `SESSION_KV_*` values live in state for the same reason.
 > Keep the state in a protected backend (e.g. a GCS bucket with tight IAM),
 > not on a shared disk or in version control.
 
@@ -144,3 +152,10 @@ terraform destroy
 
 The cluster is created with `deletion_protection = true` by default; set the
 variable to `false` (and apply) before a destroy can remove the cluster.
+
+> [!NOTE]
+> Cloud KMS key rings and crypto keys (for GKE CMEK and optional GitHub minter)
+> cannot be deleted from GCP. `terraform destroy` removes them from state, but
+> re-applying with the same names requires either importing them back into state
+> (`terraform import module.gke_cluster.google_kms_key_ring.gke_keyring[0] ...`)
+> or choosing new key/keyring names.

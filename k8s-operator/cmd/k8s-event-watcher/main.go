@@ -366,7 +366,7 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 			continue
 		}
 
-		cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+		cfg, err := clientConfigForProfile(kubeconfig, *identity)
 		if err != nil {
 			skip("kubeconfig %s: %v", kubeconfig, err)
 			continue
@@ -392,6 +392,53 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 		clusters = append(clusters, tc)
 	}
 	return clusters, nil
+}
+
+// clientConfigForProfile builds a rest.Config from a profile's kubeconfig and
+// refuses anything that does not demonstrably point at the cluster the profile
+// claims to be.
+//
+// It exists because clientcmd.BuildConfigFromFlags cannot be trusted to fail
+// here. Given an *empty* kubeconfig it does not return an error: the deferred
+// loader treats an empty config as "nothing was specified" and silently falls
+// back to the in-cluster config. A profile whose credential fetch died before
+// writing anything therefore produced a working client — pointed at the
+// management cluster, the one cluster it certainly was not describing.
+//
+// Nothing downstream could notice. The cluster label comes from
+// cluster_identity, not from the connection, so that profile was watched under
+// its own name while reading another cluster's events. Observed in autopush:
+// two watchers on the management cluster, every event reported twice, one copy
+// naming a cluster where nothing had happened. A corrupt kubeconfig fails
+// loudly and always did; an empty one was the gap.
+//
+// So the context is resolved explicitly, and checked against the identity. GKE
+// context names are gke_<project>_<location>_<cluster>, which is the same shape
+// the credential proxy already requires of any kubeconfig the agent supplies
+// (see docs/credential-isolation-design.md), so this adds no new convention. It
+// also catches a kubeconfig that accumulated several clusters' contexts and is
+// pointing at the wrong one — merged kubeconfigs are how profiles go wrong in
+// practice, since `gcloud container clusters get-credentials` appends.
+func clientConfigForProfile(kubeconfig string, identity clusterIdentity) (*rest.Config, error) {
+	apiCfg, err := clientcmd.LoadFromFile(kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
+	}
+	if apiCfg.CurrentContext == "" {
+		return nil, errors.New("kubeconfig has no current-context (it is empty or was never written); refusing to fall back to the in-cluster config, which would silently watch the wrong cluster")
+	}
+	want := fmt.Sprintf("gke_%s_%s_%s", identity.Project, identity.Location, identity.Cluster)
+	if apiCfg.CurrentContext != want {
+		return nil, fmt.Errorf("kubeconfig current-context is %q but this profile describes %q; it points at a different cluster than it claims",
+			apiCfg.CurrentContext, want)
+	}
+	// NewNonInteractiveClientConfig, not the deferred loader: this one reports an
+	// unusable config as an error instead of reaching for the in-cluster config.
+	cfg, err := clientcmd.NewNonInteractiveClientConfig(*apiCfg, apiCfg.CurrentContext, &clientcmd.ConfigOverrides{}, nil).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("build client config for context %q: %w", apiCfg.CurrentContext, err)
+	}
+	return cfg, nil
 }
 
 // gkeAuthScope is the scope gke-gcloud-auth-plugin requests. A cloud-platform
@@ -521,6 +568,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
+			// Roll back the entry Observe just wrote. Nobody was told
+			// about this failure, so the next sighting must be free to
+			// open the incident rather than be suppressed against an
+			// alert that never went out. See dedupCache.Forget.
+			d.dedup.Forget(ev.Key, ev.Message)
 			log.Printf("dispatcher: create session for %s/%s: %v", ev.Namespace, ev.Name, err)
 			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "error").Inc()
 			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "session_create").Inc()
@@ -560,9 +612,28 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
-	if err := d.injector.Inject(ctx, sid, payload); err != nil {
+	status, err := d.injector.Inject(ctx, sid, payload)
+	if err != nil {
+		// Same rollback as the CreateSession path above. A session may
+		// have been created for this attempt and is now orphaned; it
+		// ages out on the daemon's own TTL, and leaving the failure
+		// permanently unreportable would be the worse trade.
+		d.dedup.Forget(ev.Key, ev.Message)
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
 		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "inject").Inc()
+		return
+	}
+	if status == injectStatusSuppressed {
+		// 2xx, and nobody was told: the daemon spent the day's ceiling
+		// for this severity and dropped the alert. Rolled back for the
+		// same reason as an error — the dedup entry exists to stop a
+		// second copy of a delivered alert, and nothing was delivered.
+		// The ceiling resets at 00:00 UTC while this entry would
+		// otherwise outlive the reset by most of a day.
+		d.dedup.Forget(ev.Key, ev.Message)
+		d.metrics.eventsQuotaSuppress.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+		log.Printf("quota-suppressed %s pod=%s/%s (sid=%s) — daemon dropped the alert, incident reopened",
+			ev.Key.Reason, ev.Namespace, ev.Name, sid)
 		return
 	}
 	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
