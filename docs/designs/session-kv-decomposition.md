@@ -3,7 +3,7 @@
 > **STATUS — draft; not implemented.** Nothing here ships today. `session_kv_server.py` is
 > described in section 1 as it currently exists; sections 3 onward are the proposal.
 >
-> **Section 1 was re-verified against `main` on 2026-08-13, and five of its security findings had
+> **Section 1 was re-verified against `main` on 2026-08-13, and four of its security findings had
 > already been closed by work that landed in the meantime.** #616 authenticated every data route
 > and pseudonymised chat identities; #641 added a per-severity daily alert cap; #405 grew the
 > triage prompt. S1, S4, S5 and S8 are recorded below as closed, with what remains of each stated
@@ -20,8 +20,17 @@
 > offsets. Three things landed under this design and are folded in: the event watcher gained
 > leading-edge debouncing and an emergency stop (§4.3), the companion supervisor design settled on
 > a status file and an optional/required split that changes how R1 is closed (§4), and an
-> in-cluster Postgres now exists, which reopens §8's "no external database" on grounds that
-> bullet never addressed.
+> in-cluster Postgres now exists, which §8 now declines on its merits rather than by inheritance.
+>
+> **Reviewed on 2026-08-17, and that re-derivation turns out to have covered only half the
+> citations.** The reference links at the foot of this file were re-derived and are correct; the
+> bare `L###` numbers written inline in section 1 were carried forward and are six lines low
+> throughout — `session_kv_server.py` is 786 lines at `ebe33ba`, not 780, and `init_db()` begins at
+> 221 rather than 215. All of them are corrected below. Two citations were wrong by more than an
+> offset (`platform_mcp_server.py:555,601`, `store.py:13`) and are also fixed. The lesson for the
+> next refresh is recorded in §0: **a bare `L###` is pinned to nothing**, so it survives a refresh
+> that re-derives the links and stays wrong afterwards, which is worse than the stale anchor §0
+> already warns about. Refresh the two together or not at all.
 
 **Scope:** The `session_kv` mechanism — the SQLite store at
 `/var/lib/kube-agents/session/session_kv.db`, the HTTP server on port 8699, and the six
@@ -31,11 +40,11 @@ retention policy ownership, and the leader-gated single-writer contract.
 **Does not own:**
 
 - The container's process model — what starts a long-lived process, restarts it, and reports its
-  health. [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) owns that, and this design
+  health. [`agent-process-supervisor.md`][agent-process-supervisor] owns that, and this design
   depends on it: the KV server becomes a supervised process there, and the readiness signal, the
   restart policy, and the lease timing guarantee at failover are all cited from it rather than
-  restated here. **Its S1 and S2 are prerequisites for phase 3 below; its S3 pairs with phase 6**,
-  not with phase 3 — see the migration table for why that split matters.
+  restated here. **Its S1, S2 and S3 are all prerequisites for phase 3 below**, and its S4 _is_
+  phase 3 seen from the other side — the same change, owned here — see the migration table.
 - The Google Chat attribution path, which
   [`gchat-session-metadata-data-flow.md`](gchat-session-metadata-data-flow.md) documents. This
   design preserves it unchanged for chat sessions; see the bounded exception for `k8s-evt-*`
@@ -70,6 +79,21 @@ it, pinned to
 were read from on 2026-08-17. Pinning is what keeps an anchor honest — `#L227` on a moving branch
 comes to point at whatever later occupies that line, which is worse than no anchor at all. All the
 URLs sit in one block at the end, so re-pinning after a refresh is a single edit.
+
+Section 1 also writes bare `L###` numbers inline, and those are the ones to distrust. **A bare
+number is pinned to nothing**: the 2026-08-17 refresh re-derived every anchored link and left every
+inline number six lines low, and nothing in `make docs-check` can tell. They read against the same
+commit as the links and must be refreshed in the same pass — if a future refresh cannot do both,
+delete the inline numbers rather than leave them.
+
+**One document this design depends on is not on `main` yet.**
+[`agent-process-supervisor.md`][agent-process-supervisor] is PR #730, open at the time of writing.
+An earlier revision linked it as `blob/main/docs/designs/agent-process-supervisor.md` in ten
+places, all of which 404 — absolute links are not checked by anything, so a hard prerequisite went
+missing in silence. It now resolves to the pull request through **one reference definition** at the
+foot of this file, which is honest about what it is and swaps to a relative link in a single edit
+when #730 merges. That swap is the point at which `make docs-check` starts guarding it; until
+then, note that **phase 3 depends on a document that has not landed**.
 
 **The subject**
 
@@ -108,18 +132,18 @@ responsibilities rather than into separating the existing ones. It owns twelve:
 
 | #   | Responsibility                     | Where                                                                                                                            |
 | --- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Schema DDL                         | `init_db()`, L215-262 — and again in [`session_store/store.py:26`][store-py-26]                                                  |
-| 2   | Retention GC                       | `cleanup_old_records()`, L268-280                                                                                                |
-| 3   | Session-ID minting                 | `POST /sessions`, L288-302                                                                                                       |
-| 4   | Session metadata reads             | L671-718                                                                                                                         |
-| 5   | Incident report store              | L721-747 — a second, unrelated table                                                                                             |
-| 6   | Alert text formatting              | `clean_workload_name` / `clean_reason_label` / `clean_event_message` / `get_severity_details`, L304-353                          |
-| 7   | Chat delivery + thread-key parsing | `_post_initial_alert()`, L372-396                                                                                                |
-| 8   | Session↔thread routing             | `_register_session_routing()`, L455-479                                                                                          |
-| 9   | LLM prompt authoring               | `_build_agent_query()`, L501-556                                                                                                 |
-| 10  | Gateway orchestration              | `_create_gateway_session` / `_start_agent_turn`, L481-572                                                                        |
-| 11  | **Authentication**                 | `verify_api_key` and its helpers, L53-97 — added by #616                                                                         |
-| 12  | **Alert rate limiting**            | `_alert_daily_limit` / `_claim_alert_quota` / `GET /v1/alert-quota`, L159-213, L398-452, L749-779 — a third table, added by #641 |
+| 1   | Schema DDL                         | `init_db()`, L221-267 — and again in [`session_store/store.py:26`][store-py-26]                                                  |
+| 2   | Retention GC                       | `cleanup_old_records()`, L274-285                                                                                                |
+| 3   | Session-ID minting                 | `POST /sessions`, L294-307                                                                                                       |
+| 4   | Session metadata reads             | L677-724                                                                                                                         |
+| 5   | Incident report store              | L727-752 — a second, unrelated table                                                                                             |
+| 6   | Alert text formatting              | `clean_workload_name` / `clean_reason_label` / `clean_event_message` / `get_severity_details`, L310-357                          |
+| 7   | Chat delivery + thread-key parsing | `_post_initial_alert()`, L378-401                                                                                                |
+| 8   | Session↔thread routing             | `_register_session_routing()`, L461-484                                                                                          |
+| 9   | LLM prompt authoring               | `_build_agent_query()`, L507-561                                                                                                 |
+| 10  | Gateway orchestration              | `_create_gateway_session` / `_start_agent_turn`, L487-577                                                                        |
+| 11  | **Authentication**                 | `verify_api_key` and its helpers, L59-100 — added by #616                                                                        |
+| 12  | **Alert rate limiting**            | `_alert_daily_limit` / `_claim_alert_quota` / `GET /v1/alert-quota`, L165-219, L404-458, L755-783 — a third table, added by #641 |
 
 Responsibilities 11 and 12 are the argument for this design restated by events. Both are correct
 and both were the right thing to ship; neither has anything to do with a key-value store, and
@@ -131,7 +155,7 @@ Six components depend on it, and only three go through the HTTP API:
 | Consumer                                             | Path                         | Reads / writes                   |
 | ---------------------------------------------------- | ---------------------------- | -------------------------------- |
 | `k8s-event-watcher` (Go sidecar)                     | HTTP `127.0.0.1:8699`        | `POST /sessions`, `/inject`      |
-| `platform_mcp_server.py:555,601`                     | HTTP `127.0.0.1:8699`        | metadata read, incident write    |
+| `platform_mcp_server.py:686,732`                     | HTTP `127.0.0.1:8699`        | metadata read, incident write    |
 | [`incident_context/__init__.py:38`][__init__-py-38]  | HTTP `127.0.0.1:8699`        | incident read                    |
 | [`session_manager.py:59`][session_manager-py-59]     | **direct `sqlite3.connect`** | metadata read                    |
 | [`session_otel_bridge/bridge.py:136`][bridge-py-136] | **direct `sqlite3.connect`** | metadata read, **once per span** |
@@ -175,21 +199,21 @@ kept in the table rather than deleted, because section 9 maps findings to phases
 vanishing row is indistinguishable from a forgotten one. **Closed** rows state what shipped and
 what, if anything, is left; the residue is what the phases below still have to carry.
 
-| ID  | Severity   | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| --- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| S1  | **Closed** | ~~No authentication on any route, and the server binds `0.0.0.0`.~~ #616 added `verify_api_key` as a `Depends` on every data route (L67-97), and the entrypoint now binds `--host 127.0.0.1` ([`docker-entrypoint.sh:1190`][docker-entrypoint-sh-1190]). The original finding also mis-stated the network position: a NetworkPolicy **is** reconciled ([`platformagent_controller.go:532`][platformagent_controller-go-532], built at [`platformagent_manifests.go:3078`][platformagent_manifests-go-3078]), and its ingress allowlist is 8642/8643 plus the dashboard's 9119 (`:2986-3012`) — never 8699. What was deleted at [`platformagent_controller.go:496-504`][platformagent_controller-go-496-504] is a _legacy_ credential-isolation set from the two-Deployment era. **Residue:** one shared key for all callers, no scopes — which is what Seam B's zones are still for. |
-| S2  | Medium ↓   | **Stored-report prompt injection.** `POST /v1/incidents` (L721) is now authenticated, so this is no longer reachable from outside the pod — but every container in the pod holds the same key, and `incident_context` still prepends the stored `report` verbatim to the user's next message in that thread ([`__init__.py:29-34`][__init__-py-29-34]), into an agent whose prompt says it is "explicitly authorized to create a … Pull Request." Downgraded from High: the caller must now be inside the pod.                                                                                                                                                                                                                                                                                                                                                                       |
-| S3  | High       | **Event-data prompt injection.** `_build_agent_query` (L501) interpolates `message`, `name`, `namespace` and `cluster` — attacker-controllable by anyone who can create a pod or event in a watched cluster — into that same GitOps-authorizing prompt, unfenced. Authentication does not touch this one: the event text arrives through the front door, correctly authenticated, and is trusted as instructions once inside. **Still High, and the single largest open finding here.**                                                                                                                                                                                                                                                                                                                                                                                              |
-| S4  | **Closed** | ~~Declared auth is theatre.~~ The watcher now runs with `--token-env=SESSION_KV_API_KEY` ([`deploy/shared/start-services.sh:139`][start-services-sh-139]) and the server verifies what it sends. The `cluster-internal-trusted` literal it used to send is still in the tree ([`platformagent_manifests.go:1410`][platformagent_manifests-go-1410], `:1976`) but belongs to `API_SERVER_KEY`/`AGENT_API_UPSTREAM_KEY`, a loopback sentinel rather than a secret — [`session_kv_server.py:47-53`][session_kv_server-py-47-53] says so in a comment explaining why it deliberately did not reuse it.                                                                                                                                                                                                                                                                                   |
-| S5  | **Closed** | ~~PII disclosure.~~ `GET /v1/sessions` (L691) is authenticated, and #616 pseudonymised chat identities under `SESSION_KV_SALT`, with `_purge_plaintext_identities` (L103) stripping `user_email` from rows written before the change. **Residue:** the route still enumerates every session's routing metadata to any holder of the pod's one key, which is the argument for removing it in Seam B — now a tidying rather than a disclosure fix.                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| S6  | Medium     | **Path traversal into the gateway.** The `session_id` path param is unvalidated and interpolated into `f"{api_url}/api/sessions/{session_id}/chat"` (L562), reaching arbitrary gateway API routes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| S7  | Low        | **Metadata is trusted on read.** `send_notification` builds `target = f"{session_platform}:{chat_id}:{thread_id}"` from stored metadata ([`platform_mcp_server.py:698`][platform_mcp_server-py-698]). Anyone who can write metadata redirects the agent's reports to a chat space of their choosing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| S8  | **Closed** | ~~Free LLM turns.~~ `POST /sessions/{id}/inject` (L603) is authenticated, and #641 added a per-severity daily cap backed by the `alert_quota` table. **Residue:** the cap is deliberately fail-open (`_claim_alert_quota`, L406-408) and covers the alert path only, so it bounds cost rather than closing the primitive.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| S9  | Low        | Subprocess stdout/stderr from `hermes send` is logged on failure (L392); `_run_env()` passes the full environment, tokens included, to every subprocess.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| S10 | Low        | No size cap on `report` or `metadata`; no escaping of alert text before it reaches chat.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ID  | Severity   | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| --- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S1  | **Closed** | ~~No authentication on any route, and the server binds `0.0.0.0`.~~ #616 added `verify_api_key` as a `Depends` on every data route (L73-100), and the entrypoint now binds `--host 127.0.0.1` ([`docker-entrypoint.sh:1190`][docker-entrypoint-sh-1190]). The original finding also mis-stated the network position: a NetworkPolicy **is** reconciled ([`platformagent_controller.go:532`][platformagent_controller-go-532], built at [`platformagent_manifests.go:3078`][platformagent_manifests-go-3078]), and its ingress allowlist is 8642/8643 plus the dashboard's 9119 (`:2986-3012`) — never 8699. What was deleted at [`platformagent_controller.go:496-504`][platformagent_controller-go-496-504] is a _legacy_ credential-isolation set from the two-Deployment era. **Residue:** one shared key for all callers, no scopes — which is what Seam B's zones are still for. |
+| S2  | Medium ↓   | **Stored-report prompt injection.** `POST /v1/incidents` (L727) is now authenticated, so this is no longer reachable from outside the pod — but every container in the pod holds the same key, and `incident_context` still prepends the stored `report` verbatim to the user's next message in that thread ([`__init__.py:29-34`][__init__-py-29-34]), into an agent whose prompt says it is "explicitly authorized to create a … Pull Request." Downgraded from High: the caller must now be inside the pod.                                                                                                                                                                                                                                                                                                                                                                        |
+| S3  | High       | **Event-data prompt injection.** `_build_agent_query` (L507) interpolates `message`, `name`, `namespace` and `cluster` — attacker-controllable by anyone who can create a pod or event in a watched cluster — into that same GitOps-authorizing prompt, unfenced. Authentication does not touch this one: the event text arrives through the front door, correctly authenticated, and is trusted as instructions once inside. **Still High, and the single largest open finding here.**                                                                                                                                                                                                                                                                                                                                                                                               |
+| S4  | **Closed** | ~~Declared auth is theatre.~~ The watcher now runs with `--token-env=SESSION_KV_API_KEY` ([`deploy/shared/start-services.sh:139`][start-services-sh-139]) and the server verifies what it sends. The `cluster-internal-trusted` literal it used to send is still in the tree ([`platformagent_manifests.go:1410`][platformagent_manifests-go-1410], `:1976`) but belongs to `API_SERVER_KEY`/`AGENT_API_UPSTREAM_KEY`, a loopback sentinel rather than a secret — [`session_kv_server.py:47-53`][session_kv_server-py-47-53] says so in a comment explaining why it deliberately did not reuse it.                                                                                                                                                                                                                                                                                    |
+| S5  | **Closed** | ~~PII disclosure.~~ `GET /v1/sessions` (L697) is authenticated, and #616 pseudonymised chat identities under `SESSION_KV_SALT`, with `_purge_plaintext_identities` (L109) stripping `user_email` from rows written before the change. **Residue:** the route still enumerates every session's routing metadata to any holder of the pod's one key, which is the argument for removing it in Seam B — now a tidying rather than a disclosure fix.                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| S6  | Medium     | **Path traversal into the gateway.** The `session_id` path param is unvalidated and interpolated into `f"{api_url}/api/sessions/{session_id}/chat"` (L568), reaching arbitrary gateway API routes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| S7  | Low        | **Metadata is trusted on read.** `send_notification` builds `target = f"{session_platform}:{chat_id}:{thread_id}"` from stored metadata ([`platform_mcp_server.py:698`][platform_mcp_server-py-698]). Anyone who can write metadata redirects the agent's reports to a chat space of their choosing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| S8  | **Closed** | ~~Free LLM turns.~~ `POST /sessions/{id}/inject` (L609) is authenticated, and #641 added a per-severity daily cap backed by the `alert_quota` table. **Residue:** the cap is deliberately fail-open (`_claim_alert_quota`, L412-414) and covers the alert path only, so it bounds cost rather than closing the primitive.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| S9  | Low        | Subprocess stdout/stderr from `hermes send` is logged on failure (L398); `_run_env()` passes the full environment, tokens included, to every subprocess.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| S10 | Low        | No size cap on `report` or `metadata`; no escaping of alert text before it reaches chat.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 S3 is worth reading in the original rather than in summary, because the two halves sit in one
-string. `_build_agent_query` interpolates event fields at `:527-531`:
+string. `_build_agent_query` interpolates event fields at `:533-537`:
 
 ```python
     f"**Event Details:**\n"
@@ -198,7 +222,7 @@ string. `_build_agent_query` interpolates event fields at `:527-531`:
     f"- **Warning Message:** {message}\n\n"
 ```
 
-and grants authority 25 lines later, at `:552`, in the same returned value. That line is a single
+and grants authority 25 lines later, at `:558`, in the same returned value. That line is a single
 unbroken f-string in the source; wrapped here for width, the sentence inside it reads:
 
 > 1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅
@@ -219,25 +243,23 @@ for, and it is now the most serious one open.
 
 ### 1.2 Resilience findings
 
-| ID                                                                                                | Severity | Finding |
-| ------------------------------------------------------------------------------------------------- | -------- | ------- |
-| **None of these were addressed by the work that closed S1/S4/S5/S8, and two got worse.** Verified |
-| against `main` on 2026-08-13.                                                                     |
+**None of these were addressed by the work that closed S1/S4/S5/S8, and two — R7 and R8 — got
+worse.** Verified against `main` on 2026-08-13 and again at `ebe33ba` on 2026-08-17.
 
 | ID  | Severity | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | --- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | R1  | High     | **Unsupervised and unmonitored.** Started with `&` ([`docker-entrypoint.sh:1183-1190`][docker-entrypoint-sh-1183-1190]) and never restarted. The gateway container has **no readiness or liveness probe at all** ([`platformagent_manifests.go:2318-2340`][platformagent_manifests-go-2318-2340]), so `/healthz` is never called and a stopped KV server is invisible.                                                                                                                                                                                                                                                                                                                                                                  |
-| R2  | High     | **At-most-once triage.** `BackgroundTasks` (L666) holds the whole flow in memory. A restart between `200 {"status":"injected"}` and the gateway call loses the incident silently — and the watcher, having got its 200, dedup-suppresses the retry for the dedup window, widened to 24h by #640.                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| R2  | High     | **At-most-once triage.** `BackgroundTasks` (L672) holds the whole flow in memory. A restart between `200 {"status":"injected"}` and the gateway call loses the incident silently — and the watcher, having got its 200, dedup-suppresses the retry for the dedup window, widened to 24h by #640.                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | R3  | High     | **Multi-writer SQLite on NFS.** At `replicas > 1` the operator moves the volume to RWX / `standard-rwx` ([`platformagent_manifests.go:101-113`][platformagent_manifests-go-101-113]). SQLite WAL requires shared memory and is unsupported on network filesystems. `journal_mode=WAL` is still set by both openers ([`session_kv_server.py:227`][session_kv_server-py-227], [`store.py:179`][store-py-179]). Every replica runs its own KV server, because entrypoint step 5 precedes `exec "$@"` and so never sees the election.                                                                                                                                                                                                       |
-| R4  | Medium   | **Threadpool starvation.** Sync endpoints share AnyIO's 40-slot pool. `_start_agent_turn` holds a slot for up to 300 s (`urlopen(..., timeout=300.0)`, L567) and `hermes send` has **no timeout at all** (L375-381). One hang blocks `/v1/incidents/by-thread`, whose caller gives up at 2 s and fails open ([`incident_context/__init__.py:47`][__init__-py-47]) — users' replies silently lose context.                                                                                                                                                                                                                                                                                                                               |
+| R4  | Medium   | **Threadpool starvation.** Sync endpoints share AnyIO's 40-slot pool. `_start_agent_turn` holds a slot for up to 300 s (`urlopen(..., timeout=300.0)`, L573) and `hermes send` has **no timeout at all** (L381-387). One hang blocks `/v1/incidents/by-thread`, whose caller gives up at 2 s and fails open ([`incident_context/__init__.py:47`][__init__-py-47]) — users' replies silently lose context.                                                                                                                                                                                                                                                                                                                               |
 | R5  | Medium   | **Two retention policies, one table.** The server deletes at 14 days (`SESSION_KV_CLEANUP_TTL_DAYS`, L45); `session_store` deletes at 7 (`SESSION_KV_RETENTION_DAYS`, [`store.py:117-122`][store-py-117-122]) on every write. The operator sets neither, so 7 silently wins over rows the server believes it keeps.                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| R6  | Medium   | **Lost updates.** `_register_session_routing` (L455) is a read-modify-write with no `BEGIN IMMEDIATE` — the `with conn:` around it is sqlite3's implicit _deferred_ transaction — racing `INSERT OR REPLACE` from [`store.py:156`][store-py-156] on the same `session_id`. #641 shows the fix is understood locally: `_claim_alert_quota` opens with `isolation_level=None` and issues a real `BEGIN IMMEDIATE` (L419-424), and says why in a comment. Nothing generalised it.                                                                                                                                                                                                                                                          |
+| R6  | Medium   | **Lost updates.** `_register_session_routing` (L461) is a read-modify-write with no `BEGIN IMMEDIATE` — the `with conn:` around it is sqlite3's implicit _deferred_ transaction — racing `INSERT OR REPLACE` from [`store.py:156`][store-py-156] on the same `session_id`. #641 shows the fix is understood locally: `_claim_alert_quota` opens with `isolation_level=None` and issues a real `BEGIN IMMEDIATE` (L425-430), and says why in a comment. Nothing generalised it.                                                                                                                                                                                                                                                          |
 | R7  | Medium ↑ | **Two launchers, one port** — and now two _different_ servers. [`platform_mcp_server.py:744-785`][platform_mcp_server-py-744-785] probes the port and spawns if free, a TOCTOU against the entrypoint's start. The loser exits with `EADDRINUSE` into a logfile nobody reads. Since #616 the two are no longer interchangeable: [`session_kv_server.py:116-125`][session_kv_server-py-116-125] records that the MCP-spawned fallback inherits the stdio MCP allowlist in `agents/platform/config.yaml`, which names `SESSION_KV_API_KEY` and **not** `SESSION_KV_SALT` — so which launcher wins decides whether identities can be hashed at all. A race that used to cost a duplicate log line now decides a data-correctness property. |
-| R8  | Low ↑    | `init_db()` runs at import (L780); a failure makes the module unimportable and the server silently absent. It now creates three tables and runs `_purge_plaintext_identities`, a scan-and-write over `session_metadata` — so there is materially more that can fail at import than when this was written. `ALERT_DAILY_LIMITS` (L207-213) is likewise evaluated from the environment at import.                                                                                                                                                                                                                                                                                                                                         |
+| R8  | Low ↑    | `init_db()` runs at import (L786); a failure makes the module unimportable and the server silently absent. It now creates three tables and runs `_purge_plaintext_identities`, a scan-and-write over `session_metadata` — so there is materially more that can fail at import than when this was written. `ALERT_DAILY_LIMITS` (L213-219) is likewise evaluated from the environment at import.                                                                                                                                                                                                                                                                                                                                         |
 | R9  | Low      | No index on `updated_at` / `created_at` — `init_db()` creates none. Every GC `DELETE` and the `ORDER BY` in `list_sessions` is a full scan. GC only runs on writes, so a quiet system never collects and a busy one scans on every insert.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| R10 | Low      | `uuid4().hex[:8]` is 32 bits and the insert is a plain `INSERT` (L291-301) — a collision is a 500, not a retry.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| R11 | Low      | `_create_gateway_session` (L481) has no retry. The KV server is listening before `hermes gateway run` binds 8642, so alerts in the startup window are dropped with a log line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| R12 | Low      | Schema drift: `incidents.created_at` in code (L237) vs `updated_at` in [`agents/platform/docs/session_management.md:136`][session_management-md-136] — which also prints a `SELECT … updated_at FROM incidents` troubleshooting command at `:183` that cannot run. That doc's Phase 1 also claims the proxy stores the triage report, which it does not — `send_notification` does, later.                                                                                                                                                                                                                                                                                                                                              |
+| R10 | Low      | `uuid4().hex[:8]` is 32 bits and the insert is a plain `INSERT` (L297-307) — a collision is a 500, not a retry.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| R11 | Low      | `_create_gateway_session` (L487) has no retry. The KV server is listening before `hermes gateway run` binds 8642, so alerts in the startup window are dropped with a log line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| R12 | Low      | Schema drift: `incidents.created_at` in code (L243) vs `updated_at` in [`agents/platform/docs/session_management.md:136`][session_management-md-136] — which also prints a `SELECT … updated_at FROM incidents` troubleshooting command at `:183` that cannot run. That doc's Phase 1 also claims the proxy stores the triage report, which it does not — `send_notification` does, later.                                                                                                                                                                                                                                                                                                                                              |
 | R13 | Low      | Unbounded logfile on the PVC; no metrics of any kind, while the watcher that feeds it is fully instrumented.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 ---
@@ -257,7 +279,7 @@ for, and it is now the most serious one open.
   ([`platformagent_manifests.go:2279-2282`][platformagent_manifests-go-2279-2282]), and the script itself `execvp`s the gateway when the
   lease environment is absent ([`leader_elect.py:60-61`][leader_elect-py-60-61]). At the default single replica there is
   no supervisor to be supervised by.
-  [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) closes that; this design assumes
+  [`agent-process-supervisor.md`][agent-process-supervisor] closes that; this design assumes
   its S1 and S2 have shipped.
 - **The pod's one key is not a set of caller identities.** #616 gives every container the same
   `SESSION_KV_API_KEY` from the same Secret, so authentication today answers "is this caller
@@ -300,6 +322,12 @@ for, and it is now the most serious one open.
   works, but it works **because of a start-order accident**, and it should say so rather than
   rely on it silently — the MCP launcher (R7) can win that race instead, and after phase 3 the
   supervisor owns the ordering explicitly.
+
+  The accident is also not permanent, which is why §4.1 requires the conversion to be survivable
+  rather than merely sequenced: from phase 3 the supervisor can restart the KV server on its own
+  while the gateway is still holding `store.py`'s connection, and that restart opens into a peer
+  by construction. A conversion that must succeed would make the supervisor's own restart policy
+  the thing that breaks it.
 
 - The Google Chat attribution contract in `gchat-session-metadata-data-flow.md` — the fixed
   metadata allowlist and the span attribute set — is unchanged by this design for chat sessions.
@@ -357,22 +385,21 @@ implements retry, caching, and fail-open policy — today each of the five calle
 own, with timeouts of 2 s, 3 s, and none.
 
 The token-reading half of that is already duplicated three ways and is the cheapest part to
-collapse: [`platform_mcp_server.py:31-41`][platform_mcp_server-py-31-41] has a `_session_kv_headers()` helper,
+collapse: [`platform_mcp_server.py:30-41`][platform_mcp_server-py-30-41] has a `_session_kv_headers()` helper,
 [`incident_context/__init__.py:40-45`][__init__-py-40-45] builds the same header inline with its own fail-open
 comment, and the Go watcher reads the same variable through `--token-env`. `client.py` should
 absorb the two Python copies on the way past.
 
 `schema.py` gains a `schema_version` table with explicit migrations, indices on the timestamp
-columns, and a `txn()` helper issuing `BEGIN IMMEDIATE`. `BEGIN IMMEDIATE` is the fix for R6
-whether or not two writers currently collide on one row: a read-modify-write with no explicit
-transaction is unsafe by construction, and `_register_session_routing` is one. With `schema.py`
+columns, and a `txn()` helper issuing `BEGIN IMMEDIATE`. With `schema.py`
 as the only DDL, the duplicated `CREATE TABLE` — responsibility #1 of section 1, hand-rolled a
-second time at [`store.py:13`][store-py-13] — stops existing. (R12 is a different problem, code-versus-docs
+second time at [`store.py:24-30`][store-py-24-30] — stops existing. (R12 is a different problem, code-versus-docs
 drift, and it is fixed in section 7 by updating the doc.)
 
-R6 and the `txn()` helper are worth showing side by side, because the same file already contains
-both the bug and the fix. `_register_session_routing` (`:455-479`) reads, mutates in Python, and
-writes back under sqlite3's implicit **deferred** transaction:
+`txn()` is necessary for R6 and, on its own, **not sufficient** — an earlier draft of this section
+said `BEGIN IMMEDIATE` was the fix and that was wrong. The two writers are worth showing side by
+side, because they are not the same shape. `_register_session_routing` (`:461-484`) reads, mutates
+in Python, and writes back under sqlite3's implicit **deferred** transaction:
 
 ```python
 with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -390,7 +417,7 @@ with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
             )
 ```
 
-`_claim_alert_quota` (`:419-424`), added later by #641, does it correctly and explains why:
+`_claim_alert_quota` (`:425-430`), added later by #641, does it correctly and explains why:
 
 ```python
 # isolation_level=None hands transaction control to us so the BEGIN
@@ -408,6 +435,47 @@ The knowledge is in the file; what is missing is a shared helper that makes it t
 is all `txn()` is — the second block, hoisted into `db.py`, with the first block as its first
 caller.
 
+#### Serialising the two writers does not stop one of them clobbering the other
+
+The other side of R6 is not a read-modify-write at all.
+[`SessionMetadataStore.write`][store-py-148-171] is a **blind full-blob `INSERT OR REPLACE`**: it
+serialises whatever dict `SessionMetadata.from_event` produced and replaces the row, never reading
+what is there. So when it follows `_register_session_routing`, the `thread_id` and `chat_id` that
+routing just added are gone — deterministically, whatever the isolation level. `BEGIN IMMEDIATE`
+makes the two atomic with respect to each other; it does not make a full-row replace into a merge.
+
+This matters more than the race it was mistaken for, because the ordering is the common one rather
+than the unlucky one: `_register_session_routing` writes `thread_id` at step 2 of
+`trigger_agent_troubleshooter`, and `log_event_to_db` fires on every inbound gateway message in
+that thread thereafter ([`store.py:212`][store-py-212]).
+
+It also means the prototype's K1 confirmed the wrong shape — it modelled two read-modify-writes,
+which is the case `txn()` does fix — and that §7's test "concurrent `register_routing` and
+`store.write` on one session leave both fields present" would have failed against the fix this
+section used to propose. Both are corrected below.
+
+**The fix is to stop keeping routing in the blob.** `thread_id`, `chat_id` and `platform` become
+real columns on `session_metadata`; the JSON blob keeps only the attribution payload
+`SessionMetadata` owns. Then the two writers stop overlapping at all — the metadata write owns the
+blob, the routing update owns three columns, and neither can express the other's data, so there is
+nothing left to clobber. Four things follow, and they are why this is the cheaper answer rather
+than merely the correct one:
+
+- **R6 stops being a concurrency property**, so it cannot regress under a future writer that
+  forgets `txn()`. Structure beats discipline here.
+- **S7's shape check gets somewhere to live.** Validating `chat_id`/`thread_id` on the way out of
+  an opaque blob means validating whatever `json.loads` returned; validating a typed column is a
+  constraint at the write, which is where a check belongs.
+- **The OTel bridge caches a narrow projection** — three columns and a session id — rather than a
+  document whose size nothing bounds (S10).
+- **`PATCH /v1/sessions/{id}/routing` becomes a plain `UPDATE`** of named columns, so the endpoint
+  the zone table already lists stops being a read-modify-write on the server side too.
+
+The migration is the v1 → v2 step in `schema.py`: add the columns, backfill them from the existing
+blob, and leave the blob's copies in place for one release so a rollback still reads. `txn()` stays
+required regardless — `_register_session_routing` is unsafe by construction and so is any later
+read-modify-write — it is just no longer load-bearing for this particular pair.
+
 **Migrations have to adopt a database nobody stamped.** Every live PVC already carries a
 `session_metadata` table created by `CREATE TABLE IF NOT EXISTS` in one of two places, and no
 `schema_version` row anywhere. The runner therefore needs three cases, not two: no tables → create
@@ -421,8 +489,8 @@ delivery policy. They share a file only as an implementation detail below the AP
 
 `AlertQuota` is the newest and the easiest to misfile. It is not session state and not an
 incident record; it is a counter that exists to survive a restart, which its own comment in
-`init_db()` (L245-251) explains. Two properties have to survive the move intact, because both are
-deliberate: the claim is a real `BEGIN IMMEDIATE` transaction (L419-424), and the whole path
+`init_db()` (L248-255) explains. Two properties have to survive the move intact, because both are
+deliberate: the claim is a real `BEGIN IMMEDIATE` transaction (L425-430), and the whole path
 fails **open** — a database that cannot be written must not withhold an alert from an on-call
 human. `quota.py` inherits both, and `txn()` from Seam A is what the first one becomes.
 
@@ -451,6 +519,14 @@ The client therefore has to make the bridge's usage a cache hit almost always:
   the root span of the turn. So `client.put_session_metadata()` populates the cache on success.
   Writer and reader are the same process, and the write happens first, so the hit is structural
   rather than lucky.
+- **The cache is process-wide, and that is a requirement rather than an implementation detail.**
+  The writer and the reader are the same process but not the same module: `session_store` and
+  `session_otel_bridge` are two independently loaded Hermes plugins. If each constructs its own
+  client, each gets its own cache, the bridge never sees the store's write, and the write-through
+  property above quietly evaporates — leaving exactly the read-through regression it exists to
+  prevent. `client.py` therefore exposes a module-level singleton and the plugins take it; a
+  per-instance cache is the one shape that must not be allowed. §7 tests this directly, because a
+  broken singleton fails no assertion that is only about correctness.
 - A TTL cache keyed by `session_id`, bounded (LRU, order 1024 entries) so that a long-lived
   gateway cannot accumulate one entry per session seen. Session metadata is near-immutable —
   written once at session creation, amended once when `thread_id` is resolved — so a 60 s TTL is
@@ -458,10 +534,11 @@ The client therefore has to make the bridge's usage a cache hit almost always:
 - **Miss is fail-open, not fetch-inline.** On a miss the bridge emits the span without the
   session attributes and schedules an out-of-band refresh on a bounded queue that drops rather
   than blocks, so the next span is enriched. Adding request latency to span creation is not an
-  option; neither is raising out of it.
-- Negative caching, so an unknown session ID cannot generate a request per span. Its TTL is much
-  shorter than the positive one — order 5 s — and any write for that `session_id` clears it,
-  because the common cause of a negative entry is a span that arrived just ahead of the write.
+  option; neither is raising out of it. **This is also what bounds miss traffic**, so there is no
+  negative cache: a drop-don't-block queue with one in-flight refresh per `session_id` already
+  makes "a request per span for an unknown ID" impossible, and an earlier draft's second TTL, its
+  own invalidation rule and its own tests bought nothing the queue was not already buying. One
+  mechanism, one failure mode.
 - **One targeted invalidation.** `thread_id` is the single field amended out of process: the
   server writes it for `k8s-evt-*` sessions when the initial chat post resolves a thread. A
   cached entry that has no `thread_id` is therefore re-fetched once past a short floor, rather
@@ -490,7 +567,7 @@ no attribution either."
 That is an acceptable trade only if the server stops being the unsupervised background job it is
 today. **The supervision, probe, and leader-ownership work is a prerequisite for this seam, not a
 parallel workstream** — which is why section 6 puts phase 3 ahead of the port, and why S1 and S2
-of [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) come before that. It is
+of [`agent-process-supervisor.md`][agent-process-supervisor] come before that. It is
 also why the cache above has to be write-through: a fail-open miss is an acceptable answer to the
 server being down, but it must not be the normal path.
 
@@ -500,12 +577,30 @@ Today every route sits in one undifferentiated zone — #616 authenticated them 
 and no scopes**, so the boundary distinguishes inside-the-pod from outside-the-pod and nothing
 else. Split by what a caller can cause:
 
-| Zone | Routes                                                                                 | Auth                                   |
-| ---- | -------------------------------------------------------------------------------------- | -------------------------------------- |
-| 0    | `GET /healthz`                                                                         | none; no data in the response          |
-| 1    | `GET /v1/sessions/{id}/metadata`, `GET /v1/incidents/by-thread`, `GET /v1/alert-quota` | bearer, read scope                     |
-| 2    | `POST /v1/incidents`, `PATCH /v1/sessions/{id}/routing`                                | bearer, write scope                    |
-| 3    | `POST /v1/sessions`, `POST /v1/sessions/{id}/messages`, `POST /v1/alerts`              | bearer, **separate ingest credential** |
+| Zone | Routes                                                                                                         | Credential                    |
+| ---- | -------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| 0    | `GET /healthz`                                                                                                 | none; no data in the response |
+| 1    | `GET /v1/sessions/{id}/metadata`, `GET /v1/incidents/by-thread`, `GET /v1/alert-quota`, `GET /v1/outbox/stats` | `agent`                       |
+| 2    | `PUT /v1/sessions/{id}/metadata`, `POST /v1/incidents`                                                         | `agent`                       |
+| 3    | `POST /v1/sessions`, `POST /v1/sessions/{id}/messages`, `POST /v1/alerts`, `PATCH /v1/sessions/{id}/routing`   | `ingest`                      |
+
+**`PUT /v1/sessions/{id}/metadata` is the route Seam A's port depends on, and an earlier draft of
+this table did not have it.** `session_store` is the busiest consumer of the new API — a write on
+every inbound gateway message — and phase 5 cannot move it without somewhere to write. It carries
+the attribution blob only: the routing columns are not settable through it, which is what keeps
+the clobber of Seam A from being reintroduced as an API shape. It is `PUT` rather than `PATCH`
+because the blob genuinely is replace-semantics; it is the routing fields that were never
+replace-semantics, and they are no longer in it.
+
+**Two credentials, not one per zone.** The zones say what a route can cause; the credentials say
+who may cause it, and the callers only cluster two ways. `ingest` is the event watcher and nothing
+else. `agent` is everything living in or below the gateway process — `session_store`,
+`session_otel_bridge`, `session_manager`, `incident_context`, the MCP servers — which share a
+process tree and therefore share a blast radius no token split can separate. Minting a third and
+fourth key to divide zone 1 from zone 2 would be dividing a caller from itself: two more Secret
+keys, two more rotation paths, and no attacker stopped. Keep the zones as route labels, because
+that is what the coverage test asserts against and what makes the ingest split reviewable; mint
+two identities.
 
 `GET /healthz` is already exempt in the shipped code and is already tested as exempt
 ([`test_session_kv_server.py:238`][test_session_kv_server-py-238]), so zone 0 is a description rather than a change. #616 also
@@ -514,9 +609,10 @@ left behind the check this table most needs:
 route carries the dependency. Generalise it to assert every route carries a **zone**, and the
 table above stops being prose the first time someone adds a route.
 
-Zone 3 is everything that can cause a chat post or a model turn, so it gets its own credential
-and its own rate limit — #641's daily cap is the rate limit for the alert path and predates the
-zone, so it moves under zone 3 rather than being reinvented. Removing `GET /v1/sessions` (the
+Zone 3 is everything that can cause a chat post, a model turn, or a change to where either is
+delivered, so it gets its own credential and its own rate limit — #641's daily cap is the rate
+limit for the alert path and predates the zone, so it moves under zone 3 rather than being
+reinvented. Removing `GET /v1/sessions` (the
 list route) finishes S5; no consumer uses it — but it is a published route in
 `gchat-session-metadata-data-flow.md:113`, so removing it is a change to a documented API and
 lands in section 7's docs list rather than passing silently.
@@ -524,9 +620,13 @@ lands in section 7's docs list rather than passing silently.
 **Routing fields are validated on the way out, not trusted because they were stored** (S7).
 `send_notification` builds `target = f"{session_platform}:{chat_id}:{thread_id}"` from whatever
 the store returns ([`platform_mcp_server.py:698`][platform_mcp_server-py-698]), which turns metadata-write access into control
-of where the agent's reports go. Two changes: `PATCH /v1/sessions/{id}/routing` moves behind the zone 3
-ingest credential rather than a general write scope, and `chat_id`/`thread_id` are shape-checked
-against the platform's format before a target is assembled from them.
+of where the agent's reports go. Two changes: `PATCH /v1/sessions/{id}/routing` sits in zone 3
+behind the `ingest` credential rather than alongside the ordinary metadata write — which is why
+the zone table above lists it there and not in zone 2 — and `chat_id`/`thread_id` are shape-checked
+against the platform's format. With Seam A's routing columns the check happens on the way **in**,
+at the write, rather than on the way out at every read: a typed column can carry a constraint, and
+a field validated once at the boundary cannot be read back malformed by a caller who forgot to
+check.
 
 #### Session creation is a general primitive
 
@@ -603,8 +703,10 @@ the operator
 {{- end }}
 ```
 
-So the per-caller tokens are a **third and fourth key in the same Secret through the same
-template**, not a new object:
+So the two caller tokens are **one further key in the same Secret through the same template**,
+not a new object. `SESSION_KV_API_KEY` is retained as the `agent` identity — it is already what
+every gateway-side caller holds — and `SESSION_KV_INGEST_KEY` is added for the watcher, which is
+the only caller that has to be separated from the rest:
 
 - The generation loop is already a `range` over a key list; adding identities is adding names to
   that list.
@@ -612,14 +714,17 @@ template**, not a new object:
   and are already the behaviour operators have been upgraded through once.
 - Rotation stays what it is today — delete the key and let the template regenerate it — and the
   config hash in `buildDeployment` restarts the pod that consumes it.
-- `SESSION_KV_API_KEY` keeps working as the general-purpose key for one release and becomes a
-  deprecated alias, which is what lets the watcher and the plugins move independently rather than
-  in lockstep.
+- `SESSION_KV_API_KEY` keeps working as a general-purpose key accepted on every zone for one
+  release, and narrows to the `agent` identity after it, which is what lets the watcher and the
+  plugins move independently rather than in lockstep.
+- Reusing the shipped key as one of the two identities means the migration adds exactly one
+  secret, and the caller that has to change is the one caller — the watcher — whose credential is
+  already passed by name through `--token-env`.
 
 One caveat this inherits rather than introduces: `lookup` returns empty under `helm template` and
 `--dry-run`, so a rendered-only manifest shows fresh values. The template already says so; a
 GitOps flow that diffs rendered output will see spurious changes on every render, and that is a
-property to know about before adding two more generated keys to it.
+property to know about before adding another generated key to it.
 
 A caller identity whose token is empty is rejected on zones 1–3 — fail closed, matching the 503
 `verify_api_key` already returns for an unset key — but the server logs the missing identity
@@ -646,7 +751,7 @@ actually left.
 best-tested part of the file ([`test_session_kv_server.py:27-76`][test_session_kv_server-py-27-76]) and only need moving.
 
 **The triage prompt does not move to a data file owned by `session_kv`. It becomes a skill.**
-`_build_agent_query` (L501-556) is a single Python string that encodes the analysis instruction,
+`_build_agent_query` (L507-561) is a single Python string that encodes the analysis instruction,
 the report format, the console links, the human call-to-action, the follow-up GitOps procedure,
 and the authorization to execute it. None of that is transport concern; all of it is agent
 capability, and this repository already has a mechanism for agent capability.
@@ -688,8 +793,11 @@ Four things follow.
 ### Seam D — delivery and orchestration
 
 `notify.py` defines a `Notifier` protocol with `google_chat` and `slack` adapters, absorbing the
-platform-specific thread-key derivation currently inline at L386-389, and adding the missing
-subprocess timeout (R4). It is also where S9 is closed: `hermes send` is invoked with an explicit
+platform-specific thread-key derivation currently inline at L392-396. It **inherits** the missing
+subprocess timeout rather than adding it: R4's timeout is a one-line change to a live hang on the
+default install, so it lands in phase 1 where the split happens and is simply carried into
+`notify.py` here. Waiting until phase 7 to bound a `subprocess.run` that today has no timeout at
+all would be holding a fix hostage to a refactor. It is also where S9 is closed: `hermes send` is invoked with an explicit
 environment allowlist rather than `_run_env()`'s copy of everything the pod has, and a failure
 logs the exit status with a truncated, redacted `stderr` instead of the raw streams.
 
@@ -739,6 +847,16 @@ binding, and the flow degrades gracefully without one — the triage turn still 
 thread ([`platform_mcp_server.py:700-712`][platform_mcp_server-py-700-712]). The row is marked with `last_error` so the ambiguity is
 visible rather than inferred.
 
+**That special case is the whole reason the step machine exists, and it may be removable.** Google
+Chat's `spaces.messages.create` takes a client-supplied `messageId` and is idempotent on it, so if
+`hermes send` can be given one — passed down as a flag, derived from the outbox row's idempotency
+key — then `post_alert` becomes as retryable as every other step. At that point the ambiguous-step
+policy above goes, and with it most of the argument for tracking `step`/`step_result` at all: a
+flow whose every step is idempotent can be retried from the beginning, which is a loop rather than
+a state machine. **Check this before building the step machine, not after.** The recovery design
+here is correct for a non-idempotent `hermes send`; it is a lot of machinery to carry if the
+premise turns out to be false, and the premise is one flag away from being checkable.
+
 Rows that exhaust `max_attempts` become `state = 'failed'` with their last error, and
 `GET /v1/outbox/stats` (zone 1) reports the state and attempt distribution. That endpoint is not
 a convenience: it is the only way to inspect the queue once the database is opened exclusively,
@@ -776,7 +894,7 @@ Concretely:
 - **Delete entrypoint step 5** ([`docker-entrypoint.sh:1183-1190`][docker-entrypoint-sh-1183-1190]) and
   `start_session_kv_server()` ([`platform_mcp_server.py:744-785`][platform_mcp_server-py-744-785]). One owner, no TOCTOU (R7). This
   is only safe once the supervisor runs at every replica count — see
-  [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) §3.1 — because at `replicas: 1`
+  [`agent-process-supervisor.md`][agent-process-supervisor] §3.1 — because at `replicas: 1`
   those two are currently the only things that start the server at all. Deleting the MCP launcher
   also retires the salt asymmetry R7 now carries: the fallback server cannot pseudonymise, because
   the stdio MCP allowlist does not pass it `SESSION_KV_SALT`.
@@ -807,7 +925,7 @@ phase 3.
   published on the Service, and 8699 never leaves the pod.
 - R1's "a stopped KV server is invisible" is closed by the supervisor's status file and the
   readiness probe that reads it, specified in
-  [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md)
+  [`agent-process-supervisor.md`][agent-process-supervisor]
   §3.4. **Closed by being reported, not by taking the pod out of service** — and that distinction
   is the design's, not a hedge here. The KV server is an **optional** process in its table: the
   gateway's plugins fail open without it, so a stopped KV server sets `degraded: true` while the
@@ -843,25 +961,67 @@ the change in two: the WAL fix lands early, in every opener at once, and exclusi
 after Seam A's port. In the interim the file is `journal_mode=TRUNCATE` with default locking,
 which is multi-process safe and drops the `-shm` requirement that makes WAL wrong here.
 
-**The mode is passed in, not sniffed.** Nothing inside the container can see the volume's access
-mode. The operator already computes it (`getDefaultStorageConfig`) and sets the environment
-variable the server reads.
+**The mode is passed in, not sniffed** — and it is passed in on RWO too, rather than TRUNCATE
+being applied everywhere. Nothing inside the container can see the volume's access mode. The
+operator already computes it (`getDefaultStorageConfig`) and sets the environment variable the
+server reads.
+
+That conditionality is load-bearing rather than tidiness. R3 is a property of the **network**
+filesystem, so it exists only on RWX; the default install is a single replica on RWO, where WAL is
+both supported and doing real work. Between phases 1 and 5 that install still has four openers —
+the server, `store.py`'s long-lived connection, `bridge.py` once per span, and `session_manager` —
+and dropping WAL there means readers block writers on exactly the per-span path Seam A spends a
+cache to keep off the wire. **Applying TRUNCATE unconditionally would buy a fix for a bug the
+default install does not have, at the cost of a regression it would.** RWO keeps WAL throughout;
+RWX converts at phase 1.
+
+**The conversion has to be allowed to fail.** §2 establishes that leaving WAL is refused while any
+peer holds the file open, and from phase 3 the supervisor can restart the KV server on its own
+while the gateway is still up holding `store.py`'s connection — which is precisely a restart into
+a peer. So the conversion is attempted, and a failure is logged and continued past, never fatal:
+the file stays WAL for that lifetime and converts on the next restart that happens to be alone.
+Making it fatal would reintroduce R8 through a new door, and turn the supervisor's own restart
+into a crash loop on RWX. This is the one place where the start-order accident §2 identifies
+stops being merely undocumented and starts being wrong to rely on.
 
 ### 4.2 Acquiring the file at failover
 
 `locking_mode=EXCLUSIVE` means the incoming leader's KV server cannot open the database until the
-outgoing one has closed it. [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) §3.5
+outgoing one has closed it. [`agent-process-supervisor.md`][agent-process-supervisor] §3.5
 makes that ordering hold in the absence of a partition, by requiring
-`lease_duration > max_poll + process_grace`; it explicitly does not fence a partitioned-but-live
-leader, and on a network filesystem a hard-killed holder's locks clear on the file server's
-schedule rather than the pod's.
+`lease_duration > max_poll + Σ(per-process shutdown grace)` — the shutdown term is the **sum over
+the process table**, not one process's grace, and adopting the KV server is exactly what makes it
+a sum. It explicitly does not fence a partitioned-but-live leader, and on a network filesystem a
+hard-killed holder's locks clear on the file server's schedule rather than the pod's.
 
 So the server retries. Startup acquires the lock with exponential backoff over a bounded window —
-60 s — logging each attempt, and fails only past it. Two constraints tie that number down at both
-ends: it must be shorter than the supervisor's restart cap, or a slow handover looks like a
-crash-looping process; and the readiness probe's `failureThreshold × periodSeconds` must be longer
-than it, or a slow handover restarts the pod. Section 7 checks the inequality rather than trusting
-the prose.
+60 s — logging each attempt, and fails only past it.
+
+**What bounds that number is the restart cap, and not the readiness probe.** An earlier draft of
+this section had it the other way round and was wrong twice over. A failed **readiness** probe
+takes the pod out of the endpoint list; it never restarts a container — only liveness does, and
+[`agent-process-supervisor.md`][agent-process-supervisor] §3.4 says so directly. And the
+question does not arise anyway, because the KV server is an **optional** process in that design's
+table: its absence sets `degraded: true` and leaves `ready` alone, so no amount of lock-waiting
+can move the probe at all. The supervisor's 60 s readiness budget is sized against the longest
+legitimate start of the _required_ process, which is the gateway.
+
+The real constraint is the restart budget, and it is a rate rather than a duration —
+`agent-process-supervisor.md` §3.3 charges a failed start to the same counter as a crash, and
+gives up on an optional process past **5 in 300 s**. A KV server that waits its 60 s, exits, and is
+restarted with 1→2→4→8 s backoff spends that budget in about 255 s and is then left stopped and
+`degraded` rather than retrying. So the property to hold is:
+
+```
+lock_retry_window × RESTART_CAP  +  Σ backoff   ≥   the longest handover worth surviving
+```
+
+which at 60 s and a cap of 5 is a little over four minutes of total tolerance. That is the figure
+to argue about, not the 60 s in isolation. **Preferably the wait should not exit at all** — a
+process that keeps retrying internally is not a failed start, spends no budget, and reports its
+own state through the log; exiting to be restarted converts a slow handover into a countdown
+towards permanent degradation for no benefit. Section 7 asserts the tolerance arithmetic, not the
+readiness inequality the earlier draft asked for.
 
 ### 4.3 The watcher runs on the leader too — so every caller is loopback
 
@@ -931,7 +1091,7 @@ The operator says the watcher is not its own container at
 [`platformagent_manifests.go:2511`][platformagent_manifests-go-2511], and that container mounts the shared data PVC at `homeDir`
 (`:1937`), so anything the watcher needs on the shared volume is already reachable. The lease
 gate of this section becomes another flag on that invocation, and `--token-env` shows the shape
-a per-identity token would take.
+the `ingest` token would take.
 
 That correction matters most for `--dedup-persist`. The earlier draft argued it was unavailable
 without new operator work; in fact **it is already passed**, at
@@ -1018,6 +1178,14 @@ shared file, no new mount — and it collapses three separate problems into one 
 the same index handles the N-replica duplicate, the failover re-list, and the caller's own retry
 across the blackhole.
 
+**The server's TTL must be at least the watcher's dedup window**, which is 24 h since #640, and
+the operator should derive one from the other rather than let two defaults drift the way
+`SESSION_KV_CLEANUP_TTL_DAYS` and `SESSION_KV_RETENTION_DAYS` did (R5). The reason is the whole
+point of the paragraph above: if the server forgets an event before the watcher does, then for the
+interval between the two windows the watcher's in-memory cache is once again the only thing
+preventing a duplicate — which is exactly the authority this section just moved off it. Sizing it
+the other way costs nothing but rows.
+
 `--dedup-persist` then stays what it already is: an optimisation that saves the wasted HTTP calls
 after a handover, and not something correctness rests on.
 
@@ -1046,7 +1214,7 @@ _owners_ disagreeing on one table (`SESSION_KV_CLEANUP_TTL_DAYS` at 14,
 `SESSION_KV_RETENTION_DAYS` at 7, neither set by the operator), and that is what one owner fixes.
 
 The third window is the `alert_quota` table #641 added. It is currently swept by the same
-`CLEANUP_TTL_DAYS` as everything else (`cleanup_old_records`, L276-277), with a comment saying 14
+`CLEANUP_TTL_DAYS` as everything else (`cleanup_old_records`, L280-283), with a comment saying 14
 days is chosen so that "what did we drop last week" still has an answer. That is a retention
 _policy_, stated in a comment and implemented by reusing an unrelated constant; making it a named
 window is the whole of the change.
@@ -1074,24 +1242,39 @@ until the last other opener is gone**, which is why the journal-mode work is spl
 and 6 instead of landing whole in the middle.
 
 **The supervisor design's phases interleave with this table rather than preceding it**, and the
-split is load-bearing enough to state once. [`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) S1 and S2 — a
+split is load-bearing enough to state once. [`agent-process-supervisor.md`][agent-process-supervisor] S1 and S2 — a
 supervisor at every replica count, and the restart policy and probe — are prerequisites for
-**phase 3**. Its **S3** — the lease retiming that guarantees the outgoing leader has let go before
-anyone else acquires — pairs with **phase 6**, because phase 6 is what creates the exclusively held
-resource that guarantee exists for. Shipping S3 earlier buys up to 15 s of extra failover blackhole
-for a property nothing yet relies on; that design says so itself and sequences S3 accordingly.
+**phase 3**. So is its **S3**, the lease retiming, and an earlier draft of this paragraph said the
+opposite: that S3 paired with phase 6, on the reasoning that phase 6 creates the exclusive hold
+the guarantee exists for, and it claimed the supervisor design agreed. It does not — it says
+"sequence it with S4", and its S4 _is_ phase 3.
 
-| Phase | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Risk                                                                                                                                                                                                                |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | Internal only: split into `session_kv/server/` — including `quota.py` for the third table — schema versioning (with the unstamped-database case), indices, `BEGIN IMMEDIATE`, unified retention, subprocess timeouts, leaf-module extraction. **`journal_mode=TRUNCATE` in every opener, converted by whichever opens first while it is alone** (see §2 — the WAL→other direction is refused while a peer is connected). Dashboard env/mount settled either way. Consumers untouched. | Low — pure refactor, existing tests cover it                                                                                                                                                                        |
-| 2     | **Lease-gate the watcher**, with connection-refused backoff. Fixes N-duplicate alerts on its own, and must precede phase 3 — after that, a follower's watcher has no local listener.                                                                                                                                                                                                                                                                                                  | Medium — Go change; failover behaviour needs soaking                                                                                                                                                                |
-| 3     | **Survivability.** KV server becomes a supervised process; delete entrypoint step 5 and the MCP launcher, and rewrite the `IS_BOOTSTRAP_PRIMARY` comment §4 quotes. Retires the salt asymmetry in R7.                                                                                                                                                                                                                                                                                 | Medium — entrypoint + operator, loopback-only throughout                                                                                                                                                            |
-| 4     | Trust **zones and scopes** on top of the single key #616 shipped; per-identity tokens added to the existing chart-generated Secret; generalise `POST /v1/sessions` (idempotency key, prompt, skill) and widen its index to cover event dedup; publish `client.py`; old routes kept as deprecated aliases.                                                                                                                                                                             | Medium — but smaller than first scoped: authentication, the token plumbing, and the loopback bind already exist. `SESSION_KV_API_KEY` stays valid for one release, so the watcher no longer has to move in lockstep |
-| 5     | **Port the three direct openers to `client.py`**, with the write-through cache and fail-open miss behaviour.                                                                                                                                                                                                                                                                                                                                                                          | Medium — only now is this safe                                                                                                                                                                                      |
-| 6     | **`locking_mode=EXCLUSIVE` on RWX**, with the startup lock retry. Only now is the server the last opener.                                                                                                                                                                                                                                                                                                                                                                             | Medium — first change that can fail at failover                                                                                                                                                                     |
-| 7     | Add the `incident-triage` skill; shrink `_build_agent_query` to an invocation; extract `render.py`, `notify.py`, `triage.py`.                                                                                                                                                                                                                                                                                                                                                         | Medium — changes agent-visible prompt text                                                                                                                                                                          |
-| 8     | Outbox replaces `BackgroundTasks`: in-process drainer, step-wise recovery, a terminal `failed` state, `GET /v1/outbox/stats`.                                                                                                                                                                                                                                                                                                                                                         | Medium                                                                                                                                                                                                              |
-| 9     | Delete the deprecated aliases. Drop `SESSION_KV_DB_PATH` and the `system-metadata` mount from every container that no longer opens the file.                                                                                                                                                                                                                                                                                                                                          | Low — but see below                                                                                                                                                                                                 |
+**The supervisor design is right, and the reason is arithmetic this design owns.** Phase 3 is what
+puts a second entry in the process table, and §3.5's shutdown term is the sum over that table, so
+phase 3 is the moment 10 s becomes 20 s. With today's parameters `15 > 7 + 20` is false by twelve
+seconds: the overlap between an outgoing leader still stopping its processes and an incoming one
+already starting its own goes from about 2 s to about 13 s. Nothing holds an exclusive lock until
+phase 6, so this is not a correctness break in the interim — it is two KV servers writing one
+SQLite file for thirteen seconds instead of two, which default locking survives. It is still a
+regression, it is still measurable, and shipping phase 3 without S3 means shipping it knowingly.
+The 15 s of extra failover blackhole S3 costs is the price of not doing that, and it comes due at
+phase 3 rather than phase 6.
+
+Its **S4** is not a prerequisite at all — it is this table's phase 3, described from the
+supervisor's side. One change, one implementation, two documents that each need it in their
+sequence.
+
+| Phase | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Risk                                                                                                                                                                                                                |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Split into `session_kv/server/` — including `quota.py` for the third table — schema versioning (with the unstamped-database case), routing promoted to columns with its v1→v2 backfill, indices, `BEGIN IMMEDIATE`, unified retention, subprocess timeouts, leaf-module extraction. **On RWX only: `journal_mode=TRUNCATE`, converted by whichever opens first while it is alone, and tolerated when it cannot** (see §2 and §4.1 — RWO keeps WAL). Dashboard env/mount settled either way. | Low — the consumer edits are the journal-mode constant and nothing else; existing tests cover the rest                                                                                                              |
+| 2     | **Lease-gate the watcher**, with connection-refused backoff. Fixes N-duplicate alerts on its own, and must precede phase 3 — after that, a follower's watcher has no local listener.                                                                                                                                                                                                                                                                                                        | Medium — Go change; failover behaviour needs soaking                                                                                                                                                                |
+| 3     | **Survivability.** KV server becomes a supervised process (the supervisor design's S4); delete entrypoint step 5 and the MCP launcher, and rewrite the `IS_BOOTSTRAP_PRIMARY` comment §4 quotes. Retires the salt asymmetry in R7. **Ships with that design's S3**, because this is the phase that makes the shutdown term a sum.                                                                                                                                                           | Medium — entrypoint + operator, loopback-only throughout; +15 s failover blackhole arrives here                                                                                                                     |
+| 4     | Trust **zones and scopes** on top of the single key #616 shipped; the second (`ingest`) token added to the existing chart-generated Secret; generalise `POST /v1/sessions` (idempotency key, prompt, skill) and widen its index to cover event dedup; publish `client.py`; old routes kept as deprecated aliases.                                                                                                                                                                           | Medium — but smaller than first scoped: authentication, the token plumbing, and the loopback bind already exist. `SESSION_KV_API_KEY` stays valid for one release, so the watcher no longer has to move in lockstep |
+| 5     | **Port the three direct openers to `client.py`**, with the write-through cache and fail-open miss behaviour.                                                                                                                                                                                                                                                                                                                                                                                | Medium — only now is this safe                                                                                                                                                                                      |
+| 6     | **`locking_mode=EXCLUSIVE` on RWX**, with the startup lock retry of §4.2. Only now is the server the last opener, and only now does S3's release-before-acquire guarantee have a consumer.                                                                                                                                                                                                                                                                                                  | Medium — first change that can fail at failover                                                                                                                                                                     |
+| 7     | Add the `incident-triage` skill; shrink `_build_agent_query` to an invocation; extract `render.py`, `notify.py`, `triage.py`.                                                                                                                                                                                                                                                                                                                                                               | Medium — changes agent-visible prompt text                                                                                                                                                                          |
+| 8     | Outbox replaces `BackgroundTasks`: in-process drainer, step-wise recovery, a terminal `failed` state, `GET /v1/outbox/stats`.                                                                                                                                                                                                                                                                                                                                                               | Medium                                                                                                                                                                                                              |
+| 9     | Delete the deprecated aliases. Drop `SESSION_KV_DB_PATH` and the `system-metadata` mount from every container that no longer opens the file.                                                                                                                                                                                                                                                                                                                                                | Low — but see below                                                                                                                                                                                                 |
 
 Phase 2 is what removes the need for a Service-exposed 8699 and the cross-pod hop that came
 with it; an earlier draft of this design had that as a high-risk phase touching the operator and
@@ -1126,22 +1309,31 @@ next to this file and runs on the standard library alone:
 cd docs/designs/session-kv-decomposition && python3 run_experiments.py
 ```
 
-**One experiment falsified this document.** K2 tested §2's journal-mode constraint and found it
-wrong in both directions; §2 now states the measured rule and phase 1 carries the sequencing
-requirement that follows from it. The other nine confirmed what was claimed.
+**One experiment falsified this document, and a second confirmed a claim it should not have.**
+K2 tested §2's journal-mode constraint and found it wrong in both directions; §2 now states the
+measured rule and phase 1 carries the sequencing requirement that follows from it. K1 confirmed
+that `txn()` fixes R6, against a fixture that differs from the code in two ways. It models both
+writers as read-modify-writes, where the real `store.py` writer blind-replaces the whole document;
+and its safe path, `Store.put_metadata`, takes a _patch_ and does `meta.update(patch)`. So the
+merge is what keeps both fields, and `txn()` is what stops the merge interleaving — the experiment
+demonstrates the fix this design has now adopted while attributing the result to the one it had
+proposed. Seam A carries the corrected reading, and re-running K1 against a blind-replace writer
+is the way to see the difference. A prototype is only as good as its fixture, and that is the
+failure mode to weigh the rest of this table against: these are checks on a model of the code, not
+on the code.
 
-| #   | Claim under test                      | Result                                                                                                                   |
-| --- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| K1  | R6, the lost update                   | **Confirmed.** Two deferred read-modify-writes leave one field; `txn()` keeps both                                       |
-| K2  | §2's journal-mode constraint          | **FALSIFIED.** Openers cannot oscillate — leaving `WAL` with a peer connected is refused outright                        |
-| K3  | §4.1, `locking_mode=EXCLUSIVE`        | **Confirmed.** A second opener gets `database is locked` until the holder closes                                         |
-| K4  | R5, two retention owners              | **Confirmed.** The 7-day delete removes a row the 14-day owner's own query had just kept                                 |
-| K5  | R9, missing indices                   | **Confirmed.** `EXPLAIN QUERY PLAN` gives `SCAN` today and `SEARCH … USING INDEX` with Seam A                            |
-| K6  | R10, 32-bit ids                       | **Confirmed.** A duplicate is an `IntegrityError` — a 500, not a retry — and the key replays instead                     |
-| K7  | R2, at-most-once triage               | **Confirmed.** The in-memory flow loses three of four steps; the outbox resumes at the in-flight one                     |
-| K8  | Seam A's cache                        | **Confirmed.** Write-through avoids the first-span fetch; negative caching, `thread_id` refresh and fail-open all behave |
-| K9  | R4, threadpool starvation             | **Modelled, not reproduced** — AnyIO is absent, so a bounded executor stands in for the 40-slot pool                     |
-| K10 | Seam A's unstamped-database migration | **Confirmed.** A database built by the old `store.py` DDL is adopted at v1 with its rows intact                          |
+| #   | Claim under test                      | Result                                                                                                                                                                                                         |
+| --- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| K1  | R6, the lost update                   | **Confirmed, wrong fixture.** True of two read-modify-writes; `store.py` blind-replaces the blob, which `txn()` does not fix — see Seam A                                                                      |
+| K2  | §2's journal-mode constraint          | **FALSIFIED.** Openers cannot oscillate — leaving `WAL` with a peer connected is refused outright                                                                                                              |
+| K3  | §4.1, `locking_mode=EXCLUSIVE`        | **Confirmed.** A second opener gets `database is locked` until the holder closes                                                                                                                               |
+| K4  | R5, two retention owners              | **Confirmed.** The 7-day delete removes a row the 14-day owner's own query had just kept                                                                                                                       |
+| K5  | R9, missing indices                   | **Confirmed.** `EXPLAIN QUERY PLAN` gives `SCAN` today and `SEARCH … USING INDEX` with Seam A                                                                                                                  |
+| K6  | R10, 32-bit ids                       | **Confirmed.** A duplicate is an `IntegrityError` — a 500, not a retry — and the key replays instead                                                                                                           |
+| K7  | R2, at-most-once triage               | **Confirmed.** The in-memory flow loses three of four steps; the outbox resumes at the in-flight one                                                                                                           |
+| K8  | Seam A's cache                        | **Confirmed.** Write-through avoids the first-span fetch; `thread_id` refresh and fail-open behave. Negative caching was exercised here and has since been dropped as redundant with the bounded refresh queue |
+| K9  | R4, threadpool starvation             | **Modelled, not reproduced** — AnyIO is absent, so a bounded executor stands in for the 40-slot pool                                                                                                           |
+| K10 | Seam A's unstamped-database migration | **Confirmed.** A database built by the old `store.py` DDL is adopted at v1 with its rows intact                                                                                                                |
 
 Three things it deliberately does not cover, all needing something this environment does not have:
 the HTTP layer and therefore every Seam B finding (S6 included), multi-writer behaviour on a real
@@ -1159,10 +1351,22 @@ Reuse `test_declared_routes_are_all_covered` (`:224`) rather than replacing it: 
 the app's route table, and generalising it from "has the auth dependency" to "declares a zone" is
 the cheapest available guard on Seam B's table.
 
-New cases: idempotency-key replay returns `duplicate` without a second chat post; a caller with
-zone-1 scope is rejected on a zone-3 route; a `session_id` containing `../` is rejected rather
-than interpolated; concurrent `register_routing` and `store.write` on one session leave both
-fields present; the quota claim still fails open when the database is unwritable.
+New cases: idempotency-key replay returns `duplicate` without a second chat post; the `agent`
+credential is rejected on a zone-3 route; a `session_id` containing `../` is rejected rather
+than interpolated; the quota claim still fails open when the database is unwritable.
+
+Two more that exist because this design got them wrong first, and a passing suite that omits them
+would say nothing:
+
+- **A `store.write` following a `register_routing` leaves `thread_id` and `chat_id` intact.** Write
+  it as a plain sequence rather than a concurrent one — the clobber Seam A describes is an ordering
+  bug, and a test that only runs the two in parallel can pass while the common case is broken. The
+  concurrent version is still worth having for `txn()`, but it is the weaker of the two.
+- **A replayed alert consumes no quota, and a claimed quota is not stranded by a replay.** The
+  order of the idempotency check and `_claim_alert_quota` is not visible in either mechanism's
+  tests, and both orderings look correct in isolation: claiming first leaks a slot on every retry,
+  checking first is right. #641's cap fails open, so the wrong order degrades quietly into a cap
+  that under-counts rather than into anything that fails.
 
 **Boundary.** The API-only rule needs a test, or it decays the first time someone needs a value
 in a hurry. Add a check that no module outside `session_kv/server/` imports `sqlite3` against
@@ -1174,16 +1378,29 @@ currently copy-pasted into four ([`store.py:23`][store-py-23], [`bridge.py:21`][
 followed immediately by a span produces an enriched span with no HTTP request at all** — the
 write-through property, and the one that decides whether this is a port or a regression; a miss
 emits a span without session attributes rather than blocking; a repeated miss for an unknown ID
-does not issue a request per span; a write clears a negative entry for the same ID; an entry
-cached without `thread_id` is re-fetched and an entry with one is not; the cache evicts under its
-bound; the server being down degrades every caller to fail-open rather than raising into a
-gateway hook.
+does not issue a request per span; an entry cached without `thread_id` is re-fetched and an entry
+with one is not; the cache evicts under its bound; the server being down degrades every caller to
+fail-open rather than raising into a gateway hook.
+
+**Write that first case across two client references rather than one.** Fetching the client twice
+and asserting the same object is the direct test, but the one that matters is behavioural: a write
+through the handle `session_store` would use, then a read through the handle `session_otel_bridge`
+would use, and no request between them. A per-instance cache passes every other assertion in this
+list and fails only that one — which is why the singleton is written into Seam A as a requirement
+rather than left to whoever implements `client.py`.
 
 **Schema and locking.** A fixture database created by the old `store.py` DDL — tables present,
-`schema_version` absent — migrates to head rather than failing or re-creating. And the two
-timing constraints of section 4.2 are asserted in code, not prose: the lock-retry window is
-shorter than the supervisor's restart cap and shorter than
-`failureThreshold × periodSeconds` on the readiness probe.
+`schema_version` absent — migrates to head rather than failing or re-creating, and the v1→v2 step
+backfills `thread_id`/`chat_id`/`platform` out of the existing blob for rows written before the
+columns existed. A WAL→TRUNCATE conversion attempted while a peer connection is open is logged and
+survived rather than raised (§4.1) — the case a fresh-database test cannot reach, and the one a
+supervisor restart reaches routinely.
+
+Section 4.2's timing property is asserted in code rather than prose, in the form 4.2 actually
+states it: `lock_retry_window × RESTART_CAP + Σ backoff` covers the handover the design claims to
+tolerate. **Not** the readiness inequality an earlier draft asked for — the KV server is an
+optional process and cannot move that probe, and asserting `60 < 60` against the supervisor's
+shipped `failureThreshold × periodSeconds` would have failed on the first run.
 
 **Go.** `injector_test.go` already asserts the headers are sent; add the server-side counterpart
 so the assertion means something, plus retry-across-503 coverage.
@@ -1196,7 +1413,7 @@ part of the current output and therefore part of what "same shape" means. That i
 Seam C was a move rather than a rewrite.
 
 **Operator.** The readiness probe and the `Args` change belong to
-[`agent-process-supervisor.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-process-supervisor.md) §6. What this design adds to
+[`agent-process-supervisor.md`][agent-process-supervisor] §6. What this design adds to
 `platformagent_manifests_test.go` and the golden files in
 `k8s-operator/internal/testing/testdata/platform/expected/` is the retention and journal-mode
 environment, the minted-token Secret, and — whichever way section 4.3 resolves it — an assertion
@@ -1219,7 +1436,7 @@ kubectl -n kubeagents-system get pod <follower> \
 
 # 2. The leader answers on loopback, and unauthenticated calls do not.
 #    The 401 already holds on main (#616); what phase 4 adds is the third call,
-#    where a token valid for zone 1 is refused on a zone-3 route. Run all three:
+#    where the `agent` credential is refused on a zone-3 route. Run all three:
 #    the first two are the regression check that the zones did not loosen
 #    anything, and only the third is new.
 kubectl -n kubeagents-system exec <leader> -c platform-agent -- \
@@ -1228,7 +1445,7 @@ kubectl -n kubeagents-system exec <leader> -c platform-agent -- \
   curl -s -o /dev/null -w '%{http_code}\n' 127.0.0.1:8699/v1/incidents \
   -d '{"chat_id":"x","thread_id":"y","report":"z"}'          # expect 401
 kubectl -n kubeagents-system exec <leader> -c platform-agent -- \
-  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $READ_TOKEN" \
+  curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $AGENT_TOKEN" \
   127.0.0.1:8699/v1/alerts -d '{}'                           # expect 403
 
 # 3. One event, one alert — the check that leader-gating fixed the N-duplicate bug.
@@ -1242,7 +1459,7 @@ kubectl -n kubeagents-system delete pod <leader>
 # 5. Outbox drains after that restart. Via the API, not sqlite3: the database is
 #    opened exclusively from phase 6 on, so a second process cannot read it.
 kubectl -n kubeagents-system exec <pod> -c platform-agent -- \
-  curl -sf -H "Authorization: Bearer $READ_TOKEN" 127.0.0.1:8699/v1/outbox/stats
+  curl -sf -H "Authorization: Bearer $AGENT_TOKEN" 127.0.0.1:8699/v1/outbox/stats
 ```
 
 Step 4 is the one that needs soaking rather than a single run: the failover gap in section 4.3
@@ -1263,35 +1480,41 @@ each.
 
 ## 8. Deliberate non-goals
 
-- **No external database — but the recorded reason no longer covers the option on the table.**
-  This bullet declined _Cloud SQL_: a dependency and an IAM surface for a store that holds days of
-  routing rows. Since it was written the repository grew an **in-cluster** Postgres, deployed for
-  the Hindsight memory provider (`k8s-operator/config/integrations/hindsight/`), and that has no
-  IAM surface and on a stock install is already running. Feasibility is therefore no longer an
-  argument, and this call has to be re-made on its merits rather than inherited.
+- **No external database, and no in-cluster Postgres either — decided here, not inherited.**
+  This bullet used to decline _Cloud SQL_ on grounds of a dependency and an IAM surface, which
+  stopped covering the option actually on the table once the repository grew an **in-cluster**
+  Postgres for the Hindsight memory provider (`k8s-operator/config/integrations/hindsight/`). That
+  has no IAM surface and on a stock install is already running, so feasibility was no longer the
+  argument and the call had to be re-made.
 
   It is a bigger decision than a storage swap, because **the single-writer requirement is what
   most of the supervisor design exists to serve**. With Postgres there is no exclusive file to
   hand over, so §4.1 and §4.2 disappear, the outbox drains with `SELECT … FOR UPDATE SKIP LOCKED`,
   GC is an idempotent `DELETE`, and event dedup is the unique index §4.3 already calls the real
   authority — nothing needs the leader for correctness. `agent-process-supervisor.md` §3.8A works
-  the consequences out from its side and records the question as its Q5.
+  the consequences out from its side. That is a substantial simplification and it is the reason
+  this bullet is argued rather than asserted.
 
-  Three things weigh against, and they are about operations rather than feasibility. Hindsight's
-  Postgres **deploys only when the install asked for that memory provider**, so putting sessions
-  there makes it mandatory for installs that chose the file-based provider or no memory at all —
-  and keeping SQLite as a fallback means maintaining two backends, which is worse than either. It
-  is a **single-replica StatefulSet**, so this trades a file on a PVC for one pod plus a network
-  hop on the alert-and-triage path, which is precisely what must keep working during a cluster
-  incident. And it runs `POSTGRES_HOST_AUTH_METHOD=trust` with no password behind a NetworkPolicy
-  its own README notes is enforced only on Dataplane V2 clusters — justified there by the data
-  belonging to pods already trusted with it. Session metadata is a different question: S5 and #616
-  pseudonymised chat identifiers under a salt deliberately, and that work should be checked
-  against this threat model rather than inherit it.
+  **It is declined on operations, and each of the three reasons is sufficient on its own.**
+  Hindsight's Postgres **deploys only when the install asked for that memory provider**, so putting
+  sessions there makes it mandatory for installs that chose the file-based provider or no memory at
+  all — and keeping SQLite as a fallback means maintaining two backends, which is worse than
+  either. It is a **single-replica StatefulSet**, so this trades a file on a PVC for one pod plus a
+  network hop on the alert-and-triage path, which is precisely what must keep working during a
+  cluster incident; the failure mode is losing incident triage exactly when a cluster is unhealthy.
+  And it runs `POSTGRES_HOST_AUTH_METHOD=trust` with no password behind a NetworkPolicy its own
+  README notes is enforced only on Dataplane V2 clusters — justified there by the data belonging to
+  pods already trusted with it, which session metadata is not: S5 and #616 pseudonymised chat
+  identifiers under a salt deliberately, and moving those rows behind trust auth would spend that
+  work.
 
-  **Unresolved, and owned here.** Section 6 assumes the file. If the answer changes, phases 1, 6
-  and 8 change shape and the supervisor design shrinks with them, so it is worth settling before
-  phase 1 rather than after.
+  **Settled: the store stays a file.** Section 6 assumes it, and that assumption is now
+  load-bearing rather than provisional — phases 1 and 6 and the supervisor's S3 are all priced
+  against it. `agent-process-supervisor.md` Q5 asks the same question from the other side and
+  closes by reference to this bullet; the two designs deferring to each other is what kept it open
+  through two revisions, and it is the reason this is written as a decision rather than as an
+  option. **What would reopen it** is narrow and worth naming: an in-cluster Postgres that ships
+  unconditionally, replicated, and authenticated. Short of all three, the answer does not change.
 
 - **No request-continuous HA.** The failover blackhole in [`leader_elect.py:12-16`][leader_elect-py-12-16] is inherited,
   not fixed — and the supervisor design widens it, deliberately, to make the file handover
@@ -1322,21 +1545,21 @@ so that the count still reconciles.
 | Finding                      | Closed by                                                                                                                                                              | Phase   |
 | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | S1 no auth, binds `0.0.0.0`  | **Already shipped** (#616): `verify_api_key` on every data route, loopback bind. Residue — one key, no scopes — by Seam B zones                                        | done; 4 |
-| S2 stored-report injection   | Seam B write scope; Seam C fencing of the prepended report                                                                                                             | 4, 7    |
+| S2 stored-report injection   | Seam B zone 2; Seam C fencing of the prepended report                                                                                                                  | 4, 7    |
 | S3 event-data injection      | Seam C — authority moves into the skill, event fields fenced and labelled                                                                                              | 7       |
 | S4 auth theatre              | **Already shipped** (#616): watcher sends a real key via `--token-env`, server verifies it                                                                             | done    |
 | S5 PII enumeration           | **Already shipped** (#616): route authenticated, identities pseudonymised. Residue — the enumeration itself — by removing `GET /v1/sessions`                           | done; 4 |
 | S6 path traversal            | Seam B — server mints IDs; `{id}` resolved against the store before use                                                                                                | 4       |
-| S7 metadata trusted on read  | Seam B — routing writes behind the ingest credential, shape-checked on use                                                                                             | 4       |
+| S7 metadata trusted on read  | Seam B — routing writes in zone 3 behind the `ingest` credential, shape-checked at the write against typed columns                                                     | 1, 4    |
 | S8 free LLM turns            | **Already shipped** (#641): per-severity daily cap. Residue — fail-open, alert path only — by Seam B zone 3                                                            | done; 4 |
 | S9 subprocess env and logs   | Seam D — `notify.py` environment allowlist, redacted failure logging                                                                                                   | 7       |
 | S10 no size caps             | Seam C — length cap and control-character stripping                                                                                                                    | 7       |
 | R1 unsupervised, unmonitored | `agent-process-supervisor.md` §3.3–3.4 — supervised and restarted; reported as `degraded` rather than by going NotReady, since the server is an optional process there | 3       |
 | R2 at-most-once triage       | Seam D outbox; idempotency key on session creation                                                                                                                     | 8, 4    |
 | R3 multi-writer WAL on NFS   | §4.1 — `TRUNCATE` early, `EXCLUSIVE` after the port                                                                                                                    | 1, 6    |
-| R4 threadpool starvation     | Seam D — subprocess timeout, dedicated bounded executor                                                                                                                | 7, 8    |
+| R4 threadpool starvation     | Subprocess timeout in phase 1, where the split lands it; Seam D's dedicated bounded executor in phase 8                                                                | 1, 8    |
 | R5 two retention policies    | §5 — one owner, one explicit window per store                                                                                                                          | 1       |
-| R6 lost updates              | Seam A — `txn()` with `BEGIN IMMEDIATE`                                                                                                                                | 1       |
+| R6 lost updates              | Seam A — routing promoted to columns, so the two writers stop overlapping; `txn()` with `BEGIN IMMEDIATE` for the read-modify-write that remains                       | 1       |
 | R7 two launchers, one port   | §4 — entrypoint step 5 and the MCP launcher deleted; retires the salt asymmetry too                                                                                    | 3       |
 | R8 `init_db()` at import     | Seam A — schema work and the identity purge move into the app factory's startup                                                                                        | 1       |
 | R9 missing indices           | Seam A — indices on the timestamp columns; timer-driven GC                                                                                                             | 1       |
@@ -1352,6 +1575,23 @@ are recorded here so they are not lost:
 | ------------------------------------------ | -------------------------------------------------------------------------------- | ----- |
 | Concurrent dedup-snapshot writers at `n>1` | §4.3 — lease-gating collapses N watchers to one; unique temp suffix if abandoned | 2     |
 | `alert_quota` has no module or window      | §3 `quota.py`; §5 `SESSION_KV_QUOTA_RETENTION_DAYS`                              | 1     |
+
+And three more from the 2026-08-17 review, which are defects in this design rather than in the
+code — recorded because a design that fixed them silently would leave no trace that the reasoning
+had changed:
+
+| Finding                                                                   | Resolved by                                                                                                         |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| R6's stated fix did not fix R6 — `store.py` blind-replaces the whole blob | Seam A, "Serialising the two writers…" — routing moves to columns; prototype K1 modelled the wrong shape            |
+| No route for the metadata write phase 5 depends on                        | Seam B — `PUT /v1/sessions/{id}/metadata`, zone 2                                                                   |
+| §4.2's readiness-probe constraint was wrong and unsatisfiable             | §4.2 — an optional process cannot move readiness; the restart budget is the real bound, and §7 asserts that instead |
+
+<!-- The companion design is not on `main` yet, so this points at its pull request
+     rather than at a path that would 404. One edit swaps it for the relative link
+     `agent-process-supervisor.md` when #730 merges, at which point `make docs-check`
+     starts verifying it. -->
+
+[agent-process-supervisor]: https://github.com/gke-labs/kube-agents/pull/730
 
 <!-- Source links, line-anchored and pinned to the commit these line numbers
      were read from (ebe33ba). Re-pin here when the numbers are refreshed. -->
@@ -1379,7 +1619,7 @@ are recorded here so they are not lost:
 [main-go-557]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/k8s-operator/cmd/k8s-event-watcher/main.go#L557
 [platform-agent-secret-yaml-6-25]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/charts/kube-agents/templates/platform-agent-secret.yaml#L6-L25
 [platform_mcp_server-py-21]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/platform/scripts/platform_mcp_server.py#L21
-[platform_mcp_server-py-31-41]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/platform/scripts/platform_mcp_server.py#L31-L41
+[platform_mcp_server-py-30-41]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/platform/scripts/platform_mcp_server.py#L30-L41
 [platform_mcp_server-py-698]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/platform/scripts/platform_mcp_server.py#L698
 [platform_mcp_server-py-700-712]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/platform/scripts/platform_mcp_server.py#L700-L712
 [platform_mcp_server-py-744-785]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/platform/scripts/platform_mcp_server.py#L744-L785
@@ -1412,10 +1652,11 @@ are recorded here so they are not lost:
 [start-services-sh-193]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/deploy/shared/start-services.sh#L193
 [start-services-sh-200-201]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/deploy/shared/start-services.sh#L200-L201
 [store-py-117-122]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L117-L122
-[store-py-13]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L13
+[store-py-24-30]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L24-L30
 [store-py-138-146]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L138-L146
 [store-py-156]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L156
 [store-py-178]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L178
+[store-py-148-171]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L148-L171
 [store-py-178-179]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L178-L179
 [store-py-179]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L179
 [store-py-212]: https://github.com/gke-labs/kube-agents/blob/ebe33bafa4608f900348623cf8943fdeb15d701f/agents/chat/defaults/plugins/session_store/store.py#L212
