@@ -269,19 +269,37 @@ for, and it is now the most serious one open.
   and deduplicated by the server. The supervisor design widens that window to buy a release-before-
   acquire guarantee for exclusively-held resources — which is what makes the file-lock handover in
   section 4 well-defined.
-- **`journal_mode` is a property of the file, not of the connection.** Every process that opens
-  the database has to agree on it, and the last one to set it wins. Two openers set `WAL` today —
-  [`session_kv_server.py:227`][session_kv_server-py-227] inside `init_db()`, and [`store.py:178-179`][store-py-178-179] on a long-lived
-  connection:
+- **`journal_mode` is asymmetric, and an earlier draft of this bullet had it wrong.** Two openers
+  set `WAL` today — [`session_kv_server.py:227`][session_kv_server-py-227] inside `init_db()`, and
+  [`store.py:178-179`][store-py-178-179] on a long-lived connection:
 
   ```python
   conn = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
   conn.execute("PRAGMA journal_mode=WAL")
   ```
 
-  During any window where more than one opener exists, they must set the same non-WAL mode or
-  they will flip the file back and forth under each other. That is why phase 1 changes both at
-  once rather than starting with the server.
+  This bullet used to say the mode is a property of the file, that the last setter wins, and that
+  disagreeing openers "flip the file back and forth under each other". Measured (K2), SQLite does
+  none of those symmetrically:
+
+  |                                      | Behaviour                                                                                               |
+  | ------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+  | `WAL`                                | **Persistent and file-level.** Set once, every later opener gets it                                     |
+  | `TRUNCATE`, `DELETE`                 | **Per-connection.** They do not persist — after `WAL` then `TRUNCATE`, a third connection sees `delete` |
+  | Entering `WAL` with a peer connected | **Succeeds**, and the file is `WAL` from then on                                                        |
+  | Leaving `WAL` with a peer connected  | **Refused** — `OperationalError: database is locked`                                                    |
+
+  So the openers cannot oscillate; the dangerous direction simply fails. That makes the real
+  constraint a **sequencing** one rather than an agreement one: **converting the file out of `WAL`
+  requires a moment when nothing else has it open.** Changing the constant in both files is not
+  sufficient on its own — whichever process opens first has to do the conversion while it is
+  alone, and `store.py` holds its connection for the life of the gateway.
+
+  Today's boot order happens to give that window: the entrypoint starts the KV server before
+  `exec`ing the gateway, so `init_db()` runs with no peer and can convert. Phase 1 therefore
+  works, but it works **because of a start-order accident**, and it should say so rather than
+  rely on it silently — the MCP launcher (R7) can win that race instead, and after phase 3 the
+  supervisor owns the ordering explicitly.
 
 - The Google Chat attribution contract in `gchat-session-metadata-data-flow.md` — the fixed
   metadata allowlist and the span attribute set — is unchanged by this design for chat sessions.
@@ -1063,17 +1081,17 @@ anyone else acquires — pairs with **phase 6**, because phase 6 is what creates
 resource that guarantee exists for. Shipping S3 earlier buys up to 15 s of extra failover blackhole
 for a property nothing yet relies on; that design says so itself and sequences S3 accordingly.
 
-| Phase | Change                                                                                                                                                                                                                                                                                                                                                                  | Risk                                                                                                                                                                                                                |
-| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | Internal only: split into `session_kv/server/` — including `quota.py` for the third table — schema versioning (with the unstamped-database case), indices, `BEGIN IMMEDIATE`, unified retention, subprocess timeouts, leaf-module extraction. **`journal_mode=TRUNCATE` set identically in every opener.** Dashboard env/mount settled either way. Consumers untouched. | Low — pure refactor, existing tests cover it                                                                                                                                                                        |
-| 2     | **Lease-gate the watcher**, with connection-refused backoff. Fixes N-duplicate alerts on its own, and must precede phase 3 — after that, a follower's watcher has no local listener.                                                                                                                                                                                    | Medium — Go change; failover behaviour needs soaking                                                                                                                                                                |
-| 3     | **Survivability.** KV server becomes a supervised process; delete entrypoint step 5 and the MCP launcher, and rewrite the `IS_BOOTSTRAP_PRIMARY` comment §4 quotes. Retires the salt asymmetry in R7.                                                                                                                                                                   | Medium — entrypoint + operator, loopback-only throughout                                                                                                                                                            |
-| 4     | Trust **zones and scopes** on top of the single key #616 shipped; per-identity tokens added to the existing chart-generated Secret; generalise `POST /v1/sessions` (idempotency key, prompt, skill) and widen its index to cover event dedup; publish `client.py`; old routes kept as deprecated aliases.                                                               | Medium — but smaller than first scoped: authentication, the token plumbing, and the loopback bind already exist. `SESSION_KV_API_KEY` stays valid for one release, so the watcher no longer has to move in lockstep |
-| 5     | **Port the three direct openers to `client.py`**, with the write-through cache and fail-open miss behaviour.                                                                                                                                                                                                                                                            | Medium — only now is this safe                                                                                                                                                                                      |
-| 6     | **`locking_mode=EXCLUSIVE` on RWX**, with the startup lock retry. Only now is the server the last opener.                                                                                                                                                                                                                                                               | Medium — first change that can fail at failover                                                                                                                                                                     |
-| 7     | Add the `incident-triage` skill; shrink `_build_agent_query` to an invocation; extract `render.py`, `notify.py`, `triage.py`.                                                                                                                                                                                                                                           | Medium — changes agent-visible prompt text                                                                                                                                                                          |
-| 8     | Outbox replaces `BackgroundTasks`: in-process drainer, step-wise recovery, a terminal `failed` state, `GET /v1/outbox/stats`.                                                                                                                                                                                                                                           | Medium                                                                                                                                                                                                              |
-| 9     | Delete the deprecated aliases. Drop `SESSION_KV_DB_PATH` and the `system-metadata` mount from every container that no longer opens the file.                                                                                                                                                                                                                            | Low — but see below                                                                                                                                                                                                 |
+| Phase | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Risk                                                                                                                                                                                                                |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Internal only: split into `session_kv/server/` — including `quota.py` for the third table — schema versioning (with the unstamped-database case), indices, `BEGIN IMMEDIATE`, unified retention, subprocess timeouts, leaf-module extraction. **`journal_mode=TRUNCATE` in every opener, converted by whichever opens first while it is alone** (see §2 — the WAL→other direction is refused while a peer is connected). Dashboard env/mount settled either way. Consumers untouched. | Low — pure refactor, existing tests cover it                                                                                                                                                                        |
+| 2     | **Lease-gate the watcher**, with connection-refused backoff. Fixes N-duplicate alerts on its own, and must precede phase 3 — after that, a follower's watcher has no local listener.                                                                                                                                                                                                                                                                                                  | Medium — Go change; failover behaviour needs soaking                                                                                                                                                                |
+| 3     | **Survivability.** KV server becomes a supervised process; delete entrypoint step 5 and the MCP launcher, and rewrite the `IS_BOOTSTRAP_PRIMARY` comment §4 quotes. Retires the salt asymmetry in R7.                                                                                                                                                                                                                                                                                 | Medium — entrypoint + operator, loopback-only throughout                                                                                                                                                            |
+| 4     | Trust **zones and scopes** on top of the single key #616 shipped; per-identity tokens added to the existing chart-generated Secret; generalise `POST /v1/sessions` (idempotency key, prompt, skill) and widen its index to cover event dedup; publish `client.py`; old routes kept as deprecated aliases.                                                                                                                                                                             | Medium — but smaller than first scoped: authentication, the token plumbing, and the loopback bind already exist. `SESSION_KV_API_KEY` stays valid for one release, so the watcher no longer has to move in lockstep |
+| 5     | **Port the three direct openers to `client.py`**, with the write-through cache and fail-open miss behaviour.                                                                                                                                                                                                                                                                                                                                                                          | Medium — only now is this safe                                                                                                                                                                                      |
+| 6     | **`locking_mode=EXCLUSIVE` on RWX**, with the startup lock retry. Only now is the server the last opener.                                                                                                                                                                                                                                                                                                                                                                             | Medium — first change that can fail at failover                                                                                                                                                                     |
+| 7     | Add the `incident-triage` skill; shrink `_build_agent_query` to an invocation; extract `render.py`, `notify.py`, `triage.py`.                                                                                                                                                                                                                                                                                                                                                         | Medium — changes agent-visible prompt text                                                                                                                                                                          |
+| 8     | Outbox replaces `BackgroundTasks`: in-process drainer, step-wise recovery, a terminal `failed` state, `GET /v1/outbox/stats`.                                                                                                                                                                                                                                                                                                                                                         | Medium                                                                                                                                                                                                              |
+| 9     | Delete the deprecated aliases. Drop `SESSION_KV_DB_PATH` and the `system-metadata` mount from every container that no longer opens the file.                                                                                                                                                                                                                                                                                                                                          | Low — but see below                                                                                                                                                                                                 |
 
 Phase 2 is what removes the need for a Service-exposed 8699 and the cross-pod hop that came
 with it; an earlier draft of this design had that as a high-risk phase touching the operator and
@@ -1094,6 +1112,41 @@ the proof that no other component is still reaching for SQLite.
 ---
 
 ## 7. Verification
+
+### 7.0 What was prototyped, and what it changed
+
+The storage mechanisms of Seam A, Seam D and section 5 were built as a prototype before this
+design was finalised — `txn()`, the versioned schema, the outbox with step-wise recovery, the
+retention collector, and Seam A's caching client — with no HTTP layer, because every claim under
+test is about storage semantics. It lives in
+[`session-kv-decomposition/`](https://github.com/gke-labs/kube-agents/tree/main/docs/designs/session-kv-decomposition)
+next to this file and runs on the standard library alone:
+
+```bash
+cd docs/designs/session-kv-decomposition && python3 run_experiments.py
+```
+
+**One experiment falsified this document.** K2 tested §2's journal-mode constraint and found it
+wrong in both directions; §2 now states the measured rule and phase 1 carries the sequencing
+requirement that follows from it. The other nine confirmed what was claimed.
+
+| #   | Claim under test                      | Result                                                                                                                   |
+| --- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| K1  | R6, the lost update                   | **Confirmed.** Two deferred read-modify-writes leave one field; `txn()` keeps both                                       |
+| K2  | §2's journal-mode constraint          | **FALSIFIED.** Openers cannot oscillate — leaving `WAL` with a peer connected is refused outright                        |
+| K3  | §4.1, `locking_mode=EXCLUSIVE`        | **Confirmed.** A second opener gets `database is locked` until the holder closes                                         |
+| K4  | R5, two retention owners              | **Confirmed.** The 7-day delete removes a row the 14-day owner's own query had just kept                                 |
+| K5  | R9, missing indices                   | **Confirmed.** `EXPLAIN QUERY PLAN` gives `SCAN` today and `SEARCH … USING INDEX` with Seam A                            |
+| K6  | R10, 32-bit ids                       | **Confirmed.** A duplicate is an `IntegrityError` — a 500, not a retry — and the key replays instead                     |
+| K7  | R2, at-most-once triage               | **Confirmed.** The in-memory flow loses three of four steps; the outbox resumes at the in-flight one                     |
+| K8  | Seam A's cache                        | **Confirmed.** Write-through avoids the first-span fetch; negative caching, `thread_id` refresh and fail-open all behave |
+| K9  | R4, threadpool starvation             | **Modelled, not reproduced** — AnyIO is absent, so a bounded executor stands in for the 40-slot pool                     |
+| K10 | Seam A's unstamped-database migration | **Confirmed.** A database built by the old `store.py` DDL is adopted at v1 with its rows intact                          |
+
+Three things it deliberately does not cover, all needing something this environment does not have:
+the HTTP layer and therefore every Seam B finding (S6 included), multi-writer behaviour on a real
+network filesystem, and anything requiring a cluster — the watcher's lease-gating and the failover
+gap of §4.3 among them. Those stay in the end-to-end checks below.
 
 **Unit.** Extend `agents/platform/scripts/test_session_kv_server.py` into per-module tests. It has
 grown a good deal since this design was drafted — #616 added `TestSessionKvServerAuth` (`:186`)
