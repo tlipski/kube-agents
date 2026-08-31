@@ -3683,6 +3683,261 @@ class TestRecommendation(BaseTestCase):
         self.assertIn("Traffic may drop; check flows first.", rendered)
 
 
+class TestContradictoryEvidence(BaseTestCase):
+    """Two findings quoting one read of one object cannot disagree about it.
+
+    The failure this stops is not a typo. A run reported the same ComputeClass
+    as having one priority rule under `ccc-large-vm-scarcity` and three under
+    `ccc-no-ondemand-floor`, from the same `kubectl get` on the same morning,
+    and each finding's recommendation was premised on its own version of the
+    spec. A reviewer reading the ledger had no way to tell which half was real,
+    which is a worse outcome than either finding being missing.
+    """
+
+    def pair(self, *, first_excerpt, second_excerpt, second_command=None, obj="ComputeClass/db"):
+        command = "kubectl --context prod-us-east get computeclass db -o yaml"
+        return make_doc(
+            findings=[
+                make_finding(
+                    fid="one",
+                    check="netpol-missing",
+                    obj=obj,
+                    command=command,
+                    excerpt=first_excerpt,
+                ),
+                make_finding(
+                    fid="two",
+                    check="hostpath-mount",
+                    obj=obj,
+                    command=second_command or command,
+                    excerpt=second_excerpt,
+                ),
+            ]
+        )
+
+    def test_same_object_and_command_with_different_excerpts_is_rejected(self):
+        doc = self.pair(
+            first_excerpt="priorities:\n- machineType: c3-standard-88",
+            second_excerpt=(
+                "priorities:\n- machineType: c3-standard-88\n"
+                "- machineFamily: c2\n- machineFamily: e2"
+            ),
+        )
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        self.assertIn("findings[1].evidence.excerpt", message)
+        self.assertIn("findings[0].evidence.excerpt", message)
+        self.assertIn("ComputeClass/db", message)
+
+    def test_same_object_and_command_with_one_excerpt_is_fine(self):
+        """The ordinary case: two checks fire on one object off one read."""
+        excerpt = "priorities:\n- machineType: c3-standard-88"
+        doc = self.pair(first_excerpt=excerpt, second_excerpt=excerpt)
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_trailing_whitespace_is_not_a_contradiction(self):
+        doc = self.pair(
+            first_excerpt="priorities:\n- machineFamily: c3\n",
+            second_excerpt="  priorities:\r\n- machineFamily: c3  ",
+        )
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_different_commands_may_differ(self):
+        """`get -o yaml` and `describe` are two reads, so two answers is normal."""
+        doc = self.pair(
+            first_excerpt="priorities:\n- machineFamily: c3",
+            second_excerpt="Events:\n  Warning  FailedScaleUp",
+            second_command="kubectl --context prod-us-east describe computeclass db",
+        )
+        audit_report.validate_findings(doc, AUDIT)
+
+    def test_the_same_excerpt_on_a_different_object_is_untouched(self):
+        excerpt_a = "priorities:\n- machineFamily: c3"
+        doc = make_doc(
+            findings=[
+                make_finding(
+                    fid="one", obj="ComputeClass/a", command="kubectl get cc", excerpt=excerpt_a
+                ),
+                make_finding(
+                    fid="two",
+                    obj="ComputeClass/b",
+                    command="kubectl get cc",
+                    excerpt="priorities:\n- machineFamily: n4",
+                ),
+            ]
+        )
+        audit_report.validate_findings(doc, AUDIT)
+
+
+class TestImmutableUpdateConflicts(BaseTestCase):
+    """`kubectl apply --dry-run=server` needs write RBAC the audit will not have.
+
+    The audit runs on `roles/container.viewer`, so the clone is the only place
+    an "will this apply?" question can be answered: HEAD holds the previous
+    declaration, the worker wrote the proposed one, and the diff is the answer.
+    """
+
+    STS_BEFORE = """
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+  namespace: data
+spec:
+  replicas: 3
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      storageClassName: scenario-hyperdisk-balanced
+"""
+
+    def sts_after(self, *, storage_class="dynamic-rwo", replicas=3):
+        return self.STS_BEFORE.replace(
+            "scenario-hyperdisk-balanced", storage_class
+        ).replace("replicas: 3", f"replicas: {replicas}")
+
+    def test_changing_a_volume_claim_template_is_a_conflict(self):
+        conflicts = audit_report.immutable_update_conflicts(
+            self.STS_BEFORE, self.sts_after()
+        )
+        self.assertEqual(conflicts, ["StatefulSet/db `spec.volumeClaimTemplates`"])
+
+    def test_changing_a_mutable_field_is_not(self):
+        self.assertEqual(
+            audit_report.immutable_update_conflicts(
+                self.STS_BEFORE, self.sts_after(storage_class="scenario-hyperdisk-balanced", replicas=5)
+            ),
+            [],
+        )
+
+    def test_a_newly_declared_object_is_a_create(self):
+        """Nothing about a create is immutable, so a new file conflicts with nothing."""
+        self.assertEqual(
+            audit_report.immutable_update_conflicts("", self.sts_after()), []
+        )
+
+    def test_an_unrelated_object_in_the_same_file_is_ignored(self):
+        before = self.STS_BEFORE + "\n---\nkind: ConfigMap\nmetadata:\n  name: db\n"
+        after = self.sts_after() + "\n---\nkind: ConfigMap\nmetadata:\n  name: db\n"
+        self.assertEqual(
+            audit_report.immutable_update_conflicts(before, after),
+            ["StatefulSet/db `spec.volumeClaimTemplates`"],
+        )
+
+    def test_a_storage_class_reprovision_is_a_conflict(self):
+        before = "kind: StorageClass\nmetadata:\n  name: fast\nparameters:\n  type: hyperdisk-balanced\n"
+        after = "kind: StorageClass\nmetadata:\n  name: fast\nparameters:\n  type: hyperdisk-extreme\n"
+        self.assertEqual(
+            audit_report.immutable_update_conflicts(before, after),
+            ["StorageClass/fast `parameters`"],
+        )
+
+    def test_unparseable_yaml_yields_no_opinion(self):
+        """None and [] are different answers; a bad parse must not read as 'clean'."""
+        self.assertEqual(
+            audit_report.immutable_update_conflicts("{{ not yaml", self.sts_after()), []
+        )
+
+    def test_two_objects_of_one_kind_are_matched_by_name(self):
+        cache = "\n---" + self.STS_BEFORE.replace("name: db", "name: cache")
+        before = self.STS_BEFORE + cache
+        after = self.sts_after() + cache
+        self.assertEqual(
+            audit_report.immutable_update_conflicts(before, after),
+            ["StatefulSet/db `spec.volumeClaimTemplates`"],
+        )
+
+
+class TestAnnotateApplyConflicts(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.root = self.tmp_path / "clone"
+        self.root.mkdir()
+        self.shown = "HEAD content not set"
+        self.returncode = 0
+
+        def fake_git(args, *, check=True, cwd=None):
+            self.assertEqual(args[0], "show")
+            self.assertEqual(Path(cwd), self.root)
+            return subprocess.CompletedProcess(
+                ["git", *args], self.returncode, stdout=self.shown, stderr=""
+            )
+
+        self.patch_attr("git", fake_git)
+
+    def write(self, relative, text):
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def finding(self, note="Move the volume to dynamic-rwo."):
+        return make_finding(
+            fid="disk-mix",
+            remediation={"kind": "manifest", "path": "db.yaml", "note": note},
+        )
+
+    def test_a_conflicting_edit_is_annotated_not_degraded(self):
+        self.shown = TestImmutableUpdateConflicts.STS_BEFORE
+        self.write("db.yaml", TestImmutableUpdateConflicts.STS_BEFORE.replace(
+            "scenario-hyperdisk-balanced", "dynamic-rwo"
+        ))
+        findings = [self.finding()]
+        annotated = audit_report.annotate_apply_conflicts(findings, self.root)
+        self.assertEqual(annotated, ["disk-mix"])
+        note = findings[0]["remediation"]["note"]
+        # The fix survives as a manifest: a rollout detail must not throw away
+        # a correct file edit.
+        self.assertEqual(findings[0]["remediation"]["kind"], "manifest")
+        self.assertIn("Move the volume to dynamic-rwo.", note)
+        self.assertIn("spec.volumeClaimTemplates", note)
+        self.assertIn("--cascade=orphan", note)
+
+    def test_a_clean_edit_is_left_alone(self):
+        self.shown = TestImmutableUpdateConflicts.STS_BEFORE
+        self.write("db.yaml", TestImmutableUpdateConflicts.STS_BEFORE.replace(
+            "replicas: 3", "replicas: 5"
+        ))
+        findings = [self.finding()]
+        self.assertEqual(audit_report.annotate_apply_conflicts(findings, self.root), [])
+        self.assertEqual(
+            findings[0]["remediation"]["note"], "Move the volume to dynamic-rwo."
+        )
+
+    def test_a_path_absent_from_head_is_a_new_declaration(self):
+        self.returncode = 128
+        self.shown = ""
+        self.write("db.yaml", TestImmutableUpdateConflicts.STS_BEFORE)
+        findings = [self.finding()]
+        self.assertEqual(audit_report.annotate_apply_conflicts(findings, self.root), [])
+
+    def test_a_manual_remediation_is_skipped(self):
+        findings = [
+            make_finding(fid="manual", remediation={"kind": "manual", "note": "By hand."})
+        ]
+        self.assertEqual(audit_report.annotate_apply_conflicts(findings, self.root), [])
+        self.assertEqual(findings[0]["remediation"]["note"], "By hand.")
+
+    def test_annotating_twice_says_it_once(self):
+        """`finish` and `remediate` both call this; two warnings read as two problems."""
+        self.shown = TestImmutableUpdateConflicts.STS_BEFORE
+        self.write("db.yaml", TestImmutableUpdateConflicts.STS_BEFORE.replace(
+            "scenario-hyperdisk-balanced", "dynamic-rwo"
+        ))
+        findings = [self.finding()]
+        self.assertEqual(audit_report.annotate_apply_conflicts(findings, self.root), ["disk-mix"])
+        first = findings[0]["remediation"]["note"]
+        self.assertEqual(audit_report.annotate_apply_conflicts(findings, self.root), [])
+        self.assertEqual(findings[0]["remediation"]["note"], first)
+        self.assertEqual(first.count(audit_report.APPLY_CONFLICT_PREFIX), 1)
+
+    def test_an_unwritten_manifest_is_left_to_the_degrade_path(self):
+        """`remediation_file_problem` owns the missing-file report; do not double up."""
+        findings = [self.finding()]
+        self.assertEqual(audit_report.annotate_apply_conflicts(findings, self.root), [])
+
+
 class TestScopeLimitations(BaseTestCase):
     def test_limitations_are_accepted(self):
         doc = make_doc(

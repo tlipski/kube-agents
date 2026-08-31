@@ -435,9 +435,19 @@ picked up next run. That is the system working.
 Three fields, all required, all load-bearing for the human who has to decide:
 
 - **`action`** — what to do. Imperative, one or two sentences.
-- **`rationale`** — why _this_ fix and not the obvious alternative. **Name the alternative you
-  considered and why you rejected it.** A rationale that restates the action is not a rationale.
-- **`risk`** — what breaks on apply, and the read-only check to run first.
+- **`rationale`** — why _this_ fix. Where you genuinely weighed an alternative, name it and say why
+  you rejected it; that is the most useful rationale there is. Where there was no real alternative,
+  say why this is the only change that closes the finding. **Do not narrate a deliberation that did
+  not happen** — a retrofitted "X was considered but rejected" on every finding in a report is a
+  tell, and it buries the ones where a choice was actually made. A rationale that restates the
+  action is not a rationale.
+- **`risk`** — what breaks on apply, and the read-only check to run first. Quantify it where the
+  change moves resources: shapes and counts before and after, not "slightly larger".
+- **Check the fix against the SOP that produced the finding before you write the file.** A
+  remediation has to be a fixed point of its own audit — the finding it targets stops firing, and no
+  other check in the roster starts. The state you inspected in Step 2 is everything the checks read,
+  so this needs no further cluster access. A fix that reintroduces the defect it was written for
+  under a different value is the failure this catches, and it is common.
 
 ## Evidence rules
 
@@ -465,6 +475,25 @@ Corollaries:
 - Report what the command showed, not what you infer it implies. Inference belongs in `impact`.
 - One finding per object. Do not roll up "12 namespaces lack NetworkPolicies" into one finding — each
   gets its own stable id so each can resolve independently.
+- **The excerpt must contain the fact the finding asserts.** A count, a threshold, a version, an
+  identifier named in the title or `impact` appears in `evidence.excerpt`, or the finding says
+  something the excerpt supports instead. Most SOP checks pre-write an `Impact:` line for you; that
+  line is a template to adapt, and pasting it unchanged is how a finding ships ">10 rules" over an
+  excerpt showing eight. A reviewer who spots that stops trusting the other ten findings, which
+  costs more than the one they caught.
+- **Two findings against one object agree with each other.** Where a run reports two findings on the
+  same `(cluster, object)` and both name the same `evidence.command`, the excerpts must be
+  byte-identical — they came from one read of one object. `finish` rejects the document otherwise:
+  contradictory evidence in one report leaves a reviewer no way to tell which half is real.
+- **Cite a mechanism or leave it out.** A causal claim, a numeric limit, or a version gate comes from
+  the SOP's `Reference:` file, quoted as that file states it — build qualifiers included, never
+  rounded. Where the reference does not support a mechanism, report the deviation without one. "This
+  configuration cannot do what the workload asks" is a complete finding; an invented explanation
+  under it is worse than none, because it reads as authoritative and cannot be checked.
+- **Do not diagnose from a name, label, or annotation.** Human-authored metadata asserts a
+  diagnosis — `legacy`, `temp`, `deprecated`, a `scenario:` label naming a failure mode — and the
+  object's spec may not support it. Judge the spec. A finding that is not re-derivable with the
+  names stripped came from the label, not from the fleet.
 
 ## What the ledger says about each finding
 

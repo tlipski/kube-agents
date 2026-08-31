@@ -247,8 +247,9 @@ RECOMMENDATION_FIELDS: tuple[tuple[str, str], ...] = (
     ("action", "what to do, imperative, one or two sentences"),
     (
         "rationale",
-        "why this fix and not the obvious alternative; name the alternative you "
-        "considered and why you rejected it",
+        "why this fix; name the alternative you weighed and why you rejected it "
+        "where you actually weighed one, and do not narrate a deliberation that "
+        "did not happen",
     ),
     ("risk", "what breaks on apply, and the read-only check to run first"),
 )
@@ -1573,6 +1574,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
     # -> index, only to warn when shortening lands two of them on one row.
     seen_ids: dict[str, int] = {}
     short_ids: dict[str, int] = {}
+    # (cluster, object, command) -> (index, excerpt). Two findings that name one
+    # object and one command read it once, so their excerpts are the same bytes.
+    # See the contradiction check below for why this is worth a hard failure.
+    evidence_reads: dict[tuple[str, str, str], tuple[int, str]] = {}
     for i, finding in enumerate(findings):
         if not isinstance(finding, dict):
             raise ValidationError(f"findings[{i}]: expected an object")
@@ -1696,6 +1701,37 @@ def validate_findings(data: object, audit_id: str) -> dict:
         _require_str(
             evidence.get("excerpt", ""), f"findings[{i}].evidence.excerpt"
         )
+
+        # Two findings against one object, quoting one command, must quote the
+        # same output — there was one read. When they disagree the report tells
+        # a reviewer two incompatible things about the same spec and gives them
+        # no way to decide which half is real, which is worse than either
+        # finding being absent. Observed in the wild: one run reported a
+        # ComputeClass as having a single priority rule under one check and
+        # three rules under another, from the same `kubectl get` on the same
+        # morning, and both findings recommended fixes premised on their own
+        # version. Keyed on the command too, because two genuinely different
+        # reads of one object (`get -o yaml` and `describe`) legitimately
+        # differ, and only an identical command makes the excerpts comparable.
+        read_key = (
+            str(finding["cluster"]),
+            str(finding["object"]),
+            str(evidence["command"]).strip(),
+        )
+        excerpt_text = normalise_newlines(str(evidence.get("excerpt", ""))).strip()
+        first_seen = evidence_reads.get(read_key)
+        if first_seen is not None and first_seen[1] != excerpt_text:
+            raise ValidationError(
+                f"findings[{i}].evidence.excerpt: contradicts findings"
+                f"[{first_seen[0]}].evidence.excerpt. Both findings name object "
+                f"{finding['object']!r} on cluster {finding['cluster']!r} and both "
+                "ran the same command, so both are quoting one read and cannot "
+                "disagree. Re-read the object once and give both findings that "
+                "excerpt — or, if they really inspected different things, say so "
+                "in `evidence.command`"
+            )
+        if first_seen is None:
+            evidence_reads[read_key] = (i, excerpt_text)
 
         # Required on EVERY finding, not only the promotable ones. Deferring the
         # reasoning to promotion time means writing it when the evidence is no
@@ -5049,6 +5085,179 @@ def load_findings(path: str, audit_id: str) -> dict:
     return validate_findings(data, audit_id)
 
 
+# Fields the API server refuses to change on an object that already exists,
+# by kind. An audit runs on `roles/container.viewer`, so `kubectl apply
+# --dry-run=server` — the thing that would catch these — needs write RBAC it
+# does not have and will not get. The clone is the substitute: the previous
+# declaration is in `HEAD`, the proposed one is on disk, and the diff between
+# them answers "will this apply?" without touching a cluster.
+#
+# A conflict does not make the fix wrong. The declaration is still the right
+# file to edit, and GitOps still reconciles it. What it changes is the
+# rollout: a `risk` line implying a rolling update sends a reviewer into a
+# rejected write on a live workload, so the note says what the change actually
+# needs. Observed in the wild: a remediation moved a StatefulSet's
+# `volumeClaimTemplates.storageClassName` and shipped as a one-line diff,
+# which `kubectl apply` rejects outright on a running database.
+APPLY_CONFLICT_PREFIX = "Rollout note:"
+
+IMMUTABLE_UPDATE_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "StatefulSet": (
+        ("spec", "volumeClaimTemplates"),
+        ("spec", "selector"),
+        ("spec", "serviceName"),
+        ("spec", "podManagementPolicy"),
+    ),
+    "Deployment": (("spec", "selector"),),
+    "DaemonSet": (("spec", "selector"),),
+    "ReplicaSet": (("spec", "selector"),),
+    "Job": (("spec", "selector"), ("spec", "template"), ("spec", "completionMode")),
+    "Service": (("spec", "clusterIP"),),
+    "PersistentVolumeClaim": (
+        ("spec", "storageClassName"),
+        ("spec", "accessModes"),
+        ("spec", "volumeName"),
+    ),
+    "StorageClass": (
+        ("provisioner",),
+        ("parameters",),
+        ("reclaimPolicy",),
+        ("volumeBindingMode",),
+    ),
+}
+
+
+def _yaml_documents(text: str) -> list[dict] | None:
+    """Every mapping document in `text`, or None if it cannot be parsed.
+
+    None and `[]` mean different things and the caller must not conflate them:
+    an unparseable file (or a runtime without pyyaml) is "no answer", and
+    guessing at an answer there would annotate fixes on no evidence.
+    """
+    try:
+        import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
+    except ImportError:
+        return None
+    try:
+        return [d for d in yaml.safe_load_all(text) if isinstance(d, dict)]
+    except yaml.YAMLError:
+        return None
+
+
+def _manifest_key(doc: dict) -> tuple[str, str, str] | None:
+    """`(kind, name, namespace)` — the identity two revisions of one object share."""
+    meta = doc.get("metadata")
+    kind = doc.get("kind")
+    if not isinstance(meta, dict) or not isinstance(kind, str):
+        return None
+    name = meta.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    namespace = meta.get("namespace")
+    return (kind, name, namespace if isinstance(namespace, str) else "")
+
+
+def _value_at(doc: dict, path: tuple[str, ...]) -> object:
+    node: object = doc
+    for part in path:
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def immutable_update_conflicts(old_text: str, new_text: str) -> list[str]:
+    """Immutable fields this edit changes on objects that already exist.
+
+    Only objects present in *both* revisions are compared: a newly declared
+    object is a create, and nothing about a create is immutable.
+
+    An empty list is "nothing found", which includes "could not look" — a file
+    neither revision parses as YAML, or a runtime without pyyaml. Callers use
+    this to *add* a warning, never to certify a fix as applyable, so the two
+    collapse safely here; a caller that wanted the distinction would have to
+    ask `_yaml_documents` itself.
+    """
+    old_docs = _yaml_documents(old_text)
+    new_docs = _yaml_documents(new_text)
+    if old_docs is None or new_docs is None:
+        return []
+
+    previous: dict[tuple[str, str, str], dict] = {}
+    for doc in old_docs:
+        key = _manifest_key(doc)
+        if key is not None:
+            previous.setdefault(key, doc)
+
+    conflicts: list[str] = []
+    for doc in new_docs:
+        key = _manifest_key(doc)
+        if key is None:
+            continue
+        was = previous.get(key)
+        if was is None:
+            continue
+        kind, name, _ = key
+        for path in IMMUTABLE_UPDATE_FIELDS.get(kind, ()):
+            if _value_at(was, path) != _value_at(doc, path):
+                conflicts.append(f"{kind}/{name} `{'.'.join(path)}`")
+    return conflicts
+
+
+def annotate_apply_conflicts(findings: list[dict], root: Path) -> list[str]:
+    """Say, in the note, when a manifest fix cannot be rolled out with `apply`.
+
+    Advisory by design. The alternative — degrading the finding to `manual` —
+    would drop a correct file edit on the floor over a rollout detail, and the
+    pull request body is exactly where a reviewer needs this instead.
+
+    Returns the ids annotated, for the caller to log.
+    """
+    annotated: list[str] = []
+    for finding in findings:
+        remediation = finding.get("remediation") or {}
+        if remediation.get("kind") != "manifest":
+            continue
+        path = str(remediation.get("path", ""))
+        fid = str(finding.get("id", "?"))
+        try:
+            resolved = resolve_inside_repo(root, path, f"{fid}.remediation.path")
+        except ValidationError:
+            # Containment is `remediation_file_problem`'s to report, and it
+            # has already logged a SECURITY line for this path.
+            continue
+        if not resolved.is_file():
+            continue
+        # Absent from HEAD means this declaration is new, so there is no
+        # previous revision to be incompatible with. `check=False` also covers
+        # the dry-run root, which need not be a clone at all.
+        show = git(["show", f"HEAD:{path}"], check=False, cwd=root)
+        if show.returncode != 0:
+            continue
+        try:
+            proposed = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        conflicts = immutable_update_conflicts(show.stdout, proposed)
+        if not conflicts:
+            continue
+        note = str(remediation.get("note", "")).strip()
+        if APPLY_CONFLICT_PREFIX in note:
+            # Idempotent: `finish` and `remediate` both call this, and a note
+            # carrying the warning twice reads as two separate problems.
+            continue
+        warning = (
+            f"{APPLY_CONFLICT_PREFIX} this edit changes "
+            + ", ".join(conflicts)
+            + ", which the API server refuses to update in place. Applying it "
+            "needs a recreate — `kubectl delete <kind>/<name> --cascade=orphan` "
+            "and re-apply, or a `Replace=true` sync — not a rolling update."
+        )
+        remediation["note"] = f"{note} {warning}" if note else warning
+        annotated.append(fid)
+    return annotated
+
+
 def remediation_file_problem(finding: dict, root: Path) -> str | None:
     """`None` if this finding's fix is a readable file inside `root`; else why not.
 
@@ -5273,6 +5482,19 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
             f"WARNING: {fid}'s remediation path is not a readable file inside "
             f"{root}; it degrades to a manual remediation and opens no pull request."
         )
+    # The apply-conflict gate does not run here, and the preview says so rather
+    # than reading as a clean bill. It needs the previous revision, which means
+    # `git show HEAD:<path>` — and a dry run makes no git or gh call at all, by
+    # a promise this path is tested against. That promise is not fussiness: the
+    # credential-proxy shim POSTs argv and cwd to a sidecar that rejects
+    # anything outside the workspace root, and a dry run's root need not be a
+    # clone. So the note the real run may add to a remediation is absent from
+    # the body printed below.
+    log(
+        "DRY RUN: not checking whether any remediation edits an immutable "
+        "field; that needs `git show` against the clone, and a dry run makes no "
+        "git call. The real run adds the rollout note this preview omits."
+    )
     paths = manifest_paths(findings)
 
     gaps = coverage_gaps(data)
@@ -5554,6 +5776,11 @@ def handle_remediate(args: argparse.Namespace) -> None:
     # the least useful outcome and the hardest to act on. Refuse by name,
     # proceed with the rest, and let the operator see exactly which is which.
     degraded = set(degrade_missing_remediations(findings, root))
+    for fid in annotate_apply_conflicts(findings, root):
+        log(
+            f"WARNING: {fid}'s remediation edits a field the API server will not "
+            "update in place; its note now says the change needs a recreate."
+        )
     refused = [fid for fid in args.finding if fid in degraded]
     requested = [fid for fid in args.finding if fid not in degraded]
     for fid in refused:
@@ -5672,6 +5899,11 @@ def handle_finish(args: argparse.Namespace) -> None:
         log(
             f"WARNING: {fid}'s remediation file is missing under {root}; the "
             "finding is published with a manual remediation instead."
+        )
+    for fid in annotate_apply_conflicts(findings, root):
+        log(
+            f"WARNING: {fid}'s remediation edits a field the API server will not "
+            "update in place; its note now says the change needs a recreate."
         )
 
     # "Absent from this document" only means "fixed" if the audit actually

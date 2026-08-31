@@ -86,15 +86,52 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 - **S4 — explicit opt-out:** carries `kubeagents.x-k8s.io/stockout-audit: exempt`.
 - **S5 — not running:** `spec.replicas == 0`, or completed batch Jobs.
 
+**Evidence discipline — applies to every check below.** Each check states an
+**Impact** line. That line is a template to adapt to what you actually saw, not
+a string to paste: publishing it unchanged is how a finding ends up asserting a
+threshold its own evidence contradicts.
+
+- **The excerpt must contain the fact the finding asserts.** If the title or
+  impact names a count, a threshold, a machine type or a version, that value
+  appears in `evidence.excerpt` — or the finding says something else. A check
+  whose threshold is "more than 10 rules" does not fire on a class with eight,
+  and must never publish ">10" over an excerpt showing eight.
+- **One command, one object.** `evidence.command` is the command that produced
+  the excerpt for **this** finding's `object`. Quoting ComputeClass `X` under a
+  finding whose object is StatefulSet `Y` leaves a reviewer unable to reproduce
+  either.
+- **Two findings against the same object agree.** If a run reports two findings
+  on one `(cluster, object)` and both ran the same command, the excerpts are
+  identical, because they came from one read. Where they differ, one is wrong
+  and the harness rejects the document.
+- **Cite, or leave the mechanism out.** A causal claim, a numeric limit or a
+  GKE version gate comes from the `Reference:` file the check names, quoted as
+  that file states it — including the full `1.35.3-gke.1290000` style build
+  qualifier, never a rounded `1.35.3+`. If the reference does not support the
+  mechanism, say what is misconfigured and stop. "This class cannot attach the
+  disk the workload asks for" is a complete finding; an invented reason
+  underneath it is worse than none, because a reviewer cannot check it.
+- **Do not diagnose from a name, label or annotation.** An object called
+  `db-legacy-class`, or labelled `scenario: priority-starvation`, asserts a
+  diagnosis that the object's spec may not support. Judge the spec. If a
+  finding is not re-derivable with the names stripped, it came from the label.
+- **Read the workload, not only the class.** A ComputeClass is judged against
+  the workloads that select it — their `resources.requests`, their
+  `nodeAffinity` and `topologySpreadConstraints`, and the StorageClass their
+  volumes name. Step 2 already dumps all of it. Most of these checks are
+  unanswerable from `priorities[]` alone.
+
 #### 3.1 Lack of fallback machine families and dimension diversity (`ccc-missing-fallbacks`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
-- **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
+- **Command:** `kubectl --context <ctx> get computeclasses,deployments,statefulsets -A -o yaml` — the class **and** the workloads that select it. The Zone dimension below is a property of the workload, not of `priorities[]`, so a read of the ComputeClass alone cannot answer this check.
 - **Flag when:** A `ComputeClass` has `priorities[]` pinned to a single machine family or varies fewer than 2 of the 4 core obtainability dimensions across its priority chain: Zone, Family, Capacity Model (Spot vs. On-Demand), and Machine Size (vCPU core count).
+- **Zone is judged on the consuming workload.** A class with three families is still single-zone if every pod that selects it carries a `requiredDuringSchedulingIgnoredDuringExecution` `topology.kubernetes.io/zone` affinity, or a `topologySpreadConstraints` with one permitted zone. That pin is the finding: adding families varies a dimension the failure does not run on, and leaves the workload exactly as exposed to a zonal stockout. Name the affinity in the excerpt and recommend relaxing it (or `location.zones` / `locationPolicy: BALANCED` on the class), not more families.
 - **Do NOT flag:** ComputeClasses that vary 2+ obtainability dimensions (e.g. multi-zone `c3` fallback to `n4` and `n2`, or Spot fallback to On-Demand across zones); standard exclusions.
+- **Also check `whenUnsatisfiable`.** `DoNotScaleUp` is the default from GKE 1.33, so its presence is not by itself evidence of a deliberate choice — but it is what converts an exhausted priority chain into permanent `Pending`. For a general-purpose workload, name `ScaleUpAnyway` in the recommendation as the safety valve.
 - **Severity:** `critical`. When GCE encounters a zonal shortage or stockout on that machine family, Cluster Autoscaler has no fallback path and scale-up fails completely.
 - **Impact:** "Pinned to a single machine family or narrow configuration: any zonal capacity exhaustion causes scale-up to fail and leaves pods unschedulable."
-- **Remediation:** `kind: manifest`. Add multi-zone distribution and secondary fallback machine families (e.g., fallback from `c3` to `n4` and `n2`) to the ComputeClass manifest in GitOps.
+- **Remediation:** `kind: manifest`. Add multi-zone distribution and secondary fallback machine families (e.g., fallback from `c3` to `n4` and `n2`) to the ComputeClass manifest in GitOps. **Check the family fits the workload first:** a 2-vCPU pod under a `machineFamily: m1` rule provisions a 40-vCPU/961GB ultramem node, and adding fallbacks under that rule leaves the oversize as the preferred path. Where the pinned family is far larger than the pods need, the finding is the pin — recommend removing it.
 
 #### 3.2 Spot-only ComputeClass without on-demand safety floor (`ccc-no-ondemand-floor`)
 
@@ -108,10 +145,12 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 #### 3.3 Large VM shape scarcity (>32 vCPU) without multi-family fallbacks (`ccc-large-vm-scarcity`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`
 - **Command:** `kubectl --context <ctx> get deployments,statefulsets,computeclasses -n <ns> <name> -o yaml`
+- **Check the shape exists in GKE first.** Against the _Machine types GKE will not provision at all_ list in the gotchas reference — `-metal` on `c4`/`c4d`, `c3` `-metal` under Autopilot or the autoscaler, all of `x4`, and the rest. A ComputeClass naming one of those never provisions a node in any region at any time. That is `critical` and a different finding from this one: report it as an invalid machine type with permanent `Pending` as the impact, not as capacity scarcity, and say in the recommendation that no fallback rule underneath it would have helped. Bare-metal shapes read like ordinary large shapes, so check the name rather than the size.
 - **Flag when:** A workload or ComputeClass requests very large VM sizes (>32 vCPUs, such as `m1-ultramem-160`, `c3-highcpu-88`, `a2-highgpu-8g`) from thin capacity pools without secondary fallback families or horizontal replica spreading.
 - **Do NOT flag:** Workloads requesting standard/horizontal shapes (<=32 vCPUs); stateful monolithic databases that explicitly declare multi-region failover.
+- **Gate the remediation on Pod requests.** Node auto-creation sizes nodes to Pod _requests_, so a single pod requesting >32 vCPU **cannot** land on a smaller node — smaller-core fallbacks only help horizontally-scalable workloads whose pods bin-pack. For a genuinely large single pod, vary **zone and family** instead, and say so; proposing `c3-highmem-88` under a pod that needs one 200-vCPU node is a fallback the autoscaler will never take.
 - **Severity:** `major`.
 - **Impact:** "Very large VM shapes (>32 cores) draw from thin regional capacity pools and are highly prone to sudden stockouts during scale-up."
 - **Remediation:** `kind: manifest`. If horizontally scalable (verified with `kubectl top pod`), propose smaller replica shapes with horizontal autoscaling; otherwise add fallback machine families in GitOps manifests.
@@ -120,31 +159,36 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `kubectl --context <ctx> get computeclasses <name> -o yaml`
-- **Flag when:** A `ComputeClass` contains more than 10 total priority rules (granular `machineType` rules or family entries), exceeding Flex Advisor combinations and triggering Cluster Autoscaler cooldown/backoff reset loops.
+- **Flag when:** A `ComputeClass` carries more than the **~10 priority entries** the traversal supports (the reference's cap, which exists to prevent infinite loops), so rules past it are never reached. Count the rules, put the count in the excerpt, and state the count you found rather than the threshold.
+- **Separately, and only as `minor`:** a class that stays inside the cap but enumerates granular `machineType` rules where a `machineFamily` rule would do. GKE can then create nodes on any viable type in the series, which improves the odds of landing on the preferred configuration. This is a best-practice improvement, not a failure — there is no documented solver, cache, or permutation limit, and nothing below ~10 entries triggers a backoff loop. The real timing caveat the reference describes is different and is about **churn**: an unobtainable shape holds a 5-minute cooldown, and under heavy Pod create/delete the autoscaler may not reach later rules before earlier cooldowns expire. Where that is what you observed, cite the autoscaler visibility logs for it and consider disabling active migration rather than rewriting the priority list.
 - **Do NOT flag:** ComputeClasses using <= 5 broad `machineFamily` level definitions (e.g. `n4`, `c3`, `n2`).
-- **Severity:** `critical`.
-- **Impact:** "Excessive priority rules (>10) exceed the autoscaler solver cache limit, triggering backoff loops that starve lower priorities."
-- **Remediation:** `kind: manifest`. Auto-compress the ComputeClass: replace granular rules with 3-4 family-level (`machineFamily`) priority rules.
+- **Severity:** `major` over the traversal cap; `minor` for granularity alone.
+- **Impact:** over the cap, "Priority rules past the ~10-entry traversal cap are never evaluated, so the fallbacks below them cannot be reached." For granularity, say that the class forgoes viable machine types within each series — not that anything is starved.
+- **Remediation:** `kind: manifest`. Compress granular rules to family level (`machineFamily`), **carrying the sizing the granular rules expressed**: a list of `c3-standard-4` through `c3-highmem-8` becomes `machineFamily: c3` plus `minCores`/`minMemoryGb`, or the boundary is lost and the autoscaler may size nodes anywhere in the series. Check the consuming workload's `resources.requests` before compressing — if no rule in the original list could host one replica, that is §3.12(e) and a far more serious finding than this one.
 
 #### 3.5 Mixed disk generations on PV-attached ComputeClasses (`ccc-mixed-disk-generations`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `kubectl --context <ctx> get computeclasses,statefulsets -n <ns> <name> -o yaml`
-- **Flag when:** A stateful workload using PersistentVolumes references a ComputeClass whose `priorities[]` mixes Gen 2 VMs (`n2`, `n2d`, `c2`) and Gen 4/Hyperdisk VMs (`c4`, `n4`, `c3`), causing PV attachment deadlocks upon failover.
-- **Do NOT flag:** Stateless workloads; ComputeClasses whose priorities are purely Gen 2 or purely Gen 4/Hyperdisk-compatible; clusters running GKE 1.35.3+ using the `dynamic-rwo` StorageClass.
+- **Flag when:** A stateful workload using PersistentVolumes references a ComputeClass whose `priorities[]` mixes **Gen 2** VMs (`n2`, `n2d`, `c2` — Persistent Disk only) and **Gen 4** VMs (`n4`, `c4` — Hyperdisk only), causing PV attachment deadlocks upon failover.
+- **`c3`/`c3d` are Gen 3 and take either disk**, so a chain of `n1`, `n2`, `c3` is not a Gen 2/Gen 4 mix. Name the generations you actually found; do not write "Gen 2 and Gen 4" over an excerpt showing neither.
+- **Do NOT flag:** Stateless workloads; ComputeClasses whose priorities are purely Gen 2 or purely Gen 4/Hyperdisk-compatible; clusters on **GKE 1.35.3-gke.1290000 or later** whose data PVs already use the built-in `dynamic-rwo` StorageClass.
 - **Severity:** `critical`.
 - **Impact:** "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes."
-- **Remediation:** On GKE 1.35.3+, emit `kind: manifest` updating the StorageClass to `dynamic-rwo` (which makes autoscaler disk-topology aware). On older versions or fixed disks, emit `kind: manual` to unify priorities.
+- **Remediation:** On **1.35.3-gke.1290000+** — read the cluster's actual version with `gcloud container clusters describe ... --format='value(currentMasterVersion)'` and quote it, rather than assuming the fleet is current — emit `kind: manifest` moving the data PVs to the built-in `dynamic-rwo` StorageClass (`type: dynamic` + `use-allowed-disk-topology: "true"`), so the autoscaler scales up only disk-compatible nodes and skips the incompatible-generation priority. On older versions, emit `kind: manual` to unify priorities. Three things the recommendation must carry: `volumeBindingMode: WaitForFirstConsumer`; that `dynamic-rwo` selects the disk type per node, so a class pinning a specific type is giving that pin up; and that only **newly provisioned** PVs are governed, so existing volumes need a migration.
+- **A StatefulSet's `volumeClaimTemplates` is immutable.** Changing `storageClassName` there cannot be applied to a live StatefulSet — the API server rejects every update outside `replicas`, `ordinals`, `template`, `updateStrategy`, `revisionHistoryLimit`, `persistentVolumeClaimRetentionPolicy` and `minReadySeconds`. The fix is still the right file edit, but `recommendation.risk` must say it needs `kubectl delete statefulset --cascade=orphan` and a recreate (or a `Replace=true` sync), not a rolling update. See the §4 feasibility gate.
 
 #### 3.6 Incompatible machine families for Hyperdisk workloads (`ccc-hyperdisk-incompatible`)
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-gotchas-and-cuds.md`, `skills/gke-compute-classes/references/compute-class-provisioning-methods.md`
 - **Command:** `kubectl --context <ctx> get storageclasses,computeclasses,deployments -n <ns> -o yaml`
-- **Flag when:** A workload using Hyperdisk storage (`hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`) uses a ComputeClass that falls back to older generation machine families (`c2`, `n2`, `e2`) that do not support Hyperdisk CSI drivers.
-- **Do NOT flag:** Workloads using standard Persistent Disk (`pd-standard`, `pd-ssd`); ComputeClasses falling back only to Hyperdisk-capable families (`c3`, `c4`, `n4`, `c3d`).
+- **Read the StorageClass's `parameters.type` first, and judge against that type.** "Hyperdisk-compatible" is not one property — Balanced, Throughput and Extreme have different support matrices, and the gotchas reference carries them. A family that is fine for `hyperdisk-balanced` can be a hard attach failure for `hyperdisk-extreme`.
+- **Flag when:** A workload using Hyperdisk storage uses a ComputeClass with a priority rule that cannot attach **that** disk type — including a rule that names a supported family but permits shapes below the type's vCPU floor.
+- **Do NOT flag:** Workloads using standard Persistent Disk (`pd-standard`, `pd-ssd`); ComputeClasses whose every rule supports the disk type the workload names, at a size that clears its floor.
 - **Severity:** `critical`.
-- **Impact:** "Autoscaler fallback lands on an older machine family (c2/n2/e2) that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail."
-- **Remediation:** `kind: manifest`. Update ComputeClass fallback priorities to Hyperdisk-compatible families (`c3`, `c4`, `n4`) and remove incompatible older generations.
+- **Impact:** "Autoscaler fallback lands on a machine family that does not support the disk type this workload requests, causing node provisioning or pod volume attachment to fail."
+- **Remediation:** `kind: manifest`. Replace the incompatible rules with families that support the workload's disk type, and **verify the replacement against the reference before writing it** — this check firing on the fix it just proposed is the failure mode. Two traps: `n4` supports Balanced but **not Extreme**, so it is not a valid `hyperdisk-extreme` fallback; and a bare `machineFamily: c3` rule permits `c3-standard-4`, far below the 88-vCPU floor Extreme needs on C3, so pin it with `minCores`.
+- **Ask whether the disk tier is the mismatch.** Where the floor forces a node many times the pod's requests — an 8-vCPU database pulling an 88-vCPU node to satisfy `hyperdisk-extreme` — the cheaper, smaller change is usually the StorageClass, not the ComputeClass. Put both options in `recommendation.rationale` and say which you chose.
 
 #### 3.7 Regional quota exhaustion risk across fleet (`quota-exhaustion-risk`)
 
@@ -203,11 +247,13 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
 
 - **Reference:** `skills/gke-compute-classes/references/compute-class-crd-fields.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `kubectl --context <ctx> get computeclasses,deployments,statefulsets -A -o yaml`
-- **Flag when:** (a) A workload's `nodeSelector: cloud.google.com/compute-class` or namespace `cloud.google.com/default-compute-class` references a ComputeClass that does not exist; (b) A ComputeClass `status.conditions` reports invalid configuration; (c) `nodePoolAutoCreation.enabled` is false and referenced node pools lack `cloud.google.com/compute-class` label/taints; or (d) A GPU workload references a ComputeClass without declaring `nvidia.com/gpu` tolerations.
+- **Flag when:** (a) A workload's `nodeSelector: cloud.google.com/compute-class` or namespace `cloud.google.com/default-compute-class` references a ComputeClass that does not exist; (b) A ComputeClass `status.conditions` reports invalid configuration; (c) `nodePoolAutoCreation.enabled` is false and referenced node pools lack `cloud.google.com/compute-class` label/taints; (d) A GPU workload references a ComputeClass without declaring `nvidia.com/gpu` tolerations; or (e) **no priority rule in the class can host one replica of a workload that selects it** — every `machineType` names a shape smaller than the pod's `resources.requests`, so the chain is exhausted on the first scheduling attempt.
+- **(e) is the check that needs the workload dump, and it is the most common way a class is silently dead.** Compare each pod template's CPU and memory requests against every `machineType` rule; a `machineFamily` rule is sized to the pod by node auto-creation and so cannot fail this way. Five replicas requesting 14 vCPU against a list topping out at `c3-highmem-8` is permanent `Pending` for all five, with `whenUnsatisfiable: DoNotScaleUp` guaranteeing it. Put both numbers — the request and the largest rule — in the excerpt.
 - **Do NOT flag:** Workloads referencing valid, reconciled ComputeClasses with matching node pool labels and tolerations.
 - **Severity:** `critical`.
 - **Impact:** "Workload cannot be scheduled due to dangling class references, invalid CRD configuration, or missing node tolerations, causing permanent Pending state."
-- **Remediation:** `kind: manifest`. Correct the ComputeClass name in GitOps, fix invalid CRD fields, or add required GPU tolerations to workload templates.
+- **Remediation:** `kind: manifest`. Correct the ComputeClass name in GitOps, fix invalid CRD fields, or add required GPU tolerations to workload templates. For (e), either raise the rules to shapes that fit the pod or compress them to `machineFamily` so auto-creation sizes the node — and say what the resulting fleet costs, because a class that provisioned nothing now provisions one node per replica.
+- **Two things not to write here.** Updating a ComputeClass does **not** tear down or recreate existing node pools; GKE leaves existing nodes on their old configuration and applies the change to new ones, so a `risk` claiming disruption on re-apply is false. And on Autopilot there are no user-managed node pools to align, which makes (c) unreachable and its usual recommendation unactionable — on those clusters the cause is a stale auto-created pool still carrying the class's label after `priorities[]` changed. Say that instead.
 
 ### 4. Generate remediation artifacts
 
@@ -221,6 +267,16 @@ gcloud logging read 'log_id("container.googleapis.com/cluster-autoscaler-visibil
   2. For On-Demand proposals, the project quota for that family (`N4_CPUS`, `C4_CPUS`, GPU types) is greater than 0 (`gcloud compute regions describe <region> --project=<project>`).
   3. For Spot proposals, the project's preemptible CPU quota (`PREEMPTIBLE_CPUS`) is greater than 0 (and `PREEMPTIBLE_LOCAL_SSD_GB` is greater than 0 if requesting local SSDs).
 - Edit the manifest directly in `<workspace>`, adding the necessary fallback machine families, zones, or quota adjustments.
+- **Then re-run the §3 checks against the file you just wrote.** A fix is a fixed point of this SOP or it is not a fix: the finding it targets must no longer fire, and **no other check may start firing**. Nothing here needs cluster access — you have the patched manifest and the state dump from Step 2, which is everything the checks read. The failure this catches is the common one: §3.6 fires on an `e2` fallback under a `hyperdisk-extreme` volume, and the proposed replacement is `n4`, which §3.6 rejects for exactly the same reason. Where the fix cannot clear every check, it is not ready — either write a different fix or degrade the finding to `kind: manual` and say what is unresolved.
+- **Check the edit is applicable, with `git diff`.** The clone is the only mechanism available for this — the audit holds `roles/container.viewer`, so `kubectl apply --dry-run=server` is not reachable and never will be on these credentials. `git -C <workspace> diff -- <path>` names exactly the fields the fix changes; compare them against what the API server refuses to update in place:
+  - **StatefulSet:** everything outside `replicas`, `ordinals`, `template`, `updateStrategy`, `revisionHistoryLimit`, `persistentVolumeClaimRetentionPolicy` and `minReadySeconds` — so any change under `volumeClaimTemplates`, including `storageClassName` and `resources.requests.storage`.
+  - **Deployment / StatefulSet / DaemonSet / Job:** `spec.selector`. **Job:** `spec.template`. **Service:** `spec.clusterIP`. **PVC:** `spec.storageClassName`, and any decrease of `spec.resources.requests.storage`.
+
+  A conflict does not make the fix wrong — the file edit is still correct GitOps — but `recommendation.risk` must then name the recreate the change needs (`kubectl delete <kind> <name> --cascade=orphan` and re-apply, or a `Replace=true` sync) instead of implying a rolling update. `finish` re-derives this from the same diff and appends a rollout note, so a `risk` line that already says it reads as deliberate rather than as a correction. `finish --dry-run` does **not**: it makes no git call, so the preview omits the note and cannot tell you whether your edit has this problem. Run the `git diff` yourself.
+
+  Where a live schema check is worth having, `kubectl apply --dry-run=client --validate=strict -f <file>` does work on read-only credentials: it pulls the CRD's OpenAPI schema from the cluster over the discovery endpoint, so it catches a field name the installed ComputeClass CRD does not have. It validates the schema, not the admission path — it will not find any of the immutability conflicts above.
+
+- **State the blast radius as numbers, not as prose.** `recommendation.risk` says what the resulting fleet becomes: node shapes and counts before and after, derived from the pod requests and the priority rules. "Slightly larger machine sizes" over a change that takes a workload from zero schedulable nodes to five 22-vCPU nodes is the understatement this rule exists to stop.
 - **Mandatory Remediation Comments**: For every modified line in YAML, append an inline `# Remediation: <reason>` comment.
 - Set `remediation.path` to the repo-relative file path, with `kind: manifest`.
 - Reviewers may comment `/remediate <finding-id>` or `/remediate all` on the ledger issue to promote findings into PRs.

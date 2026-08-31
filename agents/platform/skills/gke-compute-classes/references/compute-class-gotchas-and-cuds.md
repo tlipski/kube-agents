@@ -12,6 +12,8 @@
     fine.
 -   **Disk Generation:**
     -   **Gen 4** (`n4`, `c4`): Requires **Hyperdisk**.
+    -   **Gen 3** (`c3`, `c3d`): Takes **either** PD or Hyperdisk. It is not
+        Gen 4 — a rule written as "Gen 2 vs Gen 4" silently miscategorises it.
     -   **Gen 2** (`n2`, `c2`): Requires **Persistent Disk**.
     -   *Rule:* For stateful PV workloads, do NOT mix Gen 2 and Gen 4 priorities
         (fallback attach fails -> `ContainerCreating` trap).
@@ -28,6 +30,40 @@
         PD↔Hyperdisk is not an in-place conversion).
     -   *Reference:*
         [Asset: postgres-primary-compute-class.yaml](../assets/postgres-primary-compute-class.yaml)
+
+-   **"Hyperdisk-compatible" is not one property.** Balanced, Throughput and
+    Extreme have different support matrices, so a priority rule that is fine
+    for one is a hard attach failure for another. Check the disk type the
+    workload's StorageClass actually names before judging a family.
+    -   **Balanced / Balanced HA:** broad. `n1` and `e2` support it only by
+        allowlist (account team), so treat them as unavailable unless the
+        project already has one.
+    -   **Extreme:** `a3`, `a4`, `c3`, `c3d`, `c4`, `g4`, `h3`, `m1`, `m3`,
+        `m4`, `n2` only. **`n4` does not support it** — recommending `n4` as a
+        fallback for a `hyperdisk-extreme` workload reintroduces the defect.
+    -   **Extreme has a vCPU floor**, and a bare `machineFamily` rule will
+        happily provision a node below it: 60 vCPU in general, `c3` 88, `c3d`
+        60, `c4`/`g4` 96, `c4a`/`c4d`/`m3`/`m4` 64, `m1` 80, `n2` 80. Pin the
+        floor with `minCores` on the rule, or name explicit shapes.
+    -   Extreme, ML and Throughput cannot be **boot** disks.
+    -   *Source:*
+        [Hyperdisk overview](https://docs.cloud.google.com/compute/docs/disks/hyperdisks),
+        [About Hyperdisk Extreme](https://docs.cloud.google.com/compute/docs/disks/hd-types/hyperdisk-extreme).
+
+-   **Machine types GKE will not provision at all.** A ComputeClass naming one
+    of these never scales up — a permanent scheduling failure, not a capacity
+    risk, and no fallback rule underneath it changes that. Bare-metal shapes
+    are the trap, because the name looks like an ordinary large shape.
+    -   `c4` and `c4d`: no `-metal` types, **including `-lssd-metal`**.
+    -   `c3`: no `-metal` types under Autopilot or the cluster autoscaler.
+    -   `x4`: the entire series. `z3`: `z3-highmem-192-highlssd-metal`.
+    -   `m4`: all `m4-hypermem-*`. `c4n`: the `-lssd` types (Preview).
+    -   `c4a` bare metal is the exception that works: `c4a-highmem-96-metal`
+        from 1.35.3-gke.1389000+, and it must be named as a `machineType` —
+        a `machineFamily: c4a` rule provisions ordinary VMs instead.
+        `c4a-standard-96-metal` is not supported for auto-creation.
+    -   *Source:*
+        [About machine support with GKE clusters](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/machine-support).
 
 ## Provisioning Nuance
 
