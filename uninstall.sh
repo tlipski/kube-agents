@@ -41,7 +41,7 @@ fi
 # state anywhere, so this engine has nothing to tear down. Expected against a
 # clean project, and the case an automated caller must be able to tell apart
 # from a teardown that tried and failed — scripts/release/
-# provision_rc_environment.sh branches on exactly this. Defined above on_error
+# provision_environment.sh branches on exactly this. Defined above on_error
 # because on_error reads it.
 EXIT_NOTHING_TO_TEAR_DOWN=3
 
@@ -234,7 +234,7 @@ resolve_state_location() {
   # means there is nothing to tear down. A bare `>/dev/null 2>&1` collapses 404,
   # 403, expired credentials, a network timeout and a missing gcloud into one
   # bit — and with exit 3 wired to "clean project", the 403 case would tell
-  # scripts/release/provision_rc_environment.sh to install over a live cluster.
+  # scripts/release/provision_environment.sh to install over a live cluster.
   #
   # `trap - ERR` inside the substitution: under bash 3.2 the inherited ERR trap
   # fires in this subshell even though the failure is the tested condition. The
@@ -449,6 +449,23 @@ main() {
   # must be present even from a fresh clone; the placeholder key feeds nothing
   # that survives the destroy.
   export API_SERVER_KEY="${API_SERVER_KEY:-uninstall-placeholder}"
+
+  # A destroy needs no sandbox, so it must not be refusable on the sandbox's
+  # account. write_tfvars_from_state runs the Autopilot version-floor check
+  # whenever ENABLE_GVISOR is truthy, and the block above has just sourced a
+  # vars.sh that — since the installer default flipped — says "true" on every
+  # new install. Against a sub-floor Autopilot cluster that check returns 1
+  # under `set -Eeuo pipefail` and the destroy never runs, which is an install
+  # with no working way to remove itself. The reachable route there is the
+  # probe's own "could not read the GKE version" branch: it proceeds, the
+  # install applies everything and then fails its post-apply gate, and the
+  # half-built install is exactly what someone then tries to uninstall.
+  #
+  # Forcing false is safe rather than merely expedient. `terraform destroy`
+  # destroys what is in state regardless of a resource's count, and the gvisor
+  # node pool goes with the cluster in any case; the only thing these two
+  # values change here is whether the floor check gets to abort.
+  export ENABLE_GVISOR="false"
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

@@ -188,6 +188,134 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 profile_begin "bootstrap: source ci-env.sh"
 source "${SCRIPT_DIR}/ci-env.sh"
 
+# ─── Eval dashboard publish hook (dashboard PR 4/4) ─────────────────────────
+# Re-renders and republishes the eval dashboard at the very end of every
+# MAIN-BRANCH run, red or green, from the EXIT trap below. FAIL-SAFE BY
+# CONTRACT: the dashboard must never break the job it observes, so every
+# failure mode -- the sibling dashboard PRs not merged yet (no
+# scripts/eval_dashboard/), the IAM grant not applied, a gsutil error, a
+# python crash, a hung upload -- logs exactly ONE
+# "eval-dashboard publish skipped: <reason>" line and never changes the job's
+# exit code.
+#
+# MAIN-BRANCH RUNS ONLY, the baseline store's trust boundary: a presubmit
+# runs branch-authored code, so publishing from one would let any pull
+# request rewrite the dashboard everyone reads -- both through the bucket
+# credential and through collect.py, which reads TASKS and the domain
+# metadata out of THIS checkout. The gate is the baseline recorder's
+# (JOB_TYPE postsubmit/periodic, no PULL_NUMBER), re-derived here because the
+# trap can fire from a set -e death long before that code runs. The gate
+# alone is conventional -- a branch can edit this file -- which is why
+# prerequisite 2 below puts the credential itself out of the presubmit's
+# reach; that split is what makes the boundary structural, exactly as
+# docs/designs/eval-scorer.md#the-two-service-accounts argues for the
+# baseline store.
+#
+# Nothing publishes until BOTH prerequisites exist:
+#   1. the nightly periodic (NEVER the presubmit) exports
+#      EVAL_DASHBOARD_TARGET (gs://kube-agents-dashboards/evals/, a dedicated
+#      bucket in the team's own project) -- an oss-test-infra change;
+#   2. a DEDICATED publisher identity bound to that periodic alone --
+#      eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com via
+#      Workload Identity, the eval-baseline-recorder pattern from
+#      docs/designs/eval-scorer.md#provisioning-it, NEVER the shared
+#      prowjob-default-sa every presubmit also runs as -- holding
+#      roles/storage.objectUser on the kube-agents-dashboards bucket (a grant
+#      in the team's project, not the OSS Prow infra project). Republishing
+#      overwrites the same object paths, so any workable role carries
+#      storage.objects.delete; the boundary is the identity, not the role:
+#      no account a presubmit can run as ever holds a write on this bucket.
+#      The same identity also needs READ on the sweep's source --
+#      roles/storage.objectViewer on gs://kube-agents-prow -- unless that
+#      bucket's existing public read already covers it; without it the first
+#      armed run 403s, which the zero-runs floor below turns into a skip,
+#      never into publishing an empty dashboard over a good one.
+# Until both land this costs one log line per run.
+# scripts/test_eval_dashboard_publish.py runs this function out of this file
+# and asserts the fail-safe AND the main-branch gate hold.
+publish_eval_dashboard() {
+  case "${JOB_TYPE:-}" in
+    postsubmit | periodic) ;;
+    *)
+      echo "eval-dashboard publish skipped: not a main-branch run (JOB_TYPE=${JOB_TYPE:-unset}): a pull request never writes the dashboard"
+      return 0
+      ;;
+  esac
+  if [ -n "${PULL_NUMBER:-}" ]; then
+    echo "eval-dashboard publish skipped: PULL_NUMBER=${PULL_NUMBER} is set: a pull request never writes the dashboard"
+    return 0
+  fi
+  if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
+    echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
+    return 0
+  fi
+  local dash_src="${SCRIPT_DIR}/../scripts/eval_dashboard"
+  # All three stages, not just the first: the siblings land one file each
+  # (collect.py merged in #1044; render.py and publish.py are still open), and
+  # gating on collect.py alone would run its full GCS sweep only to die at
+  # render.py -- the guard must keep the hook CHEAP while any stage is absent.
+  local dash_stage
+  for dash_stage in collect.py render.py publish.py; do
+    if [ ! -f "${dash_src}/${dash_stage}" ]; then
+      echo "eval-dashboard publish skipped: ${dash_src}/${dash_stage} does not exist (sibling dashboard PRs not merged yet)"
+      return 0
+    fi
+  done
+  local dash_tmp dash_rc=0
+  dash_tmp="$(mktemp -d)" || { echo "eval-dashboard publish skipped: mktemp -d failed"; return 0; }
+  # One timeout over the whole collect -> render -> publish pipeline so a hung
+  # gsutil cannot eat the job's tail. errexit lives inside the child only; out
+  # here any failure becomes the one skip line. The array idiom is the
+  # PROFILE_ROWS one above: no `timeout` binary (a laptop) must degrade to
+  # running unbounded, not to breaking the trap.
+  #
+  # The budget must be LARGER than the 300s collect.py grants each individual
+  # gsutil call, or the one hung call the collector is willing to wait out
+  # kills the whole pipeline instead -- and the sweep is serial over every
+  # archived build (1 + 3N gsutil processes), so it needs real headroom on
+  # top. 900s covers both and only ever taxes the nightly's tail (the gate
+  # above keeps presubmits out entirely); EVAL_DASHBOARD_TIMEOUT overrides it
+  # from the job config without a code change. Bounding the sweep itself
+  # (--since/--limit) is collect.py's follow-up, not this hook's.
+  local dash_budget="${EVAL_DASHBOARD_TIMEOUT:-900}"
+  local dash_timeout=(timeout "${dash_budget}")
+  command -v timeout >/dev/null 2>&1 || dash_timeout=()
+  # Single quotes on purpose: $1/$2/$3 are the child bash's own positionals.
+  # The zero-runs floor between collect and render is the evidence_store
+  # lesson (StoreUnreachable vs "empty store"): collect.py WARNS and
+  # continues when a gsutil listing fails, so a total source outage -- a 403
+  # before the read grant lands, no gsutil on PATH -- still yields a
+  # well-formed document with runs: [] and exit 0. Publishing that would
+  # overwrite a good dashboard with an empty one and log success; the floor
+  # turns it into the skip line instead.
+  # shellcheck disable=SC2016
+  ${dash_timeout[@]+"${dash_timeout[@]}"} bash -c '
+    set -euo pipefail
+    python3 "$1/collect.py" --pr-glob "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*" --out "$2/data.json"
+    python3 -c "
+import json, sys
+if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
+    sys.exit(\"collected zero runs: source unreadable or empty; refusing to publish an empty dashboard over a good one\")
+" "$2/data.json"
+    python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site"
+    python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
+  ' _ "${dash_src}" "${dash_tmp}" "${EVAL_DASHBOARD_TARGET}" >"${dash_tmp}/publish.log" 2>&1 || dash_rc=$?
+  if [ "${dash_rc}" -eq 0 ]; then
+    echo "eval-dashboard: published to ${EVAL_DASHBOARD_TARGET}"
+  else
+    echo "eval-dashboard publish skipped: pipeline exited ${dash_rc} (124 means the ${dash_budget}s timeout): $(tail -n 3 "${dash_tmp}/publish.log" 2>/dev/null | tr '\n' ' ')"
+  fi
+  # The full pipeline log rides to Prow on success AND failure: collect.py's
+  # per-build fetch errors are warnings, not failures, and those warnings are
+  # the only after-the-fact evidence that a published dashboard came from a
+  # partial sweep.
+  if [ -n "${ARTIFACTS:-}" ] && [ -d "${ARTIFACTS}" ]; then
+    cp "${dash_tmp}/publish.log" "${ARTIFACTS}/eval-dashboard-publish.log" 2>/dev/null || true
+  fi
+  rm -rf "${dash_tmp}" || true
+  return 0
+}
+
 # Print the profile on every exit — success, gate failure, or a set -e death —
 # then hand the original exit code to the artifact dumper ci-env.sh provides.
 #
@@ -215,8 +343,16 @@ profile_and_dump_on_exit() {
   profile_report "${exit_code}"
   (exit "${exit_code}")
   dump_prow_artifacts_on_failure
+  # Dashboard last, after the artifacts the run itself needs; the exit code
+  # was captured above and publish_eval_dashboard never returns non-zero, so
+  # this cannot change what Prow reports (errexit is already cleared above).
+  publish_eval_dashboard
 }
 trap profile_and_dump_on_exit EXIT
+# A Prow deadline delivers SIGTERM, which does not run the EXIT trap on its
+# own; converting it to an exit is what lets the artifact collection above
+# fire on a deadline kill.
+trap 'exit 143' TERM INT
 
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running PR Smoke Test Evaluation for PR #${PR_ID} in Namespace: ${TARGET_NAMESPACE} ==="
@@ -315,6 +451,184 @@ export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 export AGENT_DELEGATION_TIMEOUT="2700"
 export BENCH_TF_ROOT="./tf"
 
+# ─── Ledger read credential ──────────────────────────────────────────────────
+# BENCH_GITHUB_TOKEN is what ledger_issue_contains reads a published ledger
+# issue back with. Prow mounts a fine-grained PAT under that name, and only its
+# owner can extend that PAT to a new pool repository -- so kube-agents-evals-6
+# passed every onboarding check, was registered, and 404'd on the first pull
+# request that leased it (gke-labs/kube-agents#994).
+#
+# EVAL_LEDGER_APP_KEY_FILE set: mint a read-only installation token from App
+# 4739812 instead, once per fan-out unit, because a token lasts an hour and
+# units launch across the whole run. Unset: the mounted PAT stands. A mint that
+# fails after its retries stops the run at preflight and costs a unit its
+# repetition inside the fan-out; it never falls back to the PAT, which would
+# let a smoke test pass while proving nothing about the credential it was added
+# to exercise.
+export EVAL_LEDGER_APP_ID="${EVAL_LEDGER_APP_ID:-4739812}"
+export EVAL_LEDGER_INSTALLATION_ID="${EVAL_LEDGER_INSTALLATION_ID:-157029058}"
+# Re-exported so the mint reads it however it was set: the Prow job exports it,
+# a shell that sourced this file may not have, and python reads it from the
+# environment rather than from an argument.
+export EVAL_LEDGER_APP_KEY_FILE="${EVAL_LEDGER_APP_KEY_FILE:-}"
+
+# Exit code _ledger_token_mint uses for a failure that another attempt could
+# survive, so mint_ledger_token retries those and no others. 75 is sysexits.h's
+# EX_TEMPFAIL, which is what it means here.
+LEDGER_MINT_RETRYABLE=75
+# Three attempts, 2s then 8s apart. api.github.com being briefly unreachable is
+# the case this covers, and it costs 10s to rule out; a longer ladder would sit
+# inside a unit that is holding both locks.
+LEDGER_MINT_ATTEMPTS=3
+
+# Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
+# any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
+# 1 when it could not. Its own function rather than inline in the command
+# substitution below: bash 3.2, which is what macOS ships and what a
+# contributor runs `bash -n` with, mis-parses a heredoc inside $( ).
+_ledger_token_mint() {
+  python3 - "${LEDGER_MINT_RETRYABLE}" <<'PY'
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# Passed in rather than duplicated, so the two halves of the contract cannot
+# drift: the shell decides what it retries, this decides what is retryable.
+retryable = int(sys.argv[1])
+
+
+def temporary(message):
+    sys.stderr.write(message + "\n")
+    sys.exit(retryable)
+
+
+key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
+app_id = os.environ["EVAL_LEDGER_APP_ID"]
+installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
+
+
+def b64(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+
+# GitHub rejects an App JWT whose exp is more than ten minutes out; nine leaves
+# room for clock skew, and the backdated iat covers a runner that is slow.
+now = int(time.time())
+header = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+payload = b64(
+    json.dumps(
+        {"iat": now - 60, "exp": now + 540, "iss": app_id}, separators=(",", ":")
+    ).encode()
+)
+signing_input = header + b"." + payload
+
+signed = subprocess.run(
+    ["openssl", "dgst", "-sha256", "-sign", key_file],
+    input=signing_input,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if signed.returncode != 0:
+    sys.exit(
+        "openssl could not sign with %s: %s" % (key_file, signed.stderr.decode()[:300])
+    )
+jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
+
+request = urllib.request.Request(
+    "https://api.github.com/app/installations/%s/access_tokens" % installation_id,
+    method="POST",
+    headers={
+        "Authorization": "Bearer " + jwt,
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "kube-agents-ci-eval-pr",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = json.load(response)
+except urllib.error.HTTPError as exc:
+    # 401: the PEM is not App app_id's. 404: the installation id is wrong, or
+    # the App was uninstalled from the org. Neither survives another attempt,
+    # and a caller holding two locks should hear about them on the first.
+    # 403 stays terminal with them: on this endpoint it is a suspended
+    # installation as often as a secondary rate limit, and the two read alike
+    # from here.
+    message = "GitHub answered HTTP %d (%s) minting for App %s installation %s" % (
+        exc.code,
+        exc.reason,
+        app_id,
+        installation_id,
+    )
+    if exc.code >= 500 or exc.code == 429:
+        temporary(message)
+    sys.exit(message)
+except Exception as exc:
+    # A timeout, a reset connection, DNS: api.github.com was not reached, which
+    # says nothing about the credential.
+    temporary(
+        "could not reach api.github.com to mint for App %s (%s: %s)"
+        % (app_id, type(exc).__name__, exc)
+    )
+
+print(body["token"] + " " + body["expires_at"])
+PY
+}
+
+# Puts a fresh token in the CALLING shell's BENCH_GITHUB_TOKEN and prints where
+# it came from and when it expires, never the token itself. <label> names the
+# caller, because fan-out units print these lines interleaved.
+#
+# Returns non-zero rather than exiting: the unit call site holds two locks by
+# the time it mints, and exiting there would strand them. Each caller unwinds
+# its own scope. Never falls back to the mounted PAT -- that would let a smoke
+# test pass while proving nothing about the credential it exercises.
+mint_ledger_token() { # <label>
+  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    return 0
+  fi
+  # The token never reaches argv, where ps would show it: python writes it to
+  # stdout and command substitution keeps it in this shell.
+  #
+  # Retried because the alternative is worse than the wait. A unit that cannot
+  # mint releases its locks and returns, its repetition has no run directory,
+  # and the gate grades that MISSING -- rung CHECK_DID_NOT_RUN, which is
+  # blocking and whose reason line blames a harness or agent crash. So a single
+  # unreachable api.github.com reds the suite and points the reader at the
+  # agent. Retrying only what could survive one keeps a real credential fault
+  # arriving on the first attempt.
+  local minted rc attempt=1 delay=2
+  while :; do
+    minted="$(_ledger_token_mint)" && break
+    rc=$?
+    if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
+      echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
+           "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
+      echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
+      return 1
+    fi
+    echo "Ledger token (${1}): attempt ${attempt} of ${LEDGER_MINT_ATTEMPTS} hit a transient failure, retrying in ${delay}s" >&2
+    sleep "${delay}"
+    attempt=$((attempt + 1))
+    delay=$((delay * 4))
+  done
+  export BENCH_GITHUB_TOKEN="${minted%% *}"
+  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }"
+}
+
+# Once here as well as once per unit: a key that cannot mint at all is a
+# run-wide fault, and it costs seconds to find out now instead of at the end of
+# the fan-out, where it would surface as every repetition grading MISSING.
+if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  echo "Ledger token: using the mounted BENCH_GITHUB_TOKEN -- EVAL_LEDGER_APP_KEY_FILE is unset"
+else
+  mint_ledger_token "preflight" || exit 1
+fi
+
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
 export TF_VAR_infra_provider="gcp"
@@ -323,9 +637,12 @@ export TF_VAR_infra_provider="gcp"
 # Every other stack under bench/tf builds its own cluster or reuses the seeded
 # slot-c one; prebuilt/autoops-incident can use neither, because the incident
 # it plants has to be seen by k8s-event-watcher, which runs as a peer process
-# inside the Platform Agent pod and reads events --in-cluster. An incident on
-# any other cluster is never detected, and the case waits out its timeout for
-# a card nobody filed. A stack that does not declare these ignores them.
+# inside the Platform Agent pod. The watcher does fan in over the Cluster Agent
+# profile clusters as well as its own, but a per-run cluster reaches that watch
+# set too late to be watched inside the run -- see the header of
+# bench/tf/prebuilt/autoops-incident/main.tf. An incident there goes
+# undetected and the case waits out its timeout for a card nobody filed. A
+# stack that does not declare these ignores them.
 export TF_VAR_host_cluster_name="${HOST_CLUSTER_NAME}"
 export TF_VAR_host_cluster_location="${REGION}"
 export TF_VAR_agent_namespace="${TARGET_NAMESPACE}"
@@ -513,22 +830,54 @@ TASKS=(
   # machinery canary: compliance-rbac-overgrant, the measured-clean one,
   # which exercises SOP dispatch, delegation, the token minter and the
   # ledger write end to end under the fleet-audits domain. Budget: canary
-  # 606s + six probes and one reliability variation at ~150-350s each +
-  # crashloop 142s + the two incumbents, against the deadline the
-  # 2026-08-26 run blew with full audits.
+  # 606s + the probes and prompt variations at ~150-350s each + crashloop
+  # 142s + the incumbents, against the deadline the 2026-08-26 run blew with
+  # full audits. This sentence used to enumerate the matrix and fell behind
+  # it twice; the count and the arithmetic live in one place now, above
+  # EVAL_REPETITIONS, and that is the copy to keep current.
   #
-  # The six probes sit ahead of the rest on purpose. The loop below is
-  # sequential (one task at a time, no BENCH_PARALLEL), so the Prow deadline
-  # truncates the TAIL of this list; none of the probes has ever executed, so
-  # their cost is unmeasured and their signal is what this change exists to
-  # produce. Ordering the unmeasured work first means a timeout loses a
-  # measured repeat, not the new signal.
+  # This list is the gate's REPORTING order. Execution order is the
+  # fan-out's cost-hinted queue below (longest units first), so a Prow
+  # deadline kills whatever is still in flight rather than truncating this
+  # list's tail.
   "./tasks/reliability-pdb-probe/task.yaml"
   "./tasks/capacity-pinned-pool-probe/task.yaml"
   "./tasks/security-overgrant-probe/task.yaml"
   "./tasks/upgrades-lagging-master-probe/task.yaml"
   "./tasks/consistency-authorized-networks-probe/task.yaml"
   "./tasks/cost-idle-pool-probe/task.yaml"
+  # The security prompt variation, in the same relation to
+  # security-overgrant-probe that obtainability-remediation-proposal below
+  # holds to reliability-pdb-probe: the probe asks whether debug-binding is
+  # appropriately scoped, this one asks for the fix and checks the reply for
+  # a manifest's load-bearing nouns (apiVersion, roleRef, subjects --
+  # substrings, not schema validation), still with no cluster write.
+  # Measured 533s for three repetitions on build 2094466401401049088
+  # (2026-08-31, GREEN) -- 178s each, so unit_cost_hint's 200s default fits
+  # it and it needs no entry of its own. That was the last serial run before
+  # #1057's fan-out; position here is reporting order only. It carries one
+  # safeguard where the reliability variation below carries two; its
+  # task.yaml documents why the second cannot be grounded on a namespaceless
+  # role.
+  "./tasks/security-overgrant-remediation-proposal/task.yaml"
+  # Three activations that take the reliability domain to five enabled
+  # tasks (#1049), each grading a behavior nothing active grades: PDB
+  # SEMANTICS (what a wrong budget does — minAvailable: 2 on two replicas
+  # blocks drains), fleet-wide DISCOVERY (the prompt does not name the
+  # workload), and SILENCE on a namespace with no PDB-relevant defect (the
+  # false-alarm case). The semantics and silence objectives grade an
+  # output-contract token their prompts demand -- see the task headers for
+  # the two measured runs that forced that design. All three are
+  # probe-shaped, read-only against the same no-pdb-workload fixture, and
+  # measured across #1049's three draft smoke runs (the third, build
+  # 2094442155576659968 on 2026-08-31, ran the contracted prompts GREEN),
+  # so unit_cost_hint's 200s default fits them and position here is
+  # reporting order only. silence's header carries its #984 history; a red
+  # on any of the three takes its entry back out before the activating
+  # change leaves draft.
+  "./tasks/obtainability-pdb-semantics/task.yaml"
+  "./tasks/obtainability-fleet-exposure-sweep/task.yaml"
+  "./tasks/obtainability-healthy-namespace-silence/task.yaml"
   # The reliability prompt variation that grades what the probe does not
   # ask for: reliability-pdb-probe asks whether checkout-gateway survives a
   # drain; this one asks for a remediation manifest and checks the reply
@@ -542,8 +891,8 @@ TASKS=(
   # rca-remediation-pr -- remediation domain. Activated 2026-08-27 as its own
   # validation run: cost and signal were unmeasured (the 2026-08-26 run hit
   # the job deadline before reaching it), so this entry's first smoke IS the
-  # measurement. Placed after the six probes (proven, ~20 min together) and
-  # before the canary so a surprise here cannot starve the probes of budget.
+  # measurement. Launch priority lives in unit_cost_hint below, not in this
+  # list's position.
   # The one active task that WRITES: it files a remediation PR against the
   # leased project's throwaway GitOps repo via submit-suggestion.
   "./tasks/rca-remediation-pr/task.yaml"
@@ -559,15 +908,10 @@ TASKS=(
   # role to a kubeconfig. It is the cheapest task in this array (142s on the
   # 2026-08-25 run) and it proves the chain the probes above stand on.
   "./tasks/cluster-agent-crashloop-debug/task.yaml"
-  # Three more cluster-debugging cases in the same family, added by #982 and
-  # placed here rather than at the head of the array. The probes above go
-  # first because they are unmeasured and the sequential loop truncates the
-  # TAIL; these three are measured -- 190s, 142s and 220s on build
-  # 2092719124550520832 -- so ordering them first would protect the known at
-  # the expense of the unknown, which is backwards. What they do need is to
-  # stay AHEAD of gpu-stress-test-diagnosis below, the first of the array's two
-  # `deployer: tofu` entries, which spends minutes provisioning a cluster
-  # before it scores anything. All three are `deployer: noop`.
+  # Three more cluster-debugging cases in the same family, added by #982:
+  # measured 190s, 142s and 220s on build 2092719124550520832, all
+  # `deployer: noop`. Position here is reporting order only; execution
+  # order is unit_cost_hint's queue.
   #
   # A fourth is commented out beneath them, and why is worth reading before
   # uncommenting it. All four are read-only: no pull request, no ledger, so
@@ -618,7 +962,7 @@ TASKS=(
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
   "./tasks/autoops-warning-event-triage/task.yaml"
-  # Eleven registered scenarios stay commented out. The task-registration lint
+  # Ten registered scenarios stay commented out. The task-registration lint
   # counts a commented entry as registered, so a line here is a promise the
   # scenario exists, not that it runs; the domain-coverage lint counts only
   # an UNCOMMENTED one, so activating a scenario also deletes its domain from
@@ -639,21 +983,18 @@ TASKS=(
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
   # "./tasks/consistency-drift-outlier/task.yaml"
   #
-  # Three reliability prompt variations landed with #984 (their fourth
-  # sibling, obtainability-remediation-proposal, is active above), each with
-  # its one-line reason:
+  # Two reliability prompt variations landed with #984 and stay commented
+  # out (their siblings obtainability-remediation-proposal and, since
+  # #1049, obtainability-healthy-namespace-silence are active above), each
+  # with its one-line reason:
   #   -- obtainability-direct-query: superseded in presubmit by
   #      reliability-pdb-probe (same planted defect, same question); 1.0 on
   #      #984's live validation, a nightly-tier candidate.
   #   -- obtainability-refusal-direct-mutation: the agent fails it today --
   #      objective 0.0 on #984's live validation (attempted the apply;
   #      safeguards held). Activate after a clean run.
-  #   -- obtainability-healthy-namespace-silence: objective 0.0 on #984's
-  #      live validation (unlocated prompt drew a clarifying question);
-  #      prompt re-located, awaiting a clean validation run.
   # "./tasks/obtainability-direct-query/task.yaml"
   # "./tasks/obtainability-refusal-direct-mutation/task.yaml"
-  # "./tasks/obtainability-healthy-namespace-silence/task.yaml"
   #
   # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
   # Both were one Prow-side change away with their repository halves already
@@ -735,13 +1076,15 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 
 # Repetitions per task. Three is what the collapse rule needs: a case reds the
 # job alone only by failing ALL of them. Two-of-three would fire 1.45 times per
-# pull request by chance at suite scale; three-of-three fires 0.03 times. The
-# loop is serial (BENCH_PARALLEL=false), so this multiplies wall-clock by three
-# -- how it scales past a handful of tasks is issue #902's lane, not this one.
+# pull request by chance at suite scale; three-of-three fires 0.03 times.
+# Each repetition is one unit of the parallel fan-out below, so at
+# parallelism P this multiplies wall-clock by roughly 3/P, not 3; scale past
+# that is issue #902's lane. The serial measurements kept below predate the
+# fan-out and are its baseline.
 #
-# FOURTEEN tasks at three repetitions is FORTY-TWO devops-bench invocations,
-# where the presubmit's budget was sized for two. This number is no longer an
-# extrapolation from other builds: THIS matrix has now run end to end, at
+# TWENTY tasks at three repetitions is SIXTY devops-bench invocations,
+# where the presubmit's budget was sized for two. The per-invocation cost is no
+# longer an extrapolation from other builds: THIS matrix has run end to end, at
 # thirteen tasks x three repetitions, on build 2093054834931404800
 # (2026-08-27, GREEN).
 #
@@ -751,35 +1094,67 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 #       teardown)                                                16.4min
 #
 # So an invocation averages 3.6min, not the 4.7min extrapolated from #956's and
-# #982's builds -- those over-read it. Fourteen tasks x three is 42 invocations
-# and ~168min, or 1.43x against 240m.
+# #982's builds -- those over-read it. Twenty tasks x three is 60 invocations
+# and ~216min, ~232min once the fixed term is added back, or 1.55x against the
+# 360m deadline.
 #
 # One term in that is still a substitution rather than a measurement:
 # rca-remediation-pr, activated by #998 so that its own smoke run would BE the
 # first measurement, is priced at the fleet average. It is one of the two active
 # tasks that WRITE, so compliance-rbac-overgrant is the better comparable at a
-# measured 681s per repetition -- at that cost the total is ~191min and 1.26x.
-# Treat 1.26x as the honest figure and 1.43x as the optimistic one until the
-# first fourteen-task run lands.
+# measured 681s per repetition -- at that cost the total is ~239min of
+# invocations, ~256min with the fixed term, and 1.41x. 1.41x is the arithmetic's
+# honest figure and 1.55x its optimistic one -- but for this matrix the
+# arithmetic is no longer the best estimate; #1049's measured draft runs,
+# recorded below, supersede it.
 #
-# The budget has been raised twice to get here, both merged: oss-test-infra
-# #2667 took it 85m -> 150m off an estimate, and #2669 took it 150m -> 240m off
-# a ten-task measurement. 150m would still have been a guaranteed timeout, which
-# is what made #2669 a prerequisite rather than a follow-up.
+# THE SEVENTEEN-TASK RUN HAS LANDED, and the honest figure was right: build
+# 2094466401401049088 (2026-08-31, GREEN) came in at 221.7min whole-job against
+# the 223.2min predicted, 1.5min apart, with the optimistic 200min nowhere near.
+# It was the last SERIAL run before the fan-out below, so it prices the baseline
+# rather than what the job costs now. What it settles is that the 3.6min average
+# and the 16.4min fixed term extrapolate honestly, which is what the four
+# estimates before them did not.
 #
-# It is deliberately NOT being raised a third time here: work to cut the eval's
-# runtime is in flight separately, and if it lands the headroom returns without
-# another pull request against another repository. At 1.26x-1.43x measured there
-# is real room, so 300m stays a follow-up rather than a blocker.
+# Keep this count current when you activate: it was written at FOURTEEN, was
+# already one short the day #925 wrote it (the matrix stood at fifteen), and
+# #1045 took it to sixteen without touching it. Recount the uncommented entries
+# in TASKS rather than incrementing what is here.
+#
+# The budget has been raised three times to get here, all merged: oss-test-infra
+# #2667 took it 85m -> 150m off an estimate, #2669 took it 150m -> 240m off a
+# ten-task measurement, and #2676 took it 240m -> 360m on 2026-08-31. 150m would
+# still have been a guaranteed timeout, which is what made #2669 a prerequisite
+# rather than a follow-up.
+#
+# #2676 is also why #1049's three activations need no companion raise, and this
+# time the figure is measured rather than projected: their activating pull
+# request ran the matrix three times as a draft -- twice at eighteen tasks
+# (builds 2093444111125188608 and 2093496299662872576, 197.9min and ~180min
+# against the then-240m deadline), then the nineteen-task serial run (build
+# 2094442155576659968, 2026-08-31, GREEN) at ~308min against 360m. ~308min plus
+# security-overgrant-remediation-proposal's measured ~9min (178s x 3) projects
+# the full twenty-task job at ~317min serial: 1.14x. The 3.6min-average
+# arithmetic above under-prices this matrix -- autoops-warning-event-triage's
+# debounce-and-card wait lives in the measurement, not the average -- so 1.14x,
+# not 1.41x, is the honest figure.
 #
 # READ THIS BEFORE ACTIVATING ANOTHER CASE. The budget lives in another
 # repository, so every activation here silently spends headroom that only a
-# separate pull request can replace, and this number was invalidated FOUR times
-# by a matrix that grew after it was computed (#956, then #982, then #998)
-# before a real run finally replaced the arithmetic. At the measured 3.6min
-# average, each further average-cost case costs ~11min of the remaining ~49-72min
-# of headroom, and a canary-cost case costs ~34min. Activating a case and raising
-# the budget are one change in two repositories, not a change and a follow-up.
+# separate pull request can replace, and this number was invalidated FIVE times
+# by a matrix that grew after it was computed (#956, then #982, then #998, then
+# #1049's three) before and after real runs replaced the arithmetic. At the
+# measured ~317min serial, ~43min of serial headroom remains. Each further
+# average-cost case adds ~11min of INVOCATION time and a canary-cost case
+# ~34min -- divided by however much of EVAL_TASK_PARALLELISM the fan-out below
+# actually realises against the pool's model quota, which the first parallel
+# Prow run will measure. Until it has, budget serially, and recount before you
+# trust the headroom: on the serial figures even the canary case squeaks under
+# only at 0.97x, which is the kind of margin this number's five invalidations
+# were made of. The NEXT activation is therefore a raise-first change unless
+# the in-flight runtime-reduction work lands first. Activating a case and
+# raising the budget are one change in two repositories, not a change and a
+# follow-up.
 #
 # The variance that was flagged as the thing to watch has resolved in the good
 # direction: consistency-authorized-networks-probe took 1039s on the one earlier
@@ -841,9 +1216,44 @@ print(m.group(1).strip('\'\"') if m else '')
 # measured evidence, so it arms rung 4 but leaves rung 6 quiet and contributes
 # nothing to main's side of the aggregate. Screening replaces it.
 #
-# agent-kanban-smoke is deliberately NOT named: it has redded pull requests it
-# has nothing to do with, and un-arming it is half the point of the change.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-gpu-stress-test-diagnosis}"
+# This roster is what blocks a pull request once the Prow job stops being
+# optional. Thirteen of the seventeen active cases are admitted: the ones
+# whose recent record shows failures only on their own regressions or on
+# infra classes the harness already excludes from the verdict. Four are
+# held out -- they still run and report on every pull request, and they
+# cannot red one on a GRADED failure. The scope of that promise is rungs
+# 4 and 6: rungs 1-3 (a forbidden mutation, an erroring check, a record
+# that is not a real run) stay blocking for every case by design,
+# admitted or not -- see grade_case, which evaluates them before it reads
+# admission. security-overgrant-remediation-proposal (#1066) is simply
+# new: it earns its record like any case, then enters. The other three
+# each have a filed issue naming the exit condition:
+#
+#   capacity-pinned-pool-probe            -- #1010: worker completes its
+#     card at fan-out ("Awaiting synthesis" as the final answer). The
+#     failure is correlated across repetitions when the agent chooses to
+#     fan out, so the collapse rule does not absorb it. Enters when the
+#     fix merges.
+#   cluster-agent-healthy-workload-no-finding -- #1100: the agent invents
+#     a finding on a healthy workload ~1 run in 8. Main's own trait, so a
+#     collapse would tax an innocent PR. Enters when the false-positive
+#     rate drops or when rung-6 screening can compare against main.
+#   autoops-warning-event-triage          -- #1101: 0/5 graded repetitions
+#     on record; admitting it reds every pull request today. Enters when
+#     the lettered-options bar is settled and it has a clean record.
+#
+# If an admitted case reds a pull request its diff cannot explain on a
+# graded failure, demote it here and reference its issue. Demotion is a
+# one-line same-day edit to this list -- this file, not the Prow config,
+# is deliberately the fast lever. It is the lever for rung-4 reds ONLY: a
+# rung-1-3 red (mutation, erroring verifier, empty record) does not stop
+# when its case leaves this list, because those classes signal a broken
+# case or install, not flake, and the fix is on that side.
+#
+# agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
+# SRE question graded on kanban_create plus cluster names); the reds that
+# once argued for un-arming it belonged to the old vocabulary check.
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,compliance-rbac-overgrant,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
@@ -879,91 +1289,207 @@ ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
 mkdir -p "${ARTIFACT_DIR}"
 CASE_RESULTS=()
 
+# ─── Parallel fan-out ─────────────────────────────────────────────────────────
+# The schedulable unit is one (task, repetition): every invocation is an
+# independent agent conversation, and the agent span is ~98% of its wall clock
+# (profiled 2026-08-28), so the matrix is embarrassingly parallel. The cap
+# bounds concurrent load on the one gateway, LiteLLM and the judge quota;
+# 1 reproduces serial behaviour through the same code path.
+EVAL_TASK_PARALLELISM="${EVAL_TASK_PARALLELISM:-4}"
+if ! [ "${EVAL_TASK_PARALLELISM}" -ge 1 ] 2>/dev/null; then
+  echo "ERROR: EVAL_TASK_PARALLELISM must be a positive integer, got '${EVAL_TASK_PARALLELISM}'." >&2
+  exit 1
+fi
+
+# Pre-warm the bench virtualenv once; N cold `uv run`s would sync it N times
+# concurrently.
+(cd "${BENCH_DIR}" && uv run python -c '' >/dev/null 2>&1) || true
+
+# Launch-order hints, longest first, from measured runs (2026-08-27/28).
+# A wrong hint costs packing efficiency, never correctness.
+unit_cost_hint() {
+  case "$1" in
+    gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
+    compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
+    consistency-authorized-networks-probe) echo 300 ;;
+    *) echo 200 ;;
+  esac
+}
+
+# Per-task env is decided ONCE, before the fan-out, and handed to each unit:
+# the serial loop exported it globally per iteration, which two concurrent
+# units would trample. Per TASK, not per repetition, so repetitions stay
+# comparable. Seeded-cluster reuse is opted into by the task's own stack --
+# only a stack declaring `variable "reuse_existing_cluster"` knows to plan
+# nothing when handed an existing cluster's name.
+TASK_NAMES=()
+TASK_REUSE=()
+TASK_HAS_STACK=()
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
-  profile_begin "task ${TASK_NAME}: devops-bench run"
-  TASK_START=$SECONDS
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Running Task: ${TASK_NAME} (${TASK}) x${EVAL_REPETITIONS} <<<"
-
-  # BENCH_NO_INFRA stays false for EVERY task, noop-deployer ones included.
-  # A noop deployer already skips OpenTofu on its own; BENCH_NO_INFRA=true
-  # additionally makes the eval harness SKIP VERIFICATION WHOLESALE
-  # (evalharness/default.py, verification_status "skipped_no_infra"), which
-  # silently un-gates any task whose checks read the transcript rather than a
-  # cluster -- the kanban probe's tool_called check would never evaluate.
-  #
-  # The deployer itself is no longer read here. bench-gate parses the task
-  # file with a real YAML parser (bench/kube_agents_bench/cases.py) and echoes
-  # what it found; the two greps this replaced could not tell a real
-  # `deployer:` from one inside a comment or a prompt block.
-  export BENCH_NO_INFRA="false"
-  echo "Executing with BENCH_NO_INFRA=${BENCH_NO_INFRA}"
-
-  # Seeded-cluster reuse is per task, opted into by the task's own stack:
-  # only a stack that declares `variable "reuse_existing_cluster"` knows to
-  # plan nothing when handed an existing cluster's name. Handing that name
-  # to any other tofu stack would make it try to CREATE the seeded cluster
-  # and 409 on every run in every fleet-carrying project -- so a task whose
-  # stack has not opted in gets the per-run name and location restored, and
-  # so do the {{GKE_CLUSTER_NAME}}/{{CLUSTER_NAME}} placeholders its prompt
-  # and checks resolve against.
-  #
-  # This is per TASK, not per repetition: every repetition of one task targets
-  # the same cluster, which is what makes the repetitions comparable.
+  TASK_NAMES+=("${TASK_NAME}")
   TASK_STACK="$(task_stack "${BENCH_DIR}/${TASK}")"
+  if [ -n "${TASK_STACK}" ]; then TASK_HAS_STACK+=("true"); else TASK_HAS_STACK+=(""); fi
   if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${TASK_STACK}" ] \
     && grep -qs 'variable "reuse_existing_cluster"' "${BENCH_DIR}/tf/${TASK_STACK}"/*.tf; then
-    export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
-    export CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
-    export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}"
-    export GCP_LOCATION="${SEEDED_TASK_LOCATION}"
-    export TF_VAR_reuse_existing_cluster="true"
+    TASK_REUSE+=("true")
     echo "Task ${TASK_NAME}: reusing seeded cluster ${SEEDED_TASK_CLUSTER} (${SEEDED_TASK_LOCATION}); no per-run task cluster will be created"
   else
-    export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
-    export CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
-    export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}"
-    export GCP_LOCATION="${EVAL_DEFAULT_LOCATION}"
+    TASK_REUSE+=("")
+  fi
+done
+
+# One unit, in a background subshell: its exports stay local, its output goes
+# only to its own log (kept as an artifact either way), and its run directory
+# is read back from that log's own `results:` line -- the directory-set diff
+# the serial loop used cannot tell concurrent siblings apart. BENCH_NO_INFRA
+# stays false for every unit, noop-deployer ones included: true would skip
+# verification wholesale (evalharness/default.py, "skipped_no_infra") and
+# silently un-gate transcript-read checks.
+STATE_DIR="$(mktemp -d)"
+
+# mkdir is the mutex: atomic on every filesystem this runs on. A holder that
+# dies without releasing (an OOM-killed subshell releases nothing) would
+# otherwise strand every contender in a silent spin that `wait` can never
+# collect past, so acquisition carries a deadline: a unit that gives up fails
+# loudly and grades as MISSING, which is a diagnosis the gate already
+# reports. Two locks serialize what genuinely cannot overlap while noop
+# units fill the lanes:
+#   per task  -- repetitions of ONE task never overlap. Concurrent reps of a
+#                ledger-writing audit rewrite one shared ledger issue and
+#                grade each other's artifact; concurrent reps of the autoops
+#                task plant simultaneous incidents with no card attribution;
+#                and same-task reps share a tofu stack directory and cluster
+#                name. Serial reps are also what keeps them comparable.
+#   infra     -- at most one stack-bearing (tofu) unit runs at a time,
+#                across tasks: BENCH_PARALLEL stays false, so devops-bench's
+#                per-run isolation (own kubeconfig, gcloud config, tofu data
+#                dir) is off, and two concurrent tofu units would race the
+#                shared kubeconfig's current-context and their state locks.
+lock_acquire() { # <dir> [deadline-seconds]
+  local waited=0 limit="${2:-1800}"
+  until mkdir "$1" 2>/dev/null; do
+    sleep 3
+    waited=$((waited + 3))
+    if [ "${waited}" -ge "${limit}" ]; then
+      echo "ERROR: gave up on ${1} after ${limit}s; holder likely died without releasing" >&2
+      return 1
+    fi
+  done
+}
+lock_release() { rmdir "$1" 2>/dev/null || true; }
+
+run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq>
+  local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6"
+  local log="/tmp/eval_${name}_rep${rep}.log"
+  # A distinct local port per unit: the harness's port-forward is owned by
+  # the process that spawned it and its atexit teardown would drop a shared
+  # listener under every sibling mid-conversation. On its own port, each
+  # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
+  export AGENT_LOCAL_PORT=$((28642 + seq))
+  if ! lock_acquire "${STATE_DIR}/lock-task-${name}"; then
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
+    return 0
+  fi
+  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra"; then
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
+    return 0
+  fi
+  # This unit's own token, minted rather than inherited, and minted after the
+  # waiting rather than before it: reps of one task serialize on the task lock,
+  # so at the default EVAL_REPETITIONS=3 a unit can sleep past the hour a token
+  # lasts and reach devops-bench holding a dead one.
+  if ! mint_ledger_token "${name} rep ${rep}"; then
+    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
+    return 0
+  fi
+  if [ -n "${reuse}" ]; then
+    export GKE_CLUSTER_NAME="${SEEDED_TASK_CLUSTER}" CLUSTER_NAME="${SEEDED_TASK_CLUSTER}"
+    export TF_VAR_cluster_name="${SEEDED_TASK_CLUSTER}" GCP_LOCATION="${SEEDED_TASK_LOCATION}"
+    export TF_VAR_reuse_existing_cluster="true"
+  else
+    export GKE_CLUSTER_NAME="${EVAL_CLUSTER_NAME}" CLUSTER_NAME="${EVAL_CLUSTER_NAME}"
+    export TF_VAR_cluster_name="${EVAL_CLUSTER_NAME}" GCP_LOCATION="${EVAL_DEFAULT_LOCATION}"
     unset TF_VAR_reuse_existing_cluster
   fi
+  export BENCH_NO_INFRA="false"
+  local start end dir
+  start="$(_now_ms)"
+  (cd "${BENCH_DIR}" && uv run devops-bench "${task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  end="$(_now_ms)"
+  [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+  lock_release "${STATE_DIR}/lock-task-${name}"
+  # `|| true`: a run that never printed a `results:` line must still write
+  # its state files and reach the artifact copy -- it is exactly the crashed
+  # run someone will need the log for.
+  dir="$(grep -oE 'results: [^ ]*/results\.json' "${log}" | tail -1 | sed -e 's/^results: //' -e 's|/results\.json$||' || true)"
+  printf '%s\n' "${start}" > "${STATE_DIR}/${name}.rep${rep}.start"
+  printf '%s\n' "${end}" > "${STATE_DIR}/${name}.rep${rep}.end"
+  printf '%s\n' "${dir}" > "${STATE_DIR}/${name}.rep${rep}.dir"
+  # Copied here, not in the grading pass: a Prow deadline that kills the
+  # fan-out must still leave every completed unit's log in the artifacts.
+  cp "${log}" "${ARTIFACT_DIR}/eval_${name}_rep${rep}.log" 2>/dev/null || true
+  echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] finished ${name} rep ${rep} in $(((end - start) / 1000))s"
+}
+
+# Rep-ascending FIRST, cost-descending within a rep: repetitions of one task
+# serialize on the task lock, so a same-task unit launched early just parks a
+# lane sleeping on it -- the pool run of 2026-08-31 (build 2094432646640701440)
+# spent two of four lanes that way for its first twelve minutes under the
+# cost-first ordering this replaces.
+UNIT_QUEUE="$(
+  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
+    i=0
+    for TASK in "${TASKS[@]}"; do
+      printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
+      i=$((i + 1))
+    done
+  done | sort -k1,1n -k2,2rn
+)"
+UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c .)"
+
+profile_begin "task fan-out: ${UNIT_TOTAL} units, parallelism=${EVAL_TASK_PARALLELISM}"
+while read -r REP _COST IDX; do
+  [ -n "${IDX:-}" ] || continue
+  while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "${EVAL_TASK_PARALLELISM}" ]; do
+    sleep 3
+  done
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
+  UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
+  run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" &
+  # Staggered, so N units do not open their first model call in the same
+  # second -- burst 429s at the model quota are the fan-out's failure mode.
+  sleep 5
+done <<EOF_UNIT_QUEUE
+${UNIT_QUEUE}
+EOF_UNIT_QUEUE
+wait
+
+# ─── Per-case verdicts, in the order TASKS declares ───────────────────────────
+profile_begin "per-repetition breakdowns + case verdicts"
+i=0
+for TASK in "${TASKS[@]}"; do
+  TASK_NAME="${TASK_NAMES[i]}"
+  i=$((i + 1))
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${TASK_NAME} (${TASK}) x${EVAL_REPETITIONS} <<<"
 
   # One --result per repetition, positionally. A repetition that produced no
   # run directory contributes the literal MISSING, so the gate can tell "died
-  # before writing anything" from "wrote an unusable record" -- a different
-  # diagnosis with a different owner.
+  # before writing anything" from "wrote an unusable record". The harness log
+  # is kept for every repetition, green ones included: a green record is the
+  # raw material for the baseline store.
   RESULT_ARGS=()
   for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
-    echo "--- [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${TASK_NAME} repetition ${REP}/${EVAL_REPETITIONS}"
-    # Snapshot existing result directories before running to prevent stale score leakage
-    PRE_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
     EVAL_LOG="/tmp/eval_${TASK_NAME}_rep${REP}.log"
-
-    RUN_START_MS="$(_now_ms)"
-    (cd "${BENCH_DIR}" && uv run devops-bench "${TASK}" --agent-type kubeagents 2>&1 | _ts_lines | tee "${EVAL_LOG}") || true
-    RUN_END_MS="$(_now_ms)"
-
-    # Use set difference (comm -13) to isolate the brand new directory created strictly by THIS repetition.
-    # If devops-bench crashed before or during execution without completing results.json, NEW_RUN_DIR will be empty.
-    POST_RUNS="$(ls -d "${BENCH_DIR}/results/run_"* 2>/dev/null | sort || true)"
-    NEW_RUN_DIR="$(comm -13 <(echo "${PRE_RUNS}") <(echo "${POST_RUNS}") | head -n 1)"
-
-    # The harness log is kept for every repetition, green ones included: a
-    # green record is the raw material for the baseline store, and its log is
-    # how anyone reconstructs what produced it.
-    cp "${EVAL_LOG}" "${ARTIFACT_DIR}/eval_${TASK_NAME}_rep${REP}.log" 2>/dev/null || true
-
-    # Phase breakdown per repetition rather than per task: with repetitions the
-    # per-task number would average away the thing the table exists to show,
-    # which is where one run's time went. Informational, never fatal.
+    NEW_RUN_DIR="$(cat "${STATE_DIR}/${TASK_NAME}.rep${REP}.dir" 2>/dev/null || true)"
+    RUN_START_MS="$(cat "${STATE_DIR}/${TASK_NAME}.rep${REP}.start" 2>/dev/null || echo 0)"
+    RUN_END_MS="$(cat "${STATE_DIR}/${TASK_NAME}.rep${REP}.end" 2>/dev/null || echo 0)"
     REP_RESULT=""
     [ -n "${NEW_RUN_DIR}" ] && REP_RESULT="${NEW_RUN_DIR}/results.json"
     analyze_eval_phases "${EVAL_LOG}" "${RUN_START_MS}" "${RUN_END_MS}" "${TASK_NAME} rep ${REP}" "${REP_RESULT}"
-
-    # No inline RUN_CLASS here any more. INFRA / BROKEN / OK classification --
-    # including the noop carve-out, the documented empty-list record and #959's
-    # KUBE_AGENTS_INFRA_FAILURE transport marker -- moved into `bench-gate
-    # case`, which has to make the same call per repetition and must not
-    # disagree with a second copy of the rule living in shell.
     if [ -n "${NEW_RUN_DIR}" ]; then
       RESULT_ARGS+=(--result "${NEW_RUN_DIR}")
       cp "${NEW_RUN_DIR}/results.json" "results_${TASK_NAME}_rep${REP}.json" 2>/dev/null || true
@@ -973,18 +1499,14 @@ for TASK in "${TASKS[@]}"; do
   done
 
   # The verdict. bench-gate exits 0 for ANY verdict it could reach, including a
-  # blocking one -- under `set -e` a non-zero here would abort the loop and
-  # silently drop every remaining task. It exits 2 only when it could not grade
-  # at all (an unreadable task file, a broken VERSIONS.json), which is a
-  # different failure and must stop the job.
+  # blocking one; it exits 2 only when it could not grade at all, which must
+  # stop the job.
   CASE_JSON="${ARTIFACT_DIR}/case-${TASK_NAME}.json"
   (cd "${BENCH_DIR}" && uv run bench-gate case \
     --task "${TASK}" \
     "${RESULT_ARGS[@]}" \
     --json-out "${CASE_JSON}")
   CASE_RESULTS+=(--case-result "${CASE_JSON}")
-
-  echo "Task ${TASK_NAME} finished in $((SECONDS - TASK_START))s"
 done
 
 profile_begin "record + final gate"

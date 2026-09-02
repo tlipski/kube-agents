@@ -49,10 +49,16 @@
 # The defaults are the upstream references, so an ordinary build is unchanged.
 ARG HERMES_AGENT_TAG
 ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
-ARG ENVOY_VERSION=v1.39.0
+ARG ENVOY_VERSION=v1.39.1
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
-ARG GOLANG_VERSION=1.26-alpine
+ARG GOLANG_VERSION=1.27-alpine
+# Declared here as well as in the `platform` stage that consumes it, so the
+# credential-proxy build -- which shares deploy/docker/cloudbuild.yaml and is
+# therefore handed the same --build-arg -- does not warn about an argument no
+# stage declares. The value and what it is for are documented where the ENV is
+# set, at the end of the `platform` stage.
+ARG KUBE_AGENTS_VERSION=dev
 FROM ${ENVOY_IMAGE}:${ENVOY_VERSION} AS envoy-bin
 
 # Every binary in the final image must match the architecture the image ships
@@ -1081,9 +1087,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
 # 5. Create base defaults directory and copy shared defaults
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
-COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
-     agents/platform/docs/gcp-console-links.md \
-     /opt/defaults/docs/
 
 
 # 5.5. Install and enable hermes-otel plugin in /opt/defaults
@@ -1142,6 +1145,12 @@ RUN STDLIB="$(/opt/hermes/.venv/bin/python3 -c 'import sysconfig; print(sysconfi
     [ "$(find /opt/hermes -name '*.pyc' | head -5000 | wc -l)" -ge 5000 ] && \
     [ "$(find "$STDLIB" -name '*.pyc' | head -500 | wc -l)" -ge 500 ]
 
+# Below 5.5-5.7 on purpose: those steps never read these files, and above
+# them every docs edit re-ran the plugin install, purge and bytecode pass.
+COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
+     agents/platform/docs/gcp-console-links.md \
+     /opt/defaults/docs/
+
 # 5.8. Copy custom agent startup script
 # --chmod on the COPY rather than a chmod in the RUN below: same result, and the
 # three destinations differ so these cannot be folded into one COPY. The layer
@@ -1179,6 +1188,18 @@ CMD ["hermes", "gateway", "run"]
 #   - `cluster-*` = per-cluster read-only agents — scaffolded at runtime from
 #                   /opt/cluster-template (see scripts/cluster_agent_profile.py).
 FROM agent-base AS platform
+
+# Base trees this stage never writes to normalize first — including the
+# plugin tree's root-ownership barrier — so the ~150MB copy-up layer caches
+# across template edits; the staged repo plugins arrive root-owned via the
+# final RUN's cp -a. Skills stay in the final RUN with their provenance
+# manifest. Not in agent-base: credential-proxy carries neither.
+RUN set -eu; \
+    for d in /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools; do \
+        find "$d" -type d -exec chmod 755 {} + ; \
+        find "$d" -type f -exec chmod 644 {} + ; \
+    done; \
+    chown -R root:root /opt/hermes/plugins
 
 # --- Chat Agent (the `default` profile) ---
 # Chat ingress plugins/hooks (session_store, session_otel_bridge, tool_call_audit,
@@ -1298,14 +1319,20 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # only chat ingress carries, so it lives with the Chat Agent.
 # One COPY for the two: they share a destination, and the chain is bounded at
 # 128 layers — see the layer-budget note at the top of the file.
-COPY agents/platform/plugins/ agents/chat/plugins/ /opt/hermes/plugins/
+# Staged, not copied straight into /opt/hermes/plugins: the late RUN installs
+# from here so the base's ~130MB plugin tree stays out of the layer every
+# agents/ edit rewrites. `cp -a` merges exactly as the direct COPY did.
+COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 
 # NOTE: the platform overlay is no longer merged into /opt/defaults/config.yaml.
 # /opt/defaults now belongs to the Chat Agent (`default` profile) and its config
 # is copied verbatim above; the platform overlay is merged into
 # /opt/platform-template/config.yaml instead (see the RUN block above).
 
-# Normalize ownership and permissions at the end of build.
+# Normalize what THIS stage added, and install the staged repo plugins —
+# normalized before `cp -a` merges them, so they land with the same ownership
+# and modes the old combined pass produced. This RUN re-runs on every agents/
+# change; the base trees stay in the stage's first RUN, where they cache.
 #
 # `set -eu` rather than an `&&` chain ending in `|| true`: that trailing `|| true`
 # bound to the WHOLE chain, so a failure in any early command short-circuited
@@ -1344,7 +1371,8 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /opt/hermes/plugins/
 #     entrypoint step 2.6, and the cluster template's personas are re-copied into
 #     every cluster-* profile by its continuation. A rewritten SOUL.md is more
 #     load-bearing than any single SKILL.md.
-#   - /opt/hermes/plugins, the only path Hermes resolves plugins from, holding
+#   - /opt/hermes/plugins (barriered by the stage's first RUN; listed for
+#     what it covers). It is the only path Hermes resolves plugins from, holding
 #     Python imported into the agent's own process — a strictly stronger capability
 #     than a SKILL.md. Precompiling does not protect it: a rewritten .py has a
 #     newer mtime, so the cached .pyc is invalidated and the modified source is
@@ -1492,7 +1520,7 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /opt/hermes/plugins/
 # account for.
 RUN set -eu; \
     chown -R hermes:hermes /opt/defaults; \
-    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools /opt/cluster-template /opt/platform-template /opt/chat-template; do \
+    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /tmp/repo-plugins; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
@@ -1500,6 +1528,8 @@ RUN set -eu; \
     for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template; do \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
     done; \
+    cp -a /tmp/repo-plugins/. /opt/hermes/plugins/; \
+    rm -rf /tmp/repo-plugins; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2; \
     for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills; do \
@@ -1514,9 +1544,27 @@ RUN set -eu; \
             || { echo "manifest for $d has $(wc -l < "$d/skills_manifest.sha256") entries, expected $n" >&2; exit 1; }; \
         chmod 644 "$d/skills_manifest.sha256"; \
     done; \
-    chown -R root:root /opt/hermes/skills /opt/hermes/plugins /opt/platform-template /opt/cluster-template /opt/chat-template /opt/defaults/scripts
+    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/defaults/scripts
 
 USER 10000:10000
+
+# The build this image came from, for the `User-Agent` that remote MCP calls
+# carry. Hermes resolves `${KUBE_AGENTS_VERSION}` in an `mcp_servers` entry's
+# `args` from the agent process environment, so the value has to be on the
+# container rather than only in the config -- see the `--header` argument on the
+# mcp-remote entries in deploy/shared/defaults/config.yaml.
+#
+# Last instruction in the stage, not beside the ARGs at the top: the value
+# changes on every commit, and an ENV that early would invalidate the whole
+# `platform` chain's cache on every build. ENV writes no filesystem diff, so it
+# costs nothing against the layer budget.
+#
+# `dev` is the default (declared with the other build args above) because an
+# unset build arg must still produce a well-formed header. The publish workflows
+# pass the commit SHA the image is tagged with, so a User-Agent on the wire
+# names the exact image.
+ARG KUBE_AGENTS_VERSION
+ENV KUBE_AGENTS_VERSION=${KUBE_AGENTS_VERSION}
 
 # --- CREDENTIAL PROXY TOOLING ---
 # Everything the sidecar needs that is not agent source: the credential-aware

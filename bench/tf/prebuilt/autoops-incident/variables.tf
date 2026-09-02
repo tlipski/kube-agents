@@ -21,12 +21,13 @@
 # and NOT declared here raises ConfigError. So the task file and this one are a
 # matched pair.
 
-# The cluster the Platform Agent pod runs in, which is the ONLY cluster this
-# scenario can use. k8s-event-watcher is a peer process inside that pod's
-# envoy-credential-proxy container and reads events through --in-cluster, so an
-# incident planted anywhere else is never seen. hack/ci-eval-pr.sh passes these
-# two from HOST_CLUSTER_NAME/REGION -- deliberately not from the per-run task
-# cluster the other tofu stacks build, which has no agent on it.
+# The cluster the Platform Agent pod runs in, and the only cluster this
+# scenario can use -- not because k8s-event-watcher is confined to the cluster
+# it runs in (it fans in over the Cluster Agent profile clusters as well), but
+# because a per-run cluster joins that watch set too late to be watched inside
+# the run. main.tf's header carries the argument. hack/ci-eval-pr.sh passes
+# these two from HOST_CLUSTER_NAME/REGION -- deliberately not from the per-run
+# task cluster the other tofu stacks build, which has no agent on it.
 variable "host_cluster_name" {
   type        = string
   description = "Name of the cluster the Platform Agent runs in; the incident is planted here."
@@ -104,9 +105,9 @@ variable "workload_name" {
 # edits to the manifest, which is what the report is asked to propose.
 #
 # A workload that allocated WITHOUT bound would have only one sound fix -- no
-# limit fits it -- and the lettered-options objective below would then be
-# asking the agent to pad its answer. Keep the allocation bounded and keep it
-# above the limit.
+# limit fits it -- and the case's judge reference, which grades a report on
+# surfacing both, would then be asking the agent to pad its answer. Keep the
+# allocation bounded and keep it above the limit.
 variable "memory_limit_mib" {
   type        = number
   description = "The container's memory limit, in MiB. Must be below allocate_mib."
