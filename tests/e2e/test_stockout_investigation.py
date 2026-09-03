@@ -564,7 +564,7 @@ STOCKOUT_SCENARIO_DEFINITIONS: List[Tuple[str, str, str]] = [
     (
         "08-ccc-priority-starvation",
         "Rule G",
-        "Over-granular priority list causing autoscaler loop",
+        "Priority list too granular to fit the pod",
     ),
     (
         "09-duplicate-signal",

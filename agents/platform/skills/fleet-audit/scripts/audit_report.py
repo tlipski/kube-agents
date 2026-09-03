@@ -221,6 +221,7 @@ AUDITS: dict[str, AuditSpec] = {
             "reservation-mismatch-risk",
             "autoscaler-out-of-resources",
             "dangling-compute-class",
+            "ccc-invalid-machine-type",
         ),
     ),
     "gcp-networking-fabric-audit": AuditSpec(
@@ -5253,6 +5254,34 @@ IMMUTABLE_UPDATE_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
     ),
 }
 
+# Where a field is absent, the API server has already filled it in with these.
+# Without them, spelling a default out loud reads as a change: adding
+# `reclaimPolicy: Delete` to a StorageClass that omitted it produced a
+# "refuses to update in place" note on a real repository, over an edit the API
+# server would have accepted silently. A `(kind, path)` missing from this table
+# is compared as-is, which is the safe direction — a false warning on a field
+# nobody documents a default for beats missing a real conflict.
+IMMUTABLE_FIELD_DEFAULTS: dict[tuple[str, tuple[str, ...]], object] = {
+    ("StorageClass", ("reclaimPolicy",)): "Delete",
+    ("StorageClass", ("volumeBindingMode",)): "Immediate",
+    ("StatefulSet", ("spec", "podManagementPolicy")): "OrderedReady",
+}
+
+# Fields that may grow but not shrink. Equality is the wrong test for these:
+# raising a PVC's request is a supported online resize, lowering it is rejected
+# outright, and a check that flagged both would cry wolf on every expansion.
+# §4 of the stockout SOP tells the agent to look for exactly this, so the
+# automated pass has to cover it or the prose is the only thing that does.
+NO_SHRINK_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "PersistentVolumeClaim": (("spec", "resources", "requests", "storage"),),
+}
+
+# Kubernetes quantity suffixes, binary and decimal. Bare numbers are bytes.
+QUANTITY_MULTIPLIERS: dict[str, int] = {
+    "Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4, "Pi": 1024**5, "Ei": 1024**6,
+    "K": 1000, "M": 1000**2, "G": 1000**3, "T": 1000**4, "P": 1000**5, "E": 1000**6,
+}
+
 
 def _yaml_documents(text: str) -> list[dict] | None:
     """Every mapping document in `text`, or None if it cannot be parsed.
@@ -5293,22 +5322,47 @@ def _value_at(doc: dict, path: tuple[str, ...]) -> object:
     return node
 
 
-def immutable_update_conflicts(old_text: str, new_text: str) -> list[str]:
+def _effective(doc: dict, kind: str, path: tuple[str, ...]) -> object:
+    """`_value_at`, but an absent field reads as whatever the API server defaults it to."""
+    found = _value_at(doc, path)
+    if found is None:
+        return IMMUTABLE_FIELD_DEFAULTS.get((kind, path))
+    return found
+
+
+def quantity_bytes(value: object) -> int | None:
+    """A Kubernetes quantity as bytes, or None if it is not one."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    for suffix, multiplier in QUANTITY_MULTIPLIERS.items():
+        if text.endswith(suffix):
+            try:
+                return int(float(text[: -len(suffix)]) * multiplier)
+            except ValueError:
+                return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+def immutable_update_conflicts(old_text: str, new_text: str) -> list[str] | None:
     """Immutable fields this edit changes on objects that already exist.
 
     Only objects present in *both* revisions are compared: a newly declared
     object is a create, and nothing about a create is immutable.
 
-    An empty list is "nothing found", which includes "could not look" — a file
-    neither revision parses as YAML, or a runtime without pyyaml. Callers use
-    this to *add* a warning, never to certify a fix as applyable, so the two
-    collapse safely here; a caller that wanted the distinction would have to
-    ask `_yaml_documents` itself.
+    `None` means "could not look" — a revision that does not parse as YAML, or
+    a runtime without pyyaml — and is not the same answer as `[]`. The caller
+    says so in the note rather than letting a failed parse read as a clean bill.
     """
     old_docs = _yaml_documents(old_text)
     new_docs = _yaml_documents(new_text)
     if old_docs is None or new_docs is None:
-        return []
+        return None
 
     previous: dict[tuple[str, str, str], dict] = {}
     for doc in old_docs:
@@ -5326,8 +5380,16 @@ def immutable_update_conflicts(old_text: str, new_text: str) -> list[str]:
             continue
         kind, name, _ = key
         for path in IMMUTABLE_UPDATE_FIELDS.get(kind, ()):
-            if _value_at(was, path) != _value_at(doc, path):
+            if _effective(was, kind, path) != _effective(doc, kind, path):
                 conflicts.append(f"{kind}/{name} `{'.'.join(path)}`")
+        for path in NO_SHRINK_FIELDS.get(kind, ()):
+            before = quantity_bytes(_value_at(was, path))
+            after = quantity_bytes(_value_at(doc, path))
+            if before is not None and after is not None and after < before:
+                conflicts.append(
+                    f"{kind}/{name} `{'.'.join(path)}` (shrinks from "
+                    f"{_value_at(was, path)} to {_value_at(doc, path)})"
+                )
     return conflicts
 
 
@@ -5366,21 +5428,38 @@ def annotate_apply_conflicts(findings: list[dict], root: Path) -> list[str]:
         except (OSError, UnicodeDecodeError):
             continue
         conflicts = immutable_update_conflicts(show.stdout, proposed)
-        if not conflicts:
-            continue
         note = str(remediation.get("note", "")).strip()
-        if APPLY_CONFLICT_PREFIX in note:
-            # Idempotent: `finish` and `remediate` both call this, and a note
-            # carrying the warning twice reads as two separate problems.
+        if conflicts is None:
+            # Silence here would read as "checked, and it applies cleanly".
+            warning = (
+                f"{APPLY_CONFLICT_PREFIX} {path} could not be parsed as YAML on "
+                "one side of the diff, so whether this edit touches an "
+                "immutable field is unknown — it was not checked."
+            )
+        elif conflicts:
+            warning = (
+                f"{APPLY_CONFLICT_PREFIX} this edit changes "
+                + ", ".join(conflicts)
+                + ", which the API server refuses to update in place. Applying it "
+                "needs a recreate — `kubectl delete <kind>/<name> --cascade=orphan` "
+                "and re-apply, or a `Replace=true` sync — not a rolling update."
+            )
+        else:
             continue
-        warning = (
-            f"{APPLY_CONFLICT_PREFIX} this edit changes "
-            + ", ".join(conflicts)
-            + ", which the API server refuses to update in place. Applying it "
-            "needs a recreate — `kubectl delete <kind>/<name> --cascade=orphan` "
-            "and re-apply, or a `Replace=true` sync — not a rolling update."
-        )
-        remediation["note"] = f"{note} {warning}" if note else warning
+        if warning in note:
+            # Idempotent across a `finish` that follows a `remediate` on the
+            # same document. Matching the whole warning and not just the
+            # prefix: a model that wrote "Rollout note:" in its own prose would
+            # otherwise suppress the real one, which is the failure this guard
+            # is supposed to prevent rather than cause.
+            continue
+        # The warning is the part a reviewer cannot afford to lose, and
+        # `render_finding` clips the note from the right. Budget for it rather
+        # than letting a long model-authored note truncate it to "Rollout
+        # note: this …(truncated)".
+        room = MAX_NOTE_CHARS - len(warning) - 1
+        head = clip_text(note, room) if room > 0 else ""
+        remediation["note"] = f"{head} {warning}" if head else warning
         annotated.append(fid)
     return annotated
 
@@ -5882,6 +5961,16 @@ def handle_remediate(args: argparse.Namespace) -> None:
             # that is a gh call. Say so rather than let the missing "Part of
             # #N" read as a defect in the rendering.
             log("DRY RUN: no --issue given, so the 'Part of #N' link is omitted.")
+        # Same omission `_handle_finish_dry_run` announces, and for the same
+        # reason: the apply-conflict gate needs `git show HEAD:<path>`, which a
+        # dry run does not issue. Saying nothing here is worse than in `finish`
+        # — this command's whole output is the pull request body a human is
+        # about to read, so an absent rollout note reads as "there is none".
+        log(
+            "DRY RUN: not checking whether any remediation edits an immutable "
+            "field; the body below therefore omits any rollout note the real "
+            "run would add to it."
+        )
         for group in groups:
             log(f"WOULD OPEN: {group_branch_for(audit_id, group)}")
             print(

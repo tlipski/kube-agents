@@ -38,7 +38,7 @@ diagnosis points at a specific rule rather than at "the agent got it wrong".
 | `05-missing-ondemand-floor.sh`       | D    | Every ComputeClass priority is Spot; no on-demand tier         |
 | `06-stateful-disk-generation-mix.sh` | C    | Volume type attaches on some offered generations, not others   |
 | `07-hyperdisk-incompatibility.sh`    | H    | Hyperdisk on a class offering only pre-Hyperdisk families      |
-| `08-ccc-priority-starvation.sh`      | G    | Over-granular priority list; the autoscaler loops              |
+| `08-ccc-priority-starvation.sh`      | G    | Priority list whose every shape is smaller than the pod        |
 | `09-duplicate-signal.sh`             | —    | The same alert three times: dedup and duplicate-PR suppression |
 | `10-false-signal.sh`                 | —    | Alert for a workload that is not in trouble; agent stands down |
 

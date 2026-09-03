@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# Rule G — CCC Priority Starvation & Reset Loop.
+# Rule G — priority list too granular to fit the pod.
 #
-# The ComputeClass lists many narrow, granular machine types in priority order. The
-# autoscaler works down the list, fails on each, and restarts from the top rather than
-# settling — so the workload never schedules even though a shape further down would
-# have worked. The symptom is repetition, which a single alert does not show.
+# The ComputeClass lists eight narrow machine types, and the pod's requests exceed every
+# one of them, so the chain is exhausted on the first scheduling attempt and
+# `whenUnsatisfiable: DoNotScaleUp` keeps the pods Pending. No shape further down would
+# have worked either: the list could never have satisfied this pod at any position.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
-SCENARIO_TITLE="Over-granular priority list makes the autoscaler loop instead of settle"
-SCENARIO_RULE="SKILL.md Rule G — CCC Priority Starvation & Reset Loop"
+SCENARIO_TITLE="Priority list whose every shape is smaller than the pod that selects it"
+SCENARIO_RULE="SKILL.md Rule G — Priority List Too Long, or Too Granular to Fit the Pod"
 SCENARIO_CONTROLLER="transactional-db"
 SCENARIO_PODS=5
 
@@ -23,9 +23,10 @@ metadata:
   labels:
     scenario: 08-ccc-priority-starvation
 spec:
-  # Eight exact machineType entries, each a narrow target, ordered by preference. Any
-  # one of them being unavailable is unremarkable; the list being built this way is
-  # the defect, because the autoscaler re-walks it from the top on every attempt.
+  # Eight exact machineType entries, the largest of which is c3-highmem-8. The pod
+  # below requests 14 vCPU, so no entry can host a single replica and the chain is
+  # exhausted on the first scheduling attempt. Eight is inside the ~10-entry traversal
+  # cap, so the length of the list is not the defect -- the sizing is.
   priorities:
     - machineType: c3-standard-4
     - machineType: c3-standard-8
@@ -108,15 +109,15 @@ JSON
 
 scenario_notes() {
     cat <<'TXT'
-Publish this one two or three times a few minutes apart, with --keep-dedup on the
-repeats, to make the loop visible. A single alert looks like ordinary scarcity; the
-repetition across the same priority list is the actual signal, and it is what
-distinguishes Rule G from Rule B.
+The 14 vCPU request exceeds every one of the eight listed shapes, so the diagnosis
+has to say the list could never have satisfied this pod -- not that the autoscaler
+looped. What distinguishes Rule G from Rule B here is the comparison between the pod's
+requests and the largest rule, which a single alert does not show.
 
 The expected proposal collapses the eight exact machineType entries into a couple of
-machineFamily entries, which lets the autoscaler pick a shape that fits instead of
-rejecting each candidate in turn. Note that the 14 vCPU request exceeds every listed
-shape, so the diagnosis should also say the list could never have satisfied this pod.
+machineFamily entries, letting node auto-creation size the node to the pod, and states
+what the resulting fleet costs: a class that provisioned nothing now provisions one
+node per replica.
 TXT
 }
 

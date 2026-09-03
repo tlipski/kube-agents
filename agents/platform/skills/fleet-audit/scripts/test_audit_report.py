@@ -3686,12 +3686,16 @@ class TestRecommendation(BaseTestCase):
 class TestContradictoryEvidence(BaseTestCase):
     """Two findings quoting one read of one object cannot disagree about it.
 
-    The failure this stops is not a typo. A run reported the same ComputeClass
-    as having one priority rule under `ccc-large-vm-scarcity` and three under
-    `ccc-no-ondemand-floor`, from the same `kubectl get` on the same morning,
-    and each finding's recommendation was premised on its own version of the
-    spec. A reviewer reading the ledger had no way to tell which half was real,
-    which is a worse outcome than either finding being missing.
+    The failure this stops is not a typo: a run reported one object as having
+    one priority rule under one check and three under another, from the same
+    `kubectl get` on the same morning, with each recommendation premised on its
+    own version of the spec. A reviewer reading the ledger had no way to tell
+    which half was real, which is worse than either finding being missing.
+
+    The fixtures below use this stream's own check slugs rather than the
+    stockout ones the incident came from — the rule is keyed on
+    `(cluster, object, command)` and does not read `check` at all, so the
+    stream a case is written in makes no difference to what is exercised.
     """
 
     def pair(self, *, first_excerpt, second_excerpt, second_command=None, obj="ComputeClass/db"):
@@ -3836,9 +3840,55 @@ spec:
 
     def test_unparseable_yaml_yields_no_opinion(self):
         """None and [] are different answers; a bad parse must not read as 'clean'."""
-        self.assertEqual(
-            audit_report.immutable_update_conflicts("{{ not yaml", self.sts_after()), []
+        self.assertIsNone(
+            audit_report.immutable_update_conflicts("{{ not yaml", self.sts_after())
         )
+        self.assertEqual(
+            audit_report.immutable_update_conflicts(self.STS_BEFORE, self.STS_BEFORE), []
+        )
+
+    def test_spelling_a_default_out_loud_is_not_a_change(self):
+        """`reclaimPolicy: Delete` IS the default, so adding it changes nothing.
+
+        Observed on a real GitOps repository during review: adding the line the
+        API server had already defaulted produced a "refuses to update in
+        place" note over an edit it would have accepted silently.
+        """
+        before = "kind: StorageClass\nmetadata: {name: fast}\nprovisioner: pd.csi.storage.gke.io\n"
+        after = before + "reclaimPolicy: Delete\n"
+        self.assertEqual(audit_report.immutable_update_conflicts(before, after), [])
+        # A non-default value spelled out is still a real conflict.
+        retain = before + "reclaimPolicy: Retain\n"
+        self.assertEqual(
+            audit_report.immutable_update_conflicts(before, retain),
+            ["StorageClass/fast `reclaimPolicy`"],
+        )
+
+    def test_a_pvc_may_grow_but_not_shrink(self):
+        """§4 of the SOP tells the agent to look for a shrink; so must the gate."""
+        pvc = (
+            "kind: PersistentVolumeClaim\nmetadata: {name: data}\n"
+            "spec:\n  resources:\n    requests:\n      storage: %s\n"
+        )
+        self.assertEqual(audit_report.immutable_update_conflicts(pvc % "10Gi", pvc % "20Gi"), [])
+        shrunk = audit_report.immutable_update_conflicts(pvc % "10Gi", pvc % "5Gi")
+        self.assertEqual(len(shrunk), 1)
+        self.assertIn("spec.resources.requests.storage", shrunk[0])
+        self.assertIn("10Gi", shrunk[0])
+        self.assertIn("5Gi", shrunk[0])
+        # Across units, and unparseable quantities are simply not compared.
+        self.assertEqual(len(audit_report.immutable_update_conflicts(pvc % "1Ti", pvc % "900Gi")), 1)
+        self.assertEqual(audit_report.immutable_update_conflicts(pvc % "10Gi", pvc % "lots"), [])
+
+    def test_quantity_bytes_reads_binary_and_decimal_suffixes(self):
+        for text, expected in (
+            ("1Ki", 1024), ("1Mi", 1024**2), ("1Gi", 1024**3),
+            ("1K", 1000), ("1M", 1000**2), ("1G", 1000**3),
+            ("2048", 2048),
+        ):
+            self.assertEqual(audit_report.quantity_bytes(text), expected, text)
+        self.assertIsNone(audit_report.quantity_bytes("not-a-size"))
+        self.assertIsNone(audit_report.quantity_bytes(None))
 
     def test_two_objects_of_one_kind_are_matched_by_name(self):
         cache = "\n---" + self.STS_BEFORE.replace("name: db", "name: cache")
@@ -3936,6 +3986,111 @@ class TestAnnotateApplyConflicts(BaseTestCase):
         """`remediation_file_problem` owns the missing-file report; do not double up."""
         findings = [self.finding()]
         self.assertEqual(audit_report.annotate_apply_conflicts(findings, self.root), [])
+
+    def test_a_model_written_rollout_note_does_not_suppress_the_real_one(self):
+        """The guard matches the whole warning, not the prefix.
+
+        A prefix match let any note containing "Rollout note:" — which the SOP
+        now encourages the model to write in `risk` — swallow the harness's own
+        warning, turning a guard against duplication into a way to lose the
+        finding entirely.
+        """
+        self.shown = TestImmutableUpdateConflicts.STS_BEFORE
+        self.write("db.yaml", TestImmutableUpdateConflicts.STS_BEFORE.replace(
+            "scenario-hyperdisk-balanced", "dynamic-rwo"
+        ))
+        findings = [self.finding(note="Rollout note: coordinate with the DBA first.")]
+        self.assertEqual(audit_report.annotate_apply_conflicts(findings, self.root), ["disk-mix"])
+        note = findings[0]["remediation"]["note"]
+        self.assertIn("coordinate with the DBA first.", note)
+        self.assertIn("--cascade=orphan", note)
+
+    def test_a_long_note_does_not_truncate_the_warning_away(self):
+        """`render_finding` clips from the right, so the warning has to fit."""
+        self.shown = TestImmutableUpdateConflicts.STS_BEFORE
+        self.write("db.yaml", TestImmutableUpdateConflicts.STS_BEFORE.replace(
+            "scenario-hyperdisk-balanced", "dynamic-rwo"
+        ))
+        findings = [self.finding(note="x" * (audit_report.MAX_NOTE_CHARS - 20))]
+        audit_report.annotate_apply_conflicts(findings, self.root)
+        rendered = audit_report.clip_text(
+            findings[0]["remediation"]["note"], audit_report.MAX_NOTE_CHARS
+        )
+        self.assertIn("refuses to update in place", rendered)
+        self.assertIn("--cascade=orphan", rendered)
+
+    def test_an_unparseable_manifest_says_it_was_not_checked(self):
+        self.shown = "{{ not yaml"
+        self.write("db.yaml", TestImmutableUpdateConflicts.STS_BEFORE)
+        findings = [self.finding()]
+        self.assertEqual(audit_report.annotate_apply_conflicts(findings, self.root), ["disk-mix"])
+        self.assertIn("was not checked", findings[0]["remediation"]["note"])
+
+
+class TestApplyConflictsReachThePublishedBody(HarnessTestCase):
+    """`finish` and `remediate` must actually call the gate, not merely own it.
+
+    Every other test for this feature calls `annotate_apply_conflicts`
+    directly. Deleting both call sites from the subcommands therefore left the
+    entire suite green while the warning stopped reaching anyone — the note is
+    only worth writing if it lands in the body a reviewer reads, so these two
+    assert it on the wire.
+    """
+
+    PATH = "clusters/prod-us-east/db.yaml"
+
+    def setUp(self):
+        super().setUp()
+        self.harness.replies["show HEAD:"] = TestImmutableUpdateConflicts.STS_BEFORE
+        target = self.workspace / self.PATH
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            TestImmutableUpdateConflicts.STS_BEFORE.replace(
+                "scenario-hyperdisk-balanced", "dynamic-rwo"
+            ),
+            encoding="utf-8",
+        )
+
+    def doc(self):
+        return make_doc(
+            findings=[
+                make_finding(
+                    remediation={
+                        "kind": "manifest",
+                        "path": self.PATH,
+                        "note": "Move the volume to dynamic-rwo.",
+                    }
+                )
+            ]
+        )
+
+    def test_finish_publishes_the_rollout_note(self):
+        self.assertEqual(self.run_finish(self.doc()), 0, self.err)
+        published = "\n".join(self.harness.bodies_for("issue"))
+        self.assertIn(audit_report.APPLY_CONFLICT_PREFIX, published)
+        self.assertIn("spec.volumeClaimTemplates", published)
+        # The model's own note survives alongside the warning.
+        self.assertIn("Move the volume to dynamic-rwo.", published)
+
+    def test_remediate_publishes_the_rollout_note(self):
+        argv = [
+            "remediate", "--audit", AUDIT,
+            "--findings-file", self.write_findings(self.doc()),
+            "--finding", derived_id(),
+        ]
+        self.assertEqual(self.run_main(argv), 0, self.err)
+        published = "\n".join(self.harness.bodies_for("pr"))
+        self.assertIn(audit_report.APPLY_CONFLICT_PREFIX, published)
+        self.assertIn("spec.volumeClaimTemplates", published)
+
+    def test_a_clean_edit_publishes_no_rollout_note(self):
+        (self.workspace / self.PATH).write_text(
+            TestImmutableUpdateConflicts.STS_BEFORE.replace("replicas: 3", "replicas: 5"),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_finish(self.doc()), 0, self.err)
+        published = "\n".join(self.harness.bodies_for("issue"))
+        self.assertNotIn(audit_report.APPLY_CONFLICT_PREFIX, published)
 
 
 class TestScopeLimitations(BaseTestCase):

@@ -211,18 +211,22 @@ Inspect the target `ComputeClass` and workload manifests in the leased workspace
 - **Problem**: A workload requests more total resources (CPUs or GPUs) than the regional quota limit configured for the project in that region (e.g., requesting 32 L4 GPUs when `gcloud compute regions describe us-central1` shows the `NVIDIA_L4_GPUS` quota limit is 24).
 - **Fix**: Identify this explicitly as a **Regional Quota Exceeded Violation** in the diagnosis. Propose adjusting the workload deployment manifest to cap total requested GPUs/CPUs to fit strictly within the regional quota limit (e.g. reducing replicas from 4 to 3 so total GPUs = 24), and create a `ComputeClass` providing multi-zone fallback capabilities.
 
-#### Rule G: CCC Priority Starvation & Reset Loop (Excessive Granular Machine Types)
+#### Rule G: Priority List Too Long, or Too Granular to Fit the Pod
 
 > [!IMPORTANT]
-> **MANDATORY PRIORITY CHECK**: If a ComputeClass `priorities[]` list contains more than 10 granular `machineType` rules (e.g., 25 priority rules for specific machine shapes like `n2-standard-4`, `n2-standard-8`, etc.), this is a Rule G violation. You MUST NOT add more `machineType` rules. Instead, you MUST auto-compress the configuration by replacing ALL 25 granular `machineType` rules with 4 family-level (`machineFamily`) rules (e.g., `n4`, `c3`, `n2`, `e2`).
+> **MANDATORY PRIORITY CHECK**: Before proposing more `machineType` rules, compare the pod's `resources.requests` against every rule already in the list. If none of them names a shape large enough to host one replica, that — not the length of the list — is why the pods are `Pending`, and adding rules of the same size fixes nothing.
 
-- **Problem**: A Custom Compute Class (CCC) contains excessive granular `machineType` rules (e.g., 25 priority rules for specific machine shapes), exceeding Flex Advisor's cache limit (generating >200 combinations) and triggering a Cluster Autoscaler backoff reset loop. Lower-priority fallbacks (`n2`, `e2`) are starved and pods remain stuck in `Pending`.
-- **Fix**: Auto-compress the CCC configuration: Completely REPLACE the entire list of specific granular machine sizes (`machineType`) with 4 family-level definitions (`machineFamily`: `n4`, `c3`, `n2`, `e2`), reducing priority rules from 25 to 4 family-level priorities and avoiding the starvation loop.
+- **Problem**: two distinct failures wear the same shape, and they need different fixes:
+  - **No rule fits the pod.** Every `machineType` in `priorities[]` is smaller than the pod's requests, so the chain is exhausted on the first scheduling attempt and `whenUnsatisfiable: DoNotScaleUp` (the default) leaves the pods `Pending` forever. This is the common one.
+  - **Past the traversal cap.** The priority chain carries more than the **~10 entries** traversal supports, so rules below the cap are never reached.
+- **Fix**: for the first, raise the rules to shapes that fit, or compress to `machineFamily` so node auto-creation sizes the node to the pod — and say what the resulting fleet costs, since a class that provisioned nothing now provisions one node per replica. For the second, compress granular rules to family level while **carrying the sizing they expressed** (`machineFamily: c3` plus `minCores`/`minMemoryGb`), or the boundary is lost.
+- **Do not claim a solver, cache, or permutation limit.** There is no documented Flex Advisor combination limit and nothing below ~10 entries triggers a backoff loop. The real timing caveat is about churn: an unobtainable shape holds a 5-minute cooldown, and under heavy Pod create/delete the autoscaler may not reach later rules before earlier cooldowns expire. Cite the autoscaler visibility logs if that is what you observed.
 
-#### Rule H: Hyperdisk Incompatibility with Older Generation Machines
+#### Rule H: Machine Family Cannot Attach the Disk Type the Workload Requests
 
-- **Problem**: A workload using Hyperdisk (e.g. `hyperdisk-balanced`, `hyperdisk-throughput`, `hyperdisk-extreme`, or StorageClass with hyperdisk CSI provisioner) uses a CCC definition whose 1st choice is a 3rd/4th generation machine type (e.g. `c3-standard-4`, `c4-standard-4`), but has fallbacks to older generation machine types (e.g. `c2`, `n2`, `e2`). Once there is a stockout on the 1st choice, Cluster Autoscaler falls back to an incompatible machine type (`c2`, `n2`, `e2`) that does not support Hyperdisk, causing scale-up to fail.
-- **Fix**: Increase CCC fallback options to other machine families compatible with Hyperdisk (e.g. `c3`, `c4`, `n4`, `c3d`), and remove fallbacks which do not work with Hyperdisk (`c2`, `n2`, `e2`).
+- **Problem**: a workload using Hyperdisk references a CCC with a priority rule that cannot attach **that specific disk type**. Read the StorageClass's `parameters.type` first — "Hyperdisk-compatible" is not one property. Balanced, Throughput and Extreme have different support matrices, and a family that is fine for one is a hard attach failure for another.
+- **Fix**: replace the incompatible rules with families that support the workload's disk type, and **verify the replacement before writing it** — proposing a family this same rule rejects is the failure mode here. Two traps: `n4` supports Balanced but **not Extreme**, so it is not a valid `hyperdisk-extreme` fallback (`n2`, `c3`, `c3d`, `c4`, `m1`, `m3` are); and a bare `machineFamily: c3` rule permits `c3-standard-4`, far below the 88-vCPU floor Extreme needs on C3, so pin it with `minCores`.
+- Where the vCPU floor forces a node many times the pod's requests, the cheaper change is usually the StorageClass tier, not the ComputeClass. Put both options in the proposal and say which you chose.
 
 ### 6. Create GitOps Remediation Proposal
 
