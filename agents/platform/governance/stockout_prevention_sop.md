@@ -266,7 +266,7 @@ This is a separate check from §3.3 and not a severity of it. A shape on this li
 - **Do NOT flag:** `c4a-highmem-96-metal`, which auto-creation does support from 1.35.3-gke.1389000+ when named as a `machineType` (a `machineFamily: c4a` rule provisions ordinary VMs instead); shapes that are merely large or merely scarce, which are §3.3.
 - **Severity:** `critical`.
 - **Impact:** "`<machineType>` is not a shape GKE node auto-creation can provision, in any region at any time, so this rule never yields a node and the workload stays permanently `Pending`." Take `<machineType>` from the excerpt.
-- **Remediation:** `kind: manifest`. Replace the rule with a shape that exists — for a bare-metal entry that usually means the equivalent VM shape in the same series. State in `recommendation.rationale` that adding fallbacks below the invalid rule would not have fixed it, because the reviewer's first instinct will be to treat this as §3.3.
+- **Remediation:** `kind: manifest`. `recommendation.action` names the replacement shape, not the act of replacing one: for a bare-metal entry that is usually the equivalent VM in the same series, so `c4-highmem-288-lssd-metal` becomes `c4-highmem-288`. `recommendation.rationale` is "a fallback rule below this one would not have helped, because the rule above it never yields a node and nothing under it is reached."
 
 ### 4. Generate remediation artifacts
 
