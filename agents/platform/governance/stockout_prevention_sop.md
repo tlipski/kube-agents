@@ -131,7 +131,7 @@ threshold its own evidence contradicts.
 
 #### 3.1 Lack of fallback machine families and dimension diversity (`ccc-missing-fallbacks`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-prioritization.md`, `skills/gke-compute-classes/references/compute-class-crd-fields.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
 - **Command:** `kubectl --context <ctx> get computeclasses,deployments,statefulsets -A -o yaml` — the class **and** the workloads that select it. The Zone dimension below is a property of the workload, not of `priorities[]`, so a read of the ComputeClass alone cannot answer this check.
 - **Flag when:** A `ComputeClass` has `priorities[]` pinned to a single machine family or varies fewer than 2 of the 4 core obtainability dimensions across its priority chain: Zone, Family, Capacity Model (Spot vs. On-Demand), and Machine Size (vCPU core count). **Zone is judged on the consuming workload, not on `priorities[]`:** a class with three families is still single-zone if every pod that selects it carries a `requiredDuringSchedulingIgnoredDuringExecution` `topology.kubernetes.io/zone` affinity or a `topologySpreadConstraints` with one permitted zone. Name that pin in the excerpt when it is what you found.
 - **Do NOT flag:** ComputeClasses that vary 2+ obtainability dimensions (e.g. multi-zone `c3` fallback to `n4` and `n2`, or Spot fallback to On-Demand across zones); standard exclusions.
@@ -249,7 +249,7 @@ threshold its own evidence contradicts.
 
 #### 3.12 Dangling, unlabelled, or invalid ComputeClass configurations (`dangling-compute-class`)
 
-- **Reference:** `skills/gke-compute-classes/references/compute-class-crd-fields.md`, `skills/gke-compute-classes/references/compute-class-debug.md`
+- **Reference:** `skills/gke-compute-classes/references/compute-class-crd-fields.md`, `skills/gke-compute-classes/references/compute-class-debug.md`, `skills/gke-compute-classes/references/compute-class-lifecycle.md`
 - **Command:** `kubectl --context <ctx> get computeclasses,deployments,statefulsets -A -o yaml`
 - **Flag when:** (a) A workload's `nodeSelector: cloud.google.com/compute-class` or namespace `cloud.google.com/default-compute-class` references a ComputeClass that does not exist; (b) A ComputeClass `status.conditions` reports invalid configuration; (c) `nodePoolAutoCreation.enabled` is false and referenced node pools lack `cloud.google.com/compute-class` label/taints; (d) A GPU workload references a ComputeClass without declaring `nvidia.com/gpu` tolerations; or (e) **no priority rule in the class can host one replica of a workload that selects it** — every `machineType` names a shape smaller than the pod's `resources.requests`, so the chain is exhausted on the first scheduling attempt.
 - **(e) needs the workload dump, and it is the most common way a class is silently dead.** Compare each pod template's CPU and memory requests against every `machineType` rule; a `machineFamily` rule is sized to the pod by node auto-creation and so cannot fail this way. Five replicas requesting 14 vCPU against a list topping out at `c3-highmem-8` is permanent `Pending` for all five, with `whenUnsatisfiable: DoNotScaleUp` guaranteeing it. Put both numbers — the request and the largest rule — in the excerpt.
