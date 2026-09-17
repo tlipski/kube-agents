@@ -16,6 +16,7 @@ INSTALLER_DIR="${REPO_ROOT}/scripts/installer"
 # Pointed at the installer helpers rather than at this directory: load_state
 # creates the file when it is absent, and defaulting it from SCRIPT_DIR would
 # leave a stray scripts/dev/vars.sh behind.
+# shellcheck disable=SC2034 # read by the installer's load_state, sourced below
 VARS_FILE="${INSTALLER_DIR}/vars.sh"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
@@ -129,10 +130,9 @@ execute_registry() {
       --location="$REGION" \
       --project="$PROJECT_ID" \
       --description="Kubernetes Agentic Harness repository for local development" || return 1
-  # Only claim a registry this script actually created. teardown.sh reads this
-  # flag to decide whether to delete the repository and every image in it, and
-  # passes --no-confirm, so claiming one the provisioning pipeline created would
-  # hand `make teardown` a registry it otherwise preserves.
+  # Only claim a registry this script actually created: the flag records that
+  # this tooling made it. teardown_dev_01_gcp_artifact_registry.sh deletes the
+  # repository and every image in it, after asking, and clears the flag.
   save_var "DEV_ARTIFACT_REGISTRY_CREATED" "true"
 }
 

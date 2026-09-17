@@ -22,9 +22,15 @@ creates and 409 against the live fleet. The stack applies **once per eval projec
 and each project keeps its own state: bucket `<project>-tf-state`, prefix
 `seeded-fleet`, always. Whether a given project's apply is complete is not recorded here,
 because a list of project names goes stale silently: `scripts/verify_ci_pool_project.py`
-runs `hack/fleet-kubeconfigs.sh` against the project and requires all seven fixture roles.
-A role on a cluster it could not reach usually reports as unchecked rather than absent; the
-warnings that override that default are in the site's `deploy/ci-pool-projects` §6.
+runs `hack/fleet-kubeconfigs.sh` against the project and requires all seven fixture roles,
+then runs `hack/fleet-fixture-state.py` and requires each of them to be in its **designed
+state** — the `state` assertions beside each role in `fixtures.json` (the crashloop has a
+recorded OOMKilled termination, `checkout-gateway` has two Ready replicas and no PDB in its
+namespace, `seeded-b`'s master is still one minor behind its channel with the exclusion
+window ahead of now). Presence alone passed on 2026-09-07 while every slot-a fixture sat
+Pending (#1278); the state pass is what would have failed that project. A role on a cluster
+it could not reach usually reports as unchecked rather than absent; the warnings that
+override that default are in `docs/ci-pool-projects.md` §6.
 Project N+1 follows the same convention. The fleet owner creates the bucket once per project; switching projects means
 re-initializing against that project's bucket and naming the project on the apply:
 
@@ -38,8 +44,20 @@ Local validation without credentials: `tofu init -backend=false && tofu validate
 Drift is corrected by re-applying this stack on a schedule — a scheduled GitHub
 workflow, because the repository's other recurring jobs already live there and the
 apply needs nothing Cloud Build has that Actions lacks. The workflow does not exist
-yet; creating it is the fleet owner's call. Until it does, a manual `tofu apply` after
-any suspected drift is the reconcile.
+yet; creating it is the fleet owner's call (#1550). Until it does, a manual `tofu apply`
+after any suspected drift is the reconcile. Detecting the drift is a separate job, and
+it is `hack/fleet-fixture-state.py`'s: the pool verifier runs it against one project
+when asked, and the CI health bot's hourly scan runs it against every pool project and
+reports a repeated drift the way it reports a lost build node
+([`docs/ci-health.md`](../../../docs/ci-health.md), "The seeded-fleet scan"). The
+presubmit does not run it and does not act on a drift: an eval
+run's verdict is about the pull request, and skipping or excusing cases on the fleet's
+account is deliberately not part of evals v1. The script's `--wait` exists for a
+fixture that has just been rescheduled (the crashloop needs its first restart before
+OOMKilled evidence exists, observed about 40 minutes behind the node repair on one
+project in the #1278 retest sweep); a role still drifted at the deadline gets a
+`<role>.drift` file beside its kubeconfig whose lines name the assertion and what was
+observed, so the operator knows whether it is a `tofu apply` or a node.
 
 The reconcile is load-bearing for `seeded-b` in particular, and it does two distinct
 things there. First, it **carries the control plane forward**: `min_master_version` is
@@ -110,13 +128,13 @@ The scenario ids below are the contract of the in-flight Phase 2 scenario branch
 
 | Defect                                                                                                                                                                                                                          | Where                                | Fixture role         | Asserting scenario                                                                                                                                                                   |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                                                                                      | `seeded-a` / ns `seeded-reliability` | `no-pdb-workload`    | `obtainability-planted-pdb`, `cluster-agent-healthy-workload-no-finding`                                                                                                             |
+| `checkout-gateway`, two replicas, no PDB (the SOP's no-pdb check flags multi-replica only)                                                                                                                                      | `seeded-a` / ns `seeded-reliability` | `no-pdb-workload`    | `obtainability-planted-pdb`, `cluster-agent-healthy-workload-no-finding`, `cluster-agent-stalled-controller-healthy-silence`                                                         |
 | `debug-binding`, a cluster-scoped ClusterRoleBinding of cluster-admin to the `seeded-security` default SA (the compliance SOP reads ClusterRoleBindings only)                                                                   | `seeded-a`                           | `rbac-overgrant`     | `compliance-rbac-overgrant`, `security-overgrant-probe`, `security-overgrant-remediation-proposal`                                                                                   |
 | `payments-api`, deterministic OOM crashloop                                                                                                                                                                                     | `seeded-a` / ns `seeded-debug`       | `crashloop-workload` | `cluster-agent-crashloop-debug`, `cluster-agent-crashloop-fix-request`, `cluster-agent-crashloop-misleading-symptom`, `cluster-agent-crashloop-evidence-chain`, `rca-remediation-pr` |
 | `pinned-inference-pool`: one zone, autoscaler pinned at one node, HPA wants more replicas than the pool can place, leaving a standing Pending backlog (no figure: the count is a load calculation and moves between projects)   | `seeded-a` / ns `seeded-capacity`    | `hpa-saturated`      | `stockout-pinned-pool`, `cluster-agent-pending-replicas-capped-pool`                                                                                                                 |
 | `idle-batch-pool`, zero non-system pods (tainted so it stays that way)                                                                                                                                                          | `seeded-a`                           | `idle-nodepool`      | `fleet-cost-idle-pool`                                                                                                                                                               |
 | `orphan-pd-1`, `orphan-pd-2`, unattached disks                                                                                                                                                                                  | project, `var.zone`                  | — (GCE-level)        | `fleet-cost-idle-pool`                                                                                                                                                               |
-| Control plane one minor behind REGULAR default                                                                                                                                                                                  | `seeded-b`                           | `version-laggard`    | `upgrade-readiness-lagging-cluster`                                                                                                                                                  |
+| Control plane one minor behind REGULAR default                                                                                                                                                                                  | `seeded-b`                           | `version-laggard`    | `upgrade-readiness-lagging-cluster`, `upgrades-lagging-master-probe`, `upgrades-fleet-version-table`, `upgrades-fleet-rollout-stall`, `upgrades-fleet-readiness-exclusion`           |
 | Master authorized networks absent, normalized to OFF (peers run it ON with an open block, whose contents the drift SOP never compares); all three clusters carry `environment=seeded` so the drift cohort is exactly this fleet | `seeded-c`                           | `drift-outlier`      | `consistency-drift-outlier`                                                                                                                                                          |
 
 The `environment=seeded` resource label is the cohort confinement, the same class of
@@ -184,7 +202,13 @@ The chain, end to end:
    then reported a catastrophic `fail` against an agent that had touched nothing.
    Adding a fixture therefore means adding both its role and its probes; every subject
    a `task.yaml` asserts on must appear in that list, which
-   `bench/tests/test_fleet_verifier.py` enforces in both directions.
+   `bench/tests/test_fleet_verifier.py` enforces in both directions. It also means
+   adding the role's `state` assertions — the observable shape the cases depend on,
+   in the small path-and-operator language `fixtures.json`'s `state_syntax` describes
+   — which `hack/fleet-fixture-state.py` evaluates after the presence gate. For slots
+   b and c the subject is the cluster itself, read back through `clusters describe`
+   on the name the runner recorded in `.fleet-context`; the script discovers nothing
+   on its own.
 3. A check in a `task.yaml` uses the `fleet_resource_property` verifier and names
    `fixture_role: crashloop-workload`.
 4. `kube_agents_bench.fleet.kubeconfig_for_role` turns the role into that path, and the
@@ -199,11 +223,22 @@ fixture; that fallback was activation blocker A5 in `bench/tasks/DRAFTS.md`. See
 for the spec side, including how the verifier keeps "the fixture is gone" (a fail)
 apart from "the cluster was unreachable" (an error).
 
-## The second consumer: the presubmit's log-fixture subject
+## The presubmit's two consumers outside the role catalog
 
-`hack/ci-eval-pr.sh` §3b is the one consumer of this fleet outside the role catalog's
-chain, and `fixtures.json`'s description names it as the exception. On every presubmit
-in a fleet-carrying project it discovers **slot c** by the same two labels, verifies
+`hack/ci-eval-pr.sh` addresses this fleet directly in two places, both discovering by
+the same two labels and the trailing `-<slot>` name segment, and `fixtures.json`'s
+description names both as the sanctioned exceptions to its rule.
+
+**§2c, the slot-a heal (#1278),** is the only consumer that mutates the fleet. On every
+presubmit it reads **slot a**'s `default-pool` node count and resizes it to two when it
+finds fewer -- the standing state `main.tf` declares, so a later `tofu apply` is a
+no-op. It touches nothing else: not the fixtures, not `node_config`, not the state
+file; a project with no seeded fleet, an unreadable count, or a failed resize each
+produce a warning and nothing more, and `FLEET_HEAL_SEEDED_A=0` turns it off. The cost
+paragraph at the end of this README says why the pool is two nodes.
+
+**§3b, the log-fixture subject,** mutates nothing in-cluster. On every presubmit in a
+fleet-carrying project it discovers **slot c** by the same two labels, verifies
 its `default` namespace is empty, runs `get-credentials` against it, and hands its
 name to the gpu-stress-test stack, which then creates no per-run cluster: the task's
 synthetic `hypercomputer-agent`/`hpa-controller` Cloud Logging entries name the slot-c
@@ -223,31 +258,33 @@ An eval run reads this fleet to check its fixtures survived. It has no business 
 able to change them, and the safeguards are worth less if the credential that checks
 them could also have caused what it is checking for.
 
-**This is not true today, and nothing in this change makes it true.** Measured, not
-assumed: `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com` — the identity
-every presubmit runs as — holds `roles/container.admin`, `roles/container.developer`,
-`roles/storage.admin`, `roles/resourcemanager.projectIamAdmin` and
-`roles/iam.serviceAccountAdmin` in every eval project — `scripts/provision_ci_pool_project.sh`
-grants that set at onboarding, so onboarding another one does not dilute it — and
+Applying this stack is what makes it true. It provisions
+`seeded-fleet-reader@<project>.iam.gserviceaccount.com` with `roles/container.viewer` on
+the project and nothing else, and grants `roles/iam.serviceAccountTokenCreator` on that
+account to the members in `var.fleet_reader_token_creators` — which defaults to
+`prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com`, the identity every
+presubmit runs as, and to `eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com`,
+the CI health bot, whose hourly fixture-state scan reads every pool project's fleet as
+the reader and holds nothing else on the project
+([`docs/ci-health.md`](../../../docs/ci-health.md), "The seeded-fleet scan").
+`hack/ci-eval-pr.sh` exports `FLEET_READONLY_SA` pointing at the
+account, and `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` credential
+naming `hack/fleet-reader-credential.sh`, which mints a token as that account whenever
+`kubectl` asks for one.
+
+Without the grant the script warns loudly on every run and the kubeconfigs carry the
+runner's own identity, which holds `roles/container.admin` among the twelve project roles
+`scripts/provision_ci_pool_project.sh` grants at onboarding (`PROW_RUNNER_ROLES` in
+`scripts/verify_ci_pool_project.py` is the list) — measured, not assumed:
 `kubectl auth can-i delete deployments -n seeded-debug` answers yes. There are zero
 ClusterRoleBindings or RoleBindings on these clusters naming any `*.gserviceaccount.com`
 subject; authorization comes entirely from the GKE IAM webhook, so there is nothing to
-narrow in-cluster either. A read-only identity does not exist to hand the harness yet.
+narrow in-cluster either.
 
-What this change adds is the **seam**, so that closing the gap is a configuration
-change rather than another code change. The stack provisions
-`seeded-fleet-reader@<project>.iam.gserviceaccount.com` with `roles/container.viewer`
-on the project and nothing else, and grants impersonation to the identities named in
-`var.fleet_reader_token_creators` (a list of IAM members, empty by default) via
-`roles/iam.serviceAccountTokenCreator` on that account alone. Set `FLEET_READONLY_SA` to
-the account's email and `hack/fleet-kubeconfigs.sh` mints a token for it and writes each
-kubeconfig with that token as its only credential. Unset — the state today — the script
-warns loudly on every run and the kubeconfigs carry the runner's own identity.
-
-Closing it needs three things, in order, none of them done here: apply this stack in
-each eval project; add the Prow identity to `fleet_reader_token_creators` and re-apply;
-export `FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` in the
-Prow job. Then the property is checkable rather than asserted:
+The default landed after the pool was provisioned, so a project applied before it still
+lacks the binding — `scripts/verify_ci_pool_project.py` fails such a project, and
+re-applying this stack against it is the repair. Where the grant is in place the property
+is checkable rather than asserted:
 
     gcloud auth print-access-token \
       --impersonate-service-account="seeded-fleet-reader@<project>.iam.gserviceaccount.com" \
@@ -259,14 +296,16 @@ Three things about this are worth stating rather than assuming:
 - **Impersonation must be a minted token, not a flag on `get-credentials`.**
   `gke-gcloud-auth-plugin` has no impersonation option, so the exec credential a
   `get-credentials --impersonate-service-account` writes still resolves to the caller's
-  own identity at `kubectl` time. Only replacing the user entry with a minted access
-  token actually binds it.
+  own identity at `kubectl` time. Only a token minted by impersonation actually binds it.
+- **The token cannot be baked into the kubeconfig.** It lives one hour; these files are
+  written before the image build and read hours later (recorded whole-job times in
+  `hack/ci-eval-pr.sh`: 180 to 222 minutes). An expired credential makes every fleet check
+  report `status: "error"`, which reds the presubmit. Hence the `exec:` block, minting
+  against the clock of the check. `hack/fleet-reader-credential.sh` caches on disk because
+  `kubectl`'s own exec cache is per-process and every check is a separate invocation.
 - **`roles/container.viewer` was verified, not assumed.** Its permission set contains no
   `container.secrets.*` and no create/update/delete/patch verb; the single non-get/list
-  entry is `container.tokenReviews.create`. The bound worth remembering is lifetime: a
-  minted access token lives one hour, which bounds a run, not a fleet. The script mints
-  once, at the start; a run longer than the lifetime sees its fleet checks start
-  erroring, which is loud and correct but is a real operational limit.
+  entry is `container.tokenReviews.create`.
 - **Never fold gcloud's stderr into the token.** On the _success_ path
   `gcloud auth print-access-token --impersonate-service-account=...` prints
   `WARNING: This command is using service account impersonation...` to stderr. Capturing
@@ -333,6 +372,11 @@ silence-on-a-clean-fleet case needs a clean view, which is an open fleet-design
 decision recorded with the scenario drafts. The silence case in particular must
 tolerate the declared background rows above.
 
-Rough standing cost: about $260 per month — the GKE management fee (three zonal
-clusters) is most of it, the five small nodes (20 GB disks) and two 10 GB orphan disks
-the rest.
+Rough standing cost: about $285 per month — the GKE management fee (three zonal
+clusters) is most of it, the six nodes (20 GB disks) and two 10 GB orphan disks the
+rest. Four of the nodes are e2-small; `seeded-a`'s default pool is two e2-mediums
+since #1278 (roughly $25 per month more than the one it ran on), because a single
+e2-medium's 940m allocatable CPU is fully claimed by GKE system pods and the planted
+`payments-api` / `checkout-gateway` fixtures went Pending — the comment on
+`seeded_a_default` in `main.tf` has the numbers, and `hack/ci-eval-pr.sh` section 2c
+resizes a one-node pool back to two at lease time until every project is re-applied.

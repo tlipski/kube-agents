@@ -2,7 +2,7 @@
 """Pre-flight verification for onboarding a GCP project into the CI evaluation pool.
 
 Validates that a project has completed every prerequisite in
-docs/site/src/content/docs/deploy/ci-pool-projects.md before it is registered in
+docs/ci-pool-projects.md before it is registered in
 the Boskos resource pool in gke-internal/test-infra.
 
 Registering a project that has not finished onboarding does not fail only that
@@ -49,6 +49,22 @@ _FLEET_SUMMARY = re.compile(
 # clusters in another project. The 120s ceiling the single gcloud calls use is
 # not enough, and a timeout here reads as a missing fleet.
 FLEET_TIMEOUT_SECONDS = 600
+
+# The second half of the fleet check (#1544): hack/fleet-fixture-state.py reads
+# each published role's `state` assertions out of the catalog and says which
+# fixtures are there but not in the shape the cases depend on. It prints one
+# summary line of its own, parsed the same way as the presence line above.
+_FLEET_STATE = _ROOT / "hack" / "fleet-fixture-state.py"
+_FLEET_STATE_SUMMARY = re.compile(
+    r"Seeded-fleet fixture state: (?P<converged>\d+) role\(s\) in their designed state, "
+    r"(?P<drifted>\d+) drifted, (?P<unchecked>\d+) not checked"
+)
+# How long the state pass may wait for a fixture to converge before calling it
+# drifted. An operator usually runs this minutes after `tofu apply`, when the
+# crashloop fixture has been scheduled but not yet restarted, and OOMKilled
+# evidence exists only after its first restart; five minutes covers that on a
+# healthy node without turning an onboarding check into a vigil.
+FLEET_STATE_WAIT_SECONDS = 300
 
 # No gcloud or gh call here should take anywhere near this long. The ceiling
 # exists so a hung call fails the run instead of hanging a CI job forever.
@@ -180,6 +196,18 @@ AR_PULLER_ROLES = AR_WRITER_ROLES | {"roles/artifactregistry.reader"}
 # `Required "container.clusters.get" permission(s)`.
 PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
+# The second identity that borrows seeded-fleet-reader: the CI health bot's
+# hourly seeded-fleet scan (.github/workflows/ci-health.yml, docs/ci-health.md
+# "The seeded-fleet scan") runs as eval-dashboard-publisher@kube-agents-prow and
+# impersonates the reader in every pool project. Without the grant the scan
+# reports the project as "not checked" and fixture drift there goes unseen.
+CI_HEALTH_BOT_MEMBER = "serviceAccount:eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com"
+
+# Every member that must hold roles/iam.serviceAccountTokenCreator on the
+# fleet reader. Kept equal to bench/tf/fleet's `fleet_reader_token_creators`
+# default by scripts/test_verify_ci_pool_project.py.
+FLEET_READER_TOKEN_CREATORS = (PROW_RUNNER_MEMBER, CI_HEALTH_BOT_MEMBER)
+
 # The set kube-agents-evals holds, matched literally rather than by permission.
 # Not minimal -- container.admin subsumes container.developer, viewer subsumes
 # logging.viewer and cloudbuild.builds.viewer -- but the point is that a new
@@ -236,6 +264,7 @@ PLATFORM_GSA_ROLES = {
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
+    "roles/serviceusage.serviceUsageConsumer",
 }
 
 
@@ -718,13 +747,14 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, the Prow runner's and platform GSA's project roles, and the cross-project AR reader grants."""
+    """Verify Workload Identity, the Prow runner's and platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
     details = []
     warnings: List[str] = []
     passed = True
     wi_checked = False
     roles_checked = False
     prow_checked = False
+    fleet_reader_checked = False
 
     gsa_email = f"kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
@@ -952,12 +982,68 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing kube-agents-prow AR policy: {exc}")
 
+    # The runner's permission to borrow the seeded fleet's read-only account.
+    # Without it hack/fleet-kubeconfigs.sh cannot mint a token for
+    # seeded-fleet-reader, so every role kubeconfig keeps the runner's own
+    # roles/container.admin credential on a fleet all open pull requests share --
+    # loud in the log, but the run still passes, which is why this went unnoticed
+    # across the whole pool (gke-labs/kube-agents#1051). bench/tf/fleet now
+    # defaults the grant, so a project failing here was last applied before that
+    # default landed and needs `tofu apply` against its seeded-fleet state.
+    fleet_reader_email = f"seeded-fleet-reader@{project_id}.iam.gserviceaccount.com"
+    rc, out, err = run_cmd([
+        "gcloud", "iam", "service-accounts", "get-iam-policy",
+        fleet_reader_email,
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing account or failed reading policy for {fleet_reader_email}. Apply "
+            f"bench/tf/fleet in {project_id}: the stack owns this account.",
+            f"Could not read the IAM policy on {fleet_reader_email}, so the Prow runner's "
+            "impersonation grant was not checked (and neither was the account's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        fleet_reader_checked = True
+        try:
+            policy = _load_json(out)
+            token_creators = set()
+            for b in policy.get("bindings", []):
+                if b.get("role") == "roles/iam.serviceAccountTokenCreator":
+                    token_creators.update(b.get("members", []))
+            if PROW_RUNNER_MEMBER not in token_creators:
+                passed = False
+                details.append(
+                    f"The Prow runner ({PROW_RUNNER_MEMBER.split(':', 1)[1]}) is missing "
+                    f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so every "
+                    f"fleet check in this project runs under the runner's own read-write "
+                    f"credential. Re-apply bench/tf/fleet against {project_id}."
+                )
+            if CI_HEALTH_BOT_MEMBER not in token_creators:
+                passed = False
+                details.append(
+                    f"The CI health bot ({CI_HEALTH_BOT_MEMBER.split(':', 1)[1]}) is missing "
+                    f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so its hourly "
+                    f"seeded-fleet scan reports {project_id} as not checked and fixture drift "
+                    f"there goes unseen. Re-apply bench/tf/fleet against {project_id}, or run "
+                    f"the grant in docs/ci-health.md (The seeded-fleet scan)."
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing policy for {fleet_reader_email}: {exc}")
+
     # The summary must not assert an item a warning above retracts.
     partial = _partial_summary(
         [
             ("the Workload Identity binding", wi_checked),
             ("the Prow runner and platform GSA project roles", roles_checked),
             ("the cross-project AR reader grants", prow_checked),
+            ("the fleet reader's token-creator binding", fleet_reader_checked),
         ]
     )
     if not passed:
@@ -967,7 +1053,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     else:
         message = (
             "Workload Identity, Prow runner and platform GSA project roles, "
-            "and cross-project AR reader grants verified"
+            "cross-project AR reader grants, and the fleet reader's token-creator "
+            "binding verified"
         )
 
     return CheckResult(
@@ -1375,7 +1462,132 @@ def check_seeded_fleet_fixtures(project_id: str) -> CheckResult:
         rc, _, err = run_cmd(
             ["bash", str(_FLEET_KUBECONFIGS)], timeout=FLEET_TIMEOUT_SECONDS, env=env
         )
+        presence = _fleet_presence_result(name, project_id, expected, rc, err)
+        match = _FLEET_SUMMARY.search(err)
+        written = int(match.group("written")) if match else 0
+        # A presence verdict that already fails, or one that published no role
+        # at all, is the whole answer: there is nothing whose state could be
+        # read, and a second finding about the same fleet would only blur the
+        # first. Otherwise the state pass runs INSIDE the temporary directory,
+        # because it reads the kubeconfigs the presence pass just wrote.
+        if not presence.passed or not written:
+            return presence
+        rc, _, err = run_cmd(
+            [
+                "python3",
+                str(_FLEET_STATE),
+                "--dir",
+                target,
+                "--project",
+                project_id,
+                "--wait",
+                str(FLEET_STATE_WAIT_SECONDS),
+            ],
+            timeout=FLEET_STATE_WAIT_SECONDS + FLEET_TIMEOUT_SECONDS,
+            env=env,
+        )
+    return _fleet_state_result(name, project_id, expected, presence, rc, err)
 
+
+def _fleet_state_result(
+    name: str, project_id: str, expected: int, presence: CheckResult, rc: int, err: str
+) -> CheckResult:
+    """Fold hack/fleet-fixture-state.py's verdict into the presence result.
+
+    Drift is a finding about the project -- the fixture is there and is not
+    what the cases were written against -- and fails the check with the
+    script's own lines saying which assertion and what it observed. A role the
+    script could not read is unverified, like an unreachable cluster in the
+    presence pass. A script that exited without reporting is unverified if it
+    was refused or timed out and a failure otherwise, because the only other
+    way it exits non-zero is a malformed catalog, which is a repository bug.
+    """
+    match = _FLEET_STATE_SUMMARY.search(err)
+    notes = [line.strip() for line in err.splitlines() if line.startswith(("WARNING:", "ERROR:"))]
+    if not match:
+        last = (err.strip().splitlines() or ["no output"])[-1]
+        if rc != 0:
+            reason = _unread_reason(err)
+            if reason:
+                return CheckResult(
+                    name,
+                    True,
+                    presence.message,
+                    warnings=[
+                        *presence.warnings,
+                        (
+                            f"hack/fleet-fixture-state.py exited {rc} without reading the fixtures, "
+                            f"so nothing is known about their state in {project_id}: {reason}"
+                        ),
+                    ],
+                )
+            return CheckResult(
+                name,
+                False,
+                f"hack/fleet-fixture-state.py exited {rc} without reporting",
+                details=[last],
+            )
+        return CheckResult(
+            name,
+            True,
+            presence.message,
+            warnings=[
+                *presence.warnings,
+                (
+                    "hack/fleet-fixture-state.py printed no summary line, so nothing is known "
+                    f"about the fixtures' state in {project_id}. Last line of its output: {last}"
+                ),
+            ],
+        )
+
+    converged = int(match.group("converged"))
+    drifted = int(match.group("drifted"))
+    unchecked = int(match.group("unchecked"))
+    counts = (
+        f"{converged} role(s) in their designed state, {drifted} drifted, "
+        f"{unchecked} whose state could not be read"
+    )
+    if drifted:
+        return CheckResult(
+            name,
+            False,
+            "Seeded fleet fixtures present but not in their designed state",
+            details=[counts, *notes],
+        )
+    if unchecked:
+        return CheckResult(
+            name,
+            True,
+            f"{unchecked} of {expected} fixture role(s) present, state not checked",
+            warnings=[
+                *presence.warnings,
+                "\n      ".join(
+                    [
+                        (
+                            f"{counts}. Nothing was found out of shape: the reads failed, so "
+                            f"confirm the seeded fleet in {project_id} before registering it."
+                        ),
+                        *notes,
+                    ]
+                ),
+            ],
+        )
+    if presence.warnings:
+        return presence
+    return CheckResult(
+        name, True, f"All {expected} fixture roles planted, reachable and in their designed state"
+    )
+
+
+def _fleet_presence_result(
+    name: str, project_id: str, expected: int, rc: int, err: str
+) -> CheckResult:
+    """The presence half: what hack/fleet-kubeconfigs.sh's summary line says.
+
+    Passes only when every role was written, or when the roles it could not
+    write sit on clusters the script said it could not reach (unverified, with
+    a warning). Every other shape is a finding about the project.
+    """
     match = _FLEET_SUMMARY.search(err)
     if not match:
         last = (err.strip().splitlines() or ["no output"])[-1]
@@ -1837,7 +2049,7 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
             return CheckResult(name, False, "Ledger issues not readable", details=[
                 f"App {LEDGER_APP_ID} cannot see {repo_slug} at all (404). Its installation is "
                 "repository_selection: selected, so add this repository to it -- see section 5.4 "
-                "of deploy/ci-pool-projects.md. (The same 404 covers a repository that does not "
+                "of docs/ci-pool-projects.md. (The same 404 covers a repository that does not "
                 "exist; the check above settles which.)"
             ])
         return CheckResult(name, True, "Not checked", warnings=[

@@ -1107,6 +1107,14 @@ _PATH_SCOPED_ABSENT_WITNESSES: dict[str, dict[str, dict]] = {
         },
     },
 }
+# The stall-detection silence case copies the crashloop silence case's
+# safeguard verbatim -- same fixture, same path -- so it shares the witness
+# pair rather than carrying a second copy that could drift from it.
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "cluster-agent-stalled-controller-healthy-silence/the-rollout-was-not-restarted"
+] = _PATH_SCOPED_ABSENT_WITNESSES[
+    "cluster-agent-healthy-workload-no-finding/the-rollout-was-not-restarted"
+]
 
 
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
@@ -1459,19 +1467,63 @@ def _kubeconfig_stub(path: Path) -> None:
     )
 
 
-def test_the_readonly_rewrite_replaces_the_exec_plugin_with_a_token(shell, tmp_path):
+def test_the_readonly_rewrite_replaces_the_exec_plugin_with_the_credential_helper(
+    shell, tmp_path
+):
     target = tmp_path / "slot.kubeconfig"
     _kubeconfig_stub(target)
     done = shell(f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com')
     assert done.returncode == 0, done.stderr
     written = target.read_text()
-    assert "token: ya29.a0AfB_byTOKEN" in written
+    assert "command: " in written and "fleet-reader-credential.sh" in written
+    assert "- reader@x.iam.gserviceaccount.com" in written
+    assert "apiVersion: client.authentication.k8s.io/v1" in written
+    assert "interactiveMode: Never" in written
     assert "gke-gcloud-auth-plugin" not in written
     assert "server: https://10.0.0.1" in written
     assert "certificate-authority-data: Y2E=" in written
 
 
-def test_the_impersonation_warning_does_not_end_up_inside_the_token(shell, tmp_path):
+def test_the_kubeconfig_carries_no_baked_token(shell, tmp_path):
+    """The whole point of the exec entry.
+
+    An impersonated token lives one hour; ci-eval-pr.sh writes these files once,
+    before the image build, and the fan-out that reads them starts hours later
+    -- 197.9, ~180 and 221.7 recorded whole-job minutes. A token written in here
+    is expired for most of the checks that use it, and an expired credential
+    makes every one of them report status="error", which is an absolute rung
+    that reds the presubmit for any case.
+    """
+    target = tmp_path / "slot.kubeconfig"
+    _kubeconfig_stub(target)
+    done = shell(f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com')
+    assert done.returncode == 0, done.stderr
+    body = target.read_text()
+    assert "ya29.a0AfB_byTOKEN" not in body
+    assert "token:" not in body
+
+
+def test_the_mint_still_gates_the_rewrite(shell, tmp_path):
+    """The write-time mint survives the move to an exec entry, on purpose.
+
+    Nothing in the composed file needs the token any more, so the mint exists
+    only to prove the caller can impersonate the account before the credential
+    is committed to. Without it a project missing the token-creator binding
+    would get a well-formed kubeconfig that fails later, one check at a time,
+    instead of the warning and the fallback it gets today.
+    """
+    target = tmp_path / "slot.kubeconfig"
+    _kubeconfig_stub(target)
+    done = shell(
+        f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com',
+        STUB_TOKEN="ERROR: (gcloud.auth) Permission denied",
+    )
+    assert done.returncode != 0
+    assert "gke-gcloud-auth-plugin" in target.read_text()
+    assert "fleet-reader-credential.sh" not in target.read_text()
+
+
+def test_the_impersonation_warning_does_not_break_the_mint_probe(shell, tmp_path):
     """A regression test for a bug this had.
 
     `gcloud auth print-access-token --impersonate-service-account=...` prints
@@ -1479,7 +1531,9 @@ def test_the_impersonation_warning_does_not_end_up_inside_the_token(shell, tmp_p
     on the SUCCESS path. Capturing it with `2>&1` made $token a multi-line blob
     that kubectl still accepted, so every API call 401'd while the script
     reported success -- a silent read-only rollout that authenticated as
-    nobody.
+    nobody. The token no longer reaches the file, but it still decides whether
+    the file is rewritten, so folding stderr in would now reject a mint that
+    succeeded.
     """
     target = tmp_path / "slot.kubeconfig"
     _kubeconfig_stub(target)
@@ -1488,7 +1542,7 @@ def test_the_impersonation_warning_does_not_end_up_inside_the_token(shell, tmp_p
         STUB_TOKEN_WARNING="WARNING: This command is using service account impersonation.",
     )
     assert done.returncode == 0, done.stderr
-    assert "token: ya29.a0AfB_byTOKEN\n" in target.read_text()
+    assert "fleet-reader-credential.sh" in target.read_text()
     assert "WARNING" not in target.read_text()
 
 
@@ -1537,7 +1591,7 @@ def test_a_cluster_with_no_ca_data_omits_the_key_rather_than_writing_it_empty(
     assert done.returncode == 0, done.stderr
     body = target.read_text()
     assert "certificate-authority-data" not in body
-    assert "token: ya29.a0AfB_byTOKEN\n" in body
+    assert "fleet-reader-credential.sh" in body
 
 
 def _provision(shell, tmp_path, **env) -> Path:
@@ -1564,7 +1618,8 @@ def test_the_runner_writes_one_kubeconfig_per_catalog_role(shell, tmp_path):
     assert done.returncode == 0, done.stderr
     roles = set(_catalog()["roles"])
     assert {p.stem for p in out.glob("*.kubeconfig")} == roles
-    assert (out / ".fleet-context").read_text().strip() == "project=kube-agents-evals"
+    context = (out / ".fleet-context").read_text().splitlines()
+    assert context[0] == "project=kube-agents-evals"
     # And each role's file holds credentials for the cluster its catalog SLOT
     # discovered -- the whole point of the indirection. A role that resolved to
     # the wrong member of the trio would read a live cluster and report the
@@ -1595,7 +1650,8 @@ def test_a_read_only_service_account_reaches_every_role_file(shell, tmp_path):
     assert "the runner's own credential" not in done.stderr
     for path in out.glob("*.kubeconfig"):
         body = path.read_text()
-        assert "token: ya29.a0AfB_byTOKEN" in body, path
+        assert "fleet-reader-credential.sh" in body, path
+        assert "ya29.a0AfB_byTOKEN" not in body, path
         assert "gke-gcloud-auth-plugin" not in body, path
     call = next(
         line
@@ -1889,3 +1945,81 @@ def test_the_runner_refuses_a_directory_it_did_not_create(tmp_path):
     assert done.returncode != 0
     assert "refusing to remove it" in done.stderr
     assert (victim / "keep-me").exists()
+
+
+# --------------------------------------------------------------------------
+# The designed-state half (#1544): what the runner records for it and what
+# the catalog declares.
+# --------------------------------------------------------------------------
+
+
+def test_the_runner_records_each_slots_cluster_for_the_state_pass(shell, tmp_path):
+    """hack/fleet-fixture-state.py reads slot b's and c's control planes with
+    `clusters describe`, and it must not discover clusters on its own: the
+    catalog's rule is that the runner is the one place a seeded cluster is
+    resolved. So the runner writes each resolved slot's name and location
+    into the context file, beside the project."""
+    out = _provision(shell, tmp_path)
+    context = (out / ".fleet-context").read_text().splitlines()
+    for slot in ("a", "b", "c"):
+        assert f"cluster.{slot}=seeded-{slot}" in context
+        assert f"location.{slot}=us-central1-a" in context
+    # And nothing for a slot that did not resolve: the state script reports
+    # its roles as not checked rather than describing a guessed name.
+    short = _provision(shell, tmp_path / "short", STUB_CLUSTERS="seeded-a\tus-central1-a\n")
+    context = (short / ".fleet-context").read_text().splitlines()
+    assert "cluster.a=seeded-a" in context
+    assert not any(line.startswith(("cluster.b=", "cluster.c=")) for line in context)
+
+
+def _state_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "fleet_fixture_state", _REPO / "hack" / "fleet-fixture-state.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_every_catalog_role_declares_its_designed_state():
+    """Presence is not state (#1278). A role with no `state` list would pass
+    the runner's probes while its fixture sat Pending, which is the outage
+    this half of the check exists to catch, so every role asserts something
+    and the assertions parse under the script that evaluates them."""
+    roles = _state_module().load_assertions(_CATALOG)
+    for role, spec in roles.items():
+        assert spec["state"], f"role {role!r} asserts nothing beyond presence"
+
+
+def test_every_state_subject_the_catalog_declares_is_something_the_terraform_plants():
+    """Same standard as the probes: an assertion on an object no apply creates
+    would hold the role drifted forever, and the pool verifier would fail
+    every project."""
+    fleet_dir = _BENCH / "tf" / "fleet"
+    main = (fleet_dir / "main.tf").read_text()
+    seen = 0
+    for role, entry in _catalog()["roles"].items():
+        defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
+        body = main + (defects.read_text() if defects.is_file() else "")
+        for assertion in entry["state"]:
+            subject = assertion["subject"]
+            if subject == "cluster":
+                # The GKE cluster itself, which main.tf declares for every slot
+                # (test_the_catalog_agrees_with_the_terraform_it_sits_beside).
+                continue
+            if "?" in subject:
+                selector = subject.split("?", 1)[1]
+                if not selector:
+                    continue  # `kind?`: every object of the kind, nothing named
+                target = selector.split("=")[-1]
+            else:
+                target = subject.split("/", 1)[1]
+            seen += 1
+            assert re.search(rf'(?:name|app)\s*=\s*"{re.escape(target)}"', body), (
+                f"role {role!r} asserts on {subject!r}, but nothing in main.tf or "
+                f"defects-{entry['cluster_slot']}.tf declares {target!r}"
+            )
+    assert seen, "no role asserts on a named subject; this test is vacuous"
+

@@ -71,6 +71,7 @@ GOOGLE_CHAT_MODE:GOOGLE_CHAT_MODE
 CHAT_TOPIC_NAME:CHAT_TOPIC_NAME
 CHAT_SUB_NAME:CHAT_SUB_NAME
 ALLOWED_USERS:ALLOWED_USERS
+GOOGLE_CHAT_HOME_CHANNEL:GOOGLE_CHAT_HOME_CHANNEL
 SLACK_ENABLED:SLACK_ENABLED
 SLACK_BOT_TOKEN:SLACK_BOT_TOKEN
 SLACK_APP_TOKEN:SLACK_APP_TOKEN
@@ -88,6 +89,8 @@ ENABLE_GVISOR:ENABLE_GVISOR
 USER_PROFILE_ENABLED:USER_PROFILE_ENABLED
 HERMES_DASHBOARD_ENABLED:HERMES_DASHBOARD_ENABLED
 ENABLE_GKE_BACKUP_PLAN:ENABLE_GKE_BACKUP_PLAN
+ENABLE_PUBSUB_PLATFORM:ENABLE_PUBSUB_PLATFORM
+ENABLE_STOCKOUT_INVESTIGATOR:ENABLE_STOCKOUT_INVESTIGATOR
 REGISTRY_PREFIX:REGISTRY_PREFIX
 THIRD_PARTY_REGISTRY_PREFIX:THIRD_PARTY_REGISTRY_PREFIX
 NAMESPACE:AGENT_NAMESPACE
@@ -122,6 +125,8 @@ ENABLE_GVISOR
 MEMORY_PROVIDER
 USER_PROFILE_ENABLED
 ENABLE_GKE_BACKUP_PLAN
+ENABLE_PUBSUB_PLATFORM
+ENABLE_STOCKOUT_INVESTIGATOR
 "
 
 missing=""
@@ -138,7 +143,7 @@ if [ -n "$missing" ]; then
   # One annotation naming every missing variable at once. Failing on the first
   # one costs a full run per variable, and a strict render of an environment
   # that has never been configured is missing every one of them.
-  echo "::error title=Install configuration is incomplete::Set these on the GitHub environment this job binds to:${missing}. Each one is a setting the composition provisions; running without it would apply a default over the value this environment is already installed with, and terraform would plan to destroy the difference. docs/site/src/content/docs/deploy/environment-reconcile.md lists what each one should be."
+  echo "::error title=Install configuration is incomplete::Set these on the GitHub environment this job binds to:${missing}. Each one is a setting the composition provisions; running without it would apply a default over the value this environment is already installed with, and terraform would plan to destroy the difference. docs/environment-reconcile.md lists what each one should be."
   echo "==> Missing install configuration:${missing}" >&2
   exit 1
 fi

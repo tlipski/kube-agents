@@ -20,10 +20,19 @@ umask 0002
 # next container start fixes on its own. Step 5.7 warns on it and lets the agent
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
+readonly OTEL_FLAG_DISABLED="--disabled"
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
+
+# The WAL-to-DELETE conversion (deploy/shared/sqlite_journal_migrate.py). Named here
+# because two places use it: the owner runs it at step 1.7 and a non-owner waits on
+# its --check below the shared-state gate. The PVC copy is the fallback for an image
+# whose /opt/defaults predates the script, and for the tests, which run these steps
+# against a temporary home.
+SQLITE_JOURNAL_MIGRATE_SCRIPT="/opt/defaults/scripts/sqlite_journal_migrate.py"
+[ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] || SQLITE_JOURNAL_MIGRATE_SCRIPT="$TARGET_DIR/scripts/sqlite_journal_migrate.py"
 
 # Pre-export AGENT_BROWSER_EXECUTABLE_PATH before running stage2-hook.sh.
 # Why: Upstream stage2-hook.sh scans for Playwright's Chromium binary and
@@ -33,7 +42,8 @@ export INSTALL_DIR="/opt/hermes"
 # By pre-exporting AGENT_BROWSER_EXECUTABLE_PATH here, stage2-hook.sh detects
 # [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] is false and cleanly skips writing to /run/s6/.
 if [ -z "$AGENT_BROWSER_EXECUTABLE_PATH" ] && [ -d "/opt/hermes/.playwright" ]; then
-    export AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    AGENT_BROWSER_EXECUTABLE_PATH="$(find /opt/hermes/.playwright -type f -executable \( -name 'chrome' -o -name 'chromium' -o -name 'chrome-headless-shell' -o -name 'headless_shell' -o -name 'chromium-browser' \) 2>/dev/null | head -n 1)"
+    export AGENT_BROWSER_EXECUTABLE_PATH
 fi
 
 # 1. Execute upstream container initialization natively (inherits 100% of upstream updates)
@@ -172,7 +182,7 @@ if ! agent_owns_shared_state "$@"; then
     # plain manifest, `docker run`, the kustomize bases, a test harness — a missing
     # config.yaml means nobody is coming to write it, and pausing would turn a fast
     # failure into a two-minute one for no possible gain.
-    if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ ! -f "$TARGET_DIR/config.yaml" ]; then
+    if [ -n "${HERMES_MANAGED_DIR:-}" ]; then
         _wait_secs="${AGENT_SHARED_STATE_WAIT_SECS:-120}"
         # A non-numeric value would make the `-lt` below a shell ERROR, and `set -e` is on
         # — so a typo in a knob for waiting would kill the container outright, which is
@@ -184,16 +194,42 @@ if ! agent_owns_shared_state "$@"; then
                 _wait_secs=120
                 ;;
         esac
-        echo "[ENTRYPOINT] no $TARGET_DIR/config.yaml yet; waiting up to ${_wait_secs}s for the owner to seed it." >&2
-        _waited=0
-        while [ ! -f "$TARGET_DIR/config.yaml" ] && [ "$_waited" -lt "$_wait_secs" ]; do
-            sleep 1
-            _waited=$((_waited + 1))
-        done
-        if [ -f "$TARGET_DIR/config.yaml" ]; then
-            echo "[ENTRYPOINT] $TARGET_DIR/config.yaml appeared after ${_waited}s; continuing." >&2
-        else
-            echo "[ENTRYPOINT] WARN: $TARGET_DIR/config.yaml still absent after ${_wait_secs}s; starting '$*' anyway (it may fail until the owner runs)." >&2
+        if [ ! -f "$TARGET_DIR/config.yaml" ]; then
+            echo "[ENTRYPOINT] no $TARGET_DIR/config.yaml yet; waiting up to ${_wait_secs}s for the owner to seed it." >&2
+            _waited=0
+            while [ ! -f "$TARGET_DIR/config.yaml" ] && [ "$_waited" -lt "$_wait_secs" ]; do
+                sleep 1
+                _waited=$((_waited + 1))
+            done
+            if [ -f "$TARGET_DIR/config.yaml" ]; then
+                echo "[ENTRYPOINT] $TARGET_DIR/config.yaml appeared after ${_waited}s; continuing." >&2
+            else
+                echo "[ENTRYPOINT] WARN: $TARGET_DIR/config.yaml still absent after ${_wait_secs}s; starting '$*' anyway (it may fail until the owner runs)." >&2
+            fi
+        fi
+        # The same bounded wait for the owner's step 1.7, the WAL-to-DELETE conversion.
+        # Unlike the config file, this one is real in the shipped image: the owner
+        # converts the databases in place, and a non-owner that opens one mid-switch
+        # holds exactly the concurrent connection the conversion refuses to run under,
+        # so the two would settle into "left in WAL" on every start. --check exits
+        # non-zero only while the managed scope pins `delete` and a governed header
+        # still reads WAL; every other answer, including a script that cannot read the
+        # config, is "nothing to wait for". Same budget, same proceed-anyway ending.
+        if [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+            _waited=0
+            while ! "$INSTALL_DIR/.venv/bin/python3" "$SQLITE_JOURNAL_MIGRATE_SCRIPT" --check \
+                    --agent-home "$TARGET_DIR" --managed-config "$HERMES_MANAGED_DIR/config.yaml" 2>/dev/null; do
+                if [ "$_waited" -ge "$_wait_secs" ]; then
+                    echo "[ENTRYPOINT] WARN: a database under $TARGET_DIR still reads WAL after ${_wait_secs}s with journal_mode=delete pinned; starting '$*' anyway (the owner converts it at its next start)." >&2
+                    break
+                fi
+                [ "$_waited" -gt 0 ] || echo "[ENTRYPOINT] a database under $TARGET_DIR still reads WAL with journal_mode=delete pinned; waiting up to ${_wait_secs}s for the owner's conversion (step 1.7)." >&2
+                sleep 1
+                _waited=$((_waited + 1))
+            done
+            if [ "$_waited" -gt 0 ] && [ "$_waited" -lt "$_wait_secs" ]; then
+                echo "[ENTRYPOINT] the WAL-to-DELETE conversion finished after ${_waited}s; continuing." >&2
+            fi
         fi
         unset _wait_secs _waited
     fi
@@ -310,7 +346,7 @@ fi
 # built. There is deliberately no env-var override; a bypass switch would be readable to
 # exactly the caller this is meant to be honest with.
 SKILL_PROVENANCE_SCRIPT="/opt/defaults/scripts/verify_skills_provenance.py"
-for _tree in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills; do
+for _tree in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/a2a-template/skills; do
     [ -f "$_tree/skills_manifest.sha256" ] || continue
     if [ ! -f "$SKILL_PROVENANCE_SCRIPT" ] || [ ! -x "$INSTALL_DIR/.venv/bin/python3" ]; then
         echo "FATAL: $_tree carries a build-time manifest but nothing here can check it ($SKILL_PROVENANCE_SCRIPT or $INSTALL_DIR/.venv/bin/python3 is missing); refusing to start" >&2
@@ -377,6 +413,34 @@ if command -v flock >/dev/null 2>&1; then
         # behaviour, so the worst case is no worse than before the lock.
         flock -w 300 9 || echo "WARN: timed out waiting for the $TARGET_DIR bootstrap lock; proceeding concurrently with the peer container" >&2
     fi
+fi
+
+# 1.7 Convert the SQLite databases on this volume out of WAL, once, when the operator
+# has pinned `database.journal_mode: delete` in the managed scope.
+#
+# The operator pins it whenever the agent pod has a runtime class (renderConfigYAML in
+# platformagent_manifests.go): under gVisor the volume is a 9p gofer mount that accepts
+# WAL and then corrupts it, and two databases went that way in three days (#610).
+# Hermes honours the pin for a database it creates, but never downgrades one whose
+# header already reads WAL — apply_wal_with_fallback returns an on-disk WAL database
+# before it consults the setting, because a live downgrade under a concurrent opener
+# destroys committed-but-uncheckpointed frames. So a volume that ran in WAL before the
+# pin, which is every install this was written for, needs one conversion, and it has
+# to happen HERE: after the lock above, so one container does it, and before step 2,
+# because everything below opens a database somewhere (the cron reconcile, the kanban
+# board, the session store). The non-owner's wait below the shared-state gate is the
+# other half: a sidecar holds off opening a database until this has run.
+#
+# The script checkpoints each database with TRUNCATE first and switches only when
+# SQLite reports the switch took. A database another process holds open is left as it
+# is and logged, and the next start retries; nothing here can make a file worse than
+# WAL already left it. Best-effort: the gate is in the script (no pin, no conversion),
+# so an image started without the operator — compose, a plain manifest, the kustomize
+# bases — runs a no-op, and a host without the venv skips the step outright.
+if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+    "$INSTALL_DIR/.venv/bin/python3" "$SQLITE_JOURNAL_MIGRATE_SCRIPT" \
+        --agent-home "$TARGET_DIR" --managed-config "$HERMES_MANAGED_DIR/config.yaml" \
+        || echo "WARN: the WAL-to-DELETE conversion did not finish (exit $?); a database still in WAL is converted at the next start" >&2
 fi
 
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)
@@ -1078,9 +1142,20 @@ fi
 # not exist, and a profile with no skills at all is worse than one with stale
 # ones — `hermes` reports "Unknown skill(s)" and the worker exits 1. So a failure
 # there puts the original back rather than leaving the gap.
+#
+# $3 is an OPTIONAL second source directory, overlaid onto the staged copy
+# before the swap. It exists for the A2A skill (step 2.6a-bis's gate decides
+# whether to pass it), and it goes through here rather than writing into the
+# live directory afterwards for the reason the staging exists at all: a
+# non-staged writer that lands in another replica's swap window recreates
+# $_dst holding only ITS files, which sends the other pod down the
+# "reappeared during the swap" arm below and leaves the shared profile with
+# no real skills at all. Composed here, the whole tree — template plus
+# overlay — is still installed by one rename.
 sync_profile_skills() {
     _src="$1/skills"
     _dst="$2/skills"
+    _overlay="${3:-}"
     [ -d "$_src" ] || return 0
 
     # The staging paths are per POD, and that is load-bearing rather than tidy.
@@ -1103,6 +1178,7 @@ sync_profile_skills() {
     #
     # $_src is NOT shared: it is the read-only image template inside this container,
     # so only the destination side needs this.
+    # shellcheck disable=SC3028 # the next two lines fall back to hostname and $$ where HOSTNAME is unset
     _tag="${HOSTNAME:-}"
     [ -n "$_tag" ] || _tag="$(hostname 2>/dev/null || true)"
     [ -n "$_tag" ] || _tag="$$"
@@ -1142,6 +1218,17 @@ sync_profile_skills() {
         return 0
     fi
 
+    # The optional overlay, onto the staging tree only. A failure here is the
+    # same class as a failed stage: abandon the swap and keep what the profile
+    # already has, rather than installing a half-composed tree.
+    if [ -n "$_overlay" ] && [ -d "$_overlay" ]; then
+        if ! cp -a "$_overlay"/. "$_new"/ 2>/dev/null; then
+            rm -rf "$_new" 2>/dev/null || true
+            echo "WARN: could not stage the $_overlay overlay for $2; the profile keeps its existing copy" >&2
+            return 0
+        fi
+    fi
+
     if [ -e "$_dst" ] && ! mv "$_dst" "$_old" 2>/dev/null; then
         rm -rf "$_new" 2>/dev/null || true
         echo "WARN: could not move the existing skills aside in $2; the profile keeps its existing copy" >&2
@@ -1176,9 +1263,93 @@ sync_profile_skills() {
     rm -rf "$_old" 2>/dev/null || true
     return 0
 }
+# 2.6a-bis The A2A topics skill, overlaid into the platform profile only when
+# this install runs the next stack. The skill ships OUTSIDE the platform
+# template (/opt/a2a-template, see the Dockerfile) so that 2.6a's replace
+# never installs it on a today install: the mode switch's promise is that a
+# normal install cannot tell the feature exists, and a skill file in the
+# template would break it on day one. It rides 2.6a's staging as the overlay
+# argument rather than being copied in afterwards — see the note on $3 — so
+# the composed tree lands in one rename. A flip back to today self-cleans:
+# the next boot stages the template alone and renames that over the profile.
+#
+# The gate asks runtime_mode.py, the one agent-side reader the mode spec
+# allows. The mode rides the managed .env, which Hermes applies at load time
+# — it is NOT in this shell's environment — so the helper hands the managed
+# file to Python and lets runtime_mode read it from there.
+#
+# Parsed as the strict KEY=value lines renderManagedEnv writes, never sourced:
+# `.` in a shell would execute anything a value with a space grew, and this
+# script is pid 1.
+#
+# os.environ is CLEARED first, so the managed file is the only thing that can
+# answer. Without that the inherited container env would be a second delivery
+# path for the mode — an AgentPlugin's spec.env is copied into the container
+# verbatim — and the spec's whole point is that one delivery path means one
+# answer. Clearing also keeps this file from naming the key a third time,
+# which is what the grep rule forbids.
+#
+# Exit meanings: 0 next, 1 today (or no managed scope at all — a compose or
+# `docker run` start, not a fault), 2 the managed scope exists but its .env
+# could not be read or the reader is missing. Only 0 overlays; 2 warns,
+# because on an operator-managed install that is a real fault the skill's
+# silent absence would otherwise hide. Guarded like 2.6a: nothing here ever
+# kills the boot.
+a2a_mode_probe() {
+    [ -n "${HERMES_MANAGED_DIR:-}" ] || return 1
+    "$INSTALL_DIR/.venv/bin/python3" - "$HERMES_MANAGED_DIR/.env" <<'A2A_PYEOF'
+import os, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        lines = f.readlines()
+except OSError:
+    sys.exit(2)
+
+os.environ.clear()
+for line in lines:
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, _, value = line.partition("=")
+    key = key.strip()
+    # An empty key is not a pin and os.environ refuses it; skipping keeps a
+    # malformed line from being reported as an unreadable file.
+    if key:
+        os.environ[key] = value.strip()
+
+try:
+    sys.path.insert(0, "/opt/defaults/scripts")
+    import runtime_mode
+except Exception:
+    # A missing or broken reader is not "today" — it is an image fault, and
+    # exit 2 is what says so instead of a bare traceback read as a decision.
+    sys.exit(2)
+
+sys.exit(0 if runtime_mode.is_next() else 1)
+A2A_PYEOF
+}
+
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
-    sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform"
+    # `|| rc=$?` keeps the non-zero answers out of set -e's reach — "today"
+    # is a return value here, not a failure.
+    a2a_overlay=""
+    if [ -d /opt/a2a-template/skills ]; then
+        a2a_probe_rc=0
+        a2a_mode_probe || a2a_probe_rc=$?
+        case $a2a_probe_rc in
+            0)
+                a2a_overlay=/opt/a2a-template/skills
+                echo "Next stack: overlaying the A2A topics skill into the platform profile"
+                ;;
+            2)
+                echo "WARN: the managed scope has no readable .env; treating the mode as today and skipping the A2A skill overlay" >&2
+                ;;
+        esac
+    fi
+    sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform" "$a2a_overlay"
 fi
+
 # 2.6 (continued), for the cluster profiles: personas from the template, skills through
 # the helper defined just above, and one targeted config repair. Kept after 2.6a only
 # because it is the caller — everything here belongs to 2.6's force-sync, not to it.
@@ -1208,6 +1379,13 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         if [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             "$INSTALL_DIR/.venv/bin/python3" -c "import os, sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {}; m = c.get('memory'); sys.exit(0) if not isinstance(m, dict) or 'provider' not in m else None; m.pop('provider'); t = p.with_name(p.name + '.tmp'); t.write_text(yaml.safe_dump(c)); os.replace(t, p)" "$d/config.yaml" \
                 || echo "WARN: failed to strip memory.provider from $d/config.yaml; this cluster agent keeps an inert provider" >&2
+        fi
+        # Backfill default legacy risk onto any unannotated jobs in this cluster profile's
+        # cron store if one exists on the PVC.
+        if [ -f "$d/cron/jobs.json" ] && [ -w "$d/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
+            HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+                "$SCAFFOLD" --backfill-cron "$d/cron/jobs.json" \
+                || echo "WARN: failed to backfill risk tier in $d/cron/jobs.json" >&2
         fi
     done
 fi
@@ -1401,7 +1579,10 @@ fi
 # Both values come from the operator's env. The endpoint matters because hermes_otel does
 # NOT read OTEL_EXPORTER_OTLP_ENDPOINT — its backend URL is baked into the image, so
 # without this sweep a customer-configured collector would show up in the pod env and in
-# .status.telemetry while every span still went to the GKE managed collector.
+# .status.telemetry while every span still went to the GKE managed collector. Likewise,
+# when telemetry is disabled (OTEL_SDK_DISABLED=true or HERMES_OTEL_ENABLED=false), passing
+# --disabled turns off hermes_otel and clears backends so spans are not exported to an
+# unresolvable default.
 #
 # Every profile carries its own copy of the plugin config (profile_scaffold copytrees
 # /opt/defaults/plugins), so otel_config sweeps them all, deriving each from the pristine
@@ -1415,11 +1596,18 @@ fi
 # this far. The step-1.5 gate now stops that container much earlier; this guard is what
 # keeps a non-primary owner (an HA replica) from repeating the damage.
 if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/otel_config.py" ]; then
+    OTEL_EXTRA_ARGS=""
+    hermes_otel_val=$(printf '%s' "${HERMES_OTEL_ENABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    otel_sdk_val=$(printf '%s' "${OTEL_SDK_DISABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    if [ "$hermes_otel_val" = "false" ] || { [ "$hermes_otel_val" != "true" ] && [ "$otel_sdk_val" = "true" ]; }; then
+        OTEL_EXTRA_ARGS="$OTEL_FLAG_DISABLED"
+    fi
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" "$TARGET_DIR/scripts/otel_config.py" \
         --hermes-home "$TARGET_DIR" \
         --service-name "${OTEL_SERVICE_NAME:-}" \
         --endpoint "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" \
         --defaults-plugins /opt/defaults/plugins \
+        $OTEL_EXTRA_ARGS \
         || echo "WARN: could not update the OpenTelemetry plugin config; traces may go to the image default" >&2
 fi
 
@@ -1432,6 +1620,7 @@ if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plu
     OTEL_CONFIG="$TARGET_DIR/plugins/hermes_otel/config.yaml"
     OTEL_COMPAT_CONFIG="$HOME/.hermes/plugins/hermes_otel/config.yaml"
     mkdir -p "$(dirname "$OTEL_COMPAT_CONFIG")"
+    # shellcheck disable=SC3013 # -ef is implemented by dash and busybox ash, the shells this image runs
     if [ ! "$OTEL_CONFIG" -ef "$OTEL_COMPAT_CONFIG" ]; then
         ln -sf "$OTEL_CONFIG" "$OTEL_COMPAT_CONFIG"
     fi

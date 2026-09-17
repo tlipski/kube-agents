@@ -11,7 +11,7 @@ uv run --project bench pytest -s bench/cuj
 ```
 
 The suite targets the stock `platform-agent` resource created by
-`./install.sh`. Set `CUJ_PROJECT_ID` for scenarios that
+`install.sh`. Set `CUJ_PROJECT_ID` for scenarios that
 need a Google Cloud project. `CUJ_PROFILE`, `CUJ_TIMEOUT`, and
 `CUJ_POLL_INTERVAL` are optional overrides shared by the whole suite.
 Pytest reports every journey independently using its normal test discovery.
@@ -20,9 +20,10 @@ agent to be discoverable and complete a minimal `READY` interaction through the
 same admin portal path.
 Each test starts an API-only portal on an OS-assigned loopback port and uses a
 unique interaction session, so parallel workers do not share ports or sessions.
-Each journey appends its request, every portal interaction response, acceptance
-criteria, milestones, and summary to `interactions.jsonl` in a unique
-`/tmp/kube-agents-<scenario>-*` directory. Backend-independent acceptance
+Each journey appends its request, each change in the portal interaction
+projection (not every poll), acceptance criteria, milestones, and summary to
+`interactions.jsonl` in a unique `/tmp/kube-agents-<scenario>-*` directory,
+beside a readable `conversation.txt` shaped like the portal's Chat tab. Backend-independent acceptance
 criteria determine the pytest result. Backend-specific milestones report
 diagnostic progress but do not pass or fail the test. Both report the required
 proof and observed evidence.

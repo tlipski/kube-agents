@@ -21,6 +21,7 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import findings_queue
 
 # Configure logging
 logging.basicConfig(
@@ -448,10 +449,14 @@ def init_db() -> None:
                 )
                 """
             )
+            findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
 
 
 def cleanup_old_records(conn: sqlite3.Connection) -> None:
+    # `findings` and `queue_publications` are deliberately absent: a backlog
+    # with a TTL is not a backlog, and a `dismissed` row that ages out is one
+    # the next sweep re-offers. Their lifecycle is `state`, not age.
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
@@ -1097,6 +1102,17 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     the delegation to that persona is what makes the citation unresolvable for
     the agent being asked to obey it.
 
+    The **Done when** line is the card's acceptance criterion, stated apart from
+    the template on purpose. `_build_agent_query` rule 4 keeps triage cards out
+    of goal mode; this line is the fallback if one is graded anyway. Hermes's
+    `judge_goal` grades the worker's `summary` (falling back to `result`)
+    against title + body, so the line asks for the three facts in `summary`
+    too: a body that says what done means, answered by a summary that states
+    it, can be satisfied where a body that only says what the report looks like
+    cannot (#656). It is deliberately not a ``##`` heading, for the
+    three-section rule above, and it sits outside the ``## What to do`` → 🔗
+    span that the bench delivery contract slices.
+
     The report ends by inviting the reader to reply ``apply``, and something
     honours it. The agent that acts on such a reply reads the report back from
     the ``incidents`` table through the ``incident_context`` plugin, and the row
@@ -1166,6 +1182,11 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where the "
         f"alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` delivers "
         f"one line to the person waiting for the diagnosis.\n\n"
+        f"**Done when:** the root cause is named with the evidence that proves it; at least one GitOps remediation option is proposed, "
+        f"or the report says explicitly that no manifest change is warranted and why; and the whole report is recorded with `kanban_complete`. "
+        f"Nothing else is a condition of finishing. The shape below is how to present that work, not a fourth requirement: "
+        f"once you have those three things, complete the card — never `kanban_block` over formatting. "
+        f"State those three things in `summary`'s one line as well: a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list.\n\n"
@@ -1221,6 +1242,16 @@ def _build_agent_query(payload: Dict[str, Any]) -> str:
     Nothing about where the answer goes travels through this text. The card the
     front door files inherits the alert's chat route from the session it is
     filed in, so a paraphrase can cost the report's shape but not its address.
+
+    The fourth rule exists because on 2026-08-12 the front door set
+    `goal_mode=true` on its own (card t_0a43cf9c, #656). Nothing asked for it;
+    the tool's default is false. A goal-mode card is graded by Hermes's
+    `judge_goal` against its title and body before `kanban_complete` is allowed
+    through, and this body is a shape rather than a criterion, so the worker's
+    only exit once the judge rejected its report was a sticky `needs_input`
+    block with `result = NULL`. The rule is stated here, where the router reads
+    its instructions, rather than in the persona, because the persona is what
+    the router had when it improvised.
     """
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
@@ -1235,8 +1266,9 @@ def _build_agent_query(payload: Dict[str, Any]) -> str:
         f"- `assignee`: the `cluster-*` agent scoped to **{cluster_name}** — take its exact name from your "
         f"`[SPECIALIST AGENTS AVAILABLE NOW]` block, and call `list_agents` once to refresh if none is listed for that cluster.\n"
         f"- `title`: `Triage {namespace}/{object_kind}/{object_name} ({event_reason}) on {cluster_name}`\n"
-        f"- `body`: everything between the two markers below, **copied verbatim**.\n\n"
-        f"Three rules, and they are why this text spells the call out:\n\n"
+        f"- `body`: everything between the two markers below, **copied verbatim**.\n"
+        f"- `goal_mode`: leave it unset (it defaults to false). Rule 4 says why.\n\n"
+        f"Four rules, and they are why this text spells the call out:\n\n"
         f"1. **Copy the body exactly.** Do not summarise it, shorten it, reformat it, or restate it in your own words. "
         f"It carries the report format and the delivery instruction the diagnosis depends on, and on 2026-08-17 a "
         f"paraphrase dropped both.\n"
@@ -1245,7 +1277,11 @@ def _build_agent_query(payload: Dict[str, Any]) -> str:
         f"`list_agents` refresh.\n"
         f"3. **Do nothing else.** Do not diagnose the event, do not post anything to chat, and do not file a second card to "
         f"have someone else deliver the answer. Completing the card is the delivery: this one is subscribed to the thread "
-        f"the alert was posted in, and the report reaches the user from there.\n\n"
+        f"the alert was posted in, and the report reaches the user from there.\n"
+        f"4. **Leave `goal_mode` off.** A goal-mode card is graded by an auxiliary judge against its title and body before "
+        f"`kanban_complete` is allowed through, and this body is a presentation template, not a checklist a judge can tick: "
+        f"a worker whose finished report the judge rejects cannot complete the card and has only `kanban_block` left, which "
+        f"parks the report unread for good (#656).\n\n"
         f"--- BEGIN TASK BODY (copy verbatim) ---\n"
         f"{_triage_task_body(payload)}\n"
         f"--- END TASK BODY ---"
@@ -2374,6 +2410,123 @@ def get_alert_quota(day: str = "") -> Dict[str, Any]:
         if limit > 0
     }
     return {"day": day, "severities": severities}
+
+
+# --------------------------------------------------------------------------
+# The findings queue: docs/designs/inventory-findings-queue.md §6.1.
+#
+# HTTP rather than MCP tools alone because the event watcher is a first-class
+# writer (§5.1) and it is Go. `findings_queue` holds the schema, the rubric and
+# the ordering; these routes are the transport, and the MCP tools in
+# platform_mcp_server.py are a wrapper over them.
+# --------------------------------------------------------------------------
+
+
+def _findings_write(operation, *args, **kwargs) -> Any:
+    """Run one queue operation in a transaction, mapping its errors to status."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+            # BEGIN IMMEDIATE, as the alert ceiling above does and for the same
+            # reason: every operation here reads a row before deciding what to
+            # write. Under a deferred transaction two sources registering the
+            # same finding both read "absent" and both INSERT, and the loser's
+            # entire batch dies on the UNIQUE constraint.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = operation(conn, *args, **kwargs)
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+            return result
+    except findings_queue.FindingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except findings_queue.FindingNotFound as exc:
+        raise HTTPException(status_code=404, detail=f"no finding {exc.args[0]!r}") from None
+    except sqlite3.OperationalError as exc:
+        # `database is locked`, once the 5s budget is spent. Retryable, and 503
+        # says so; a 500 would tell the caller its payload was the problem.
+        raise HTTPException(status_code=503, detail=f"the findings queue is busy: {exc}") from None
+
+
+@app.post("/v1/findings", dependencies=[Depends(verify_api_key)])
+def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Upsert a batch of findings under §5.2's per-state rules.
+
+    `scope` is how a source says its run was complete for one cluster, which is
+    the only condition under which absence may lower a row's confidence. A
+    partial run must omit it: a sweep that died halfway looks exactly like a
+    fleet that got healthier.
+    """
+    return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
+
+
+@app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])
+def get_ranked_findings() -> Dict[str, Any]:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        return {"findings": findings_queue.ranked_findings(conn)}
+
+
+@app.get("/v1/findings", dependencies=[Depends(verify_api_key)])
+def get_findings(
+    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = ""
+) -> Dict[str, Any]:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            findings = findings_queue.list_findings(conn, cluster, state, severity, limit, project)
+    except findings_queue.FindingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"findings": findings}
+
+
+@app.post("/v1/findings/{finding_id}/surfaced", dependencies=[Depends(verify_api_key)])
+def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    body = body or {}
+    return _findings_write(
+        findings_queue.mark_surfaced,
+        finding_id,
+        str(body.get("chat_id") or ""),
+        str(body.get("thread_id") or ""),
+    )
+
+
+@app.patch("/v1/findings/{finding_id}", dependencies=[Depends(verify_api_key)])
+def patch_finding(finding_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """The three human transitions (§3.2), the early end of a snooze, and PR reconciliation."""
+    return _findings_write(findings_queue.patch_finding, finding_id, body)
+
+
+@app.post("/v1/findings/expire-snoozes", dependencies=[Depends(verify_api_key)])
+def expire_finding_snoozes() -> Dict[str, Any]:
+    """Return every finding whose `snoozed_until` has lapsed to `surfaced` (§3.2)."""
+    return {"expired": _findings_write(findings_queue.expire_snoozes)}
+
+
+@app.post("/v1/findings/{finding_id}/verified", dependencies=[Depends(verify_api_key)])
+def record_finding_verification(finding_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """§7.4's three outcomes: still_failing, resolved, unverifiable."""
+    return _findings_write(
+        findings_queue.record_verification,
+        finding_id,
+        str(body.get("outcome") or ""),
+        str(body.get("observed") or ""),
+        body.get("rubric"),
+        bool(body.get("object_missing")),
+    )
+
+
+@app.get("/v1/findings/publication/{publisher}", dependencies=[Depends(verify_api_key)])
+def get_queue_publication(publisher: str) -> Dict[str, Any]:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        row = findings_queue.get_publication(conn, publisher)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"no publication row for {publisher!r}")
+    return row
+
+
+@app.put("/v1/findings/publication/{publisher}", dependencies=[Depends(verify_api_key)])
+def put_queue_publication(publisher: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    return _findings_write(findings_queue.put_publication, publisher, body)
 
 
 init_db()

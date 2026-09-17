@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS.
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt.
 #
 # Domain: cluster debugging. Journey: the RCA has to be backed by what the
 # agent actually observed, not by a plausible label.
@@ -86,6 +86,9 @@ validated: false
 
 # Slug per docs/designs/domains.yaml.
 domain: cluster-debugging
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
 
 # Fixture roles from bench/tf/fleet/fixtures.json; the design is in
 # docs/designs/bench-fleet-catalog.md. Named by role, never by cluster name or

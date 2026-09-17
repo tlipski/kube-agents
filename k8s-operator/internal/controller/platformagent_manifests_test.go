@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -169,6 +170,53 @@ func TestBuildConfigMap(t *testing.T) {
 	for _, forbidden := range []string{"platform_control", "agent_common", "hermes-api-server", "hermes-cli"} {
 		if strings.Contains(yamlContent, forbidden) {
 			t.Errorf("default (chat) profile must not contain %q, got:\n%s", forbidden, yamlContent)
+		}
+	}
+}
+
+// The SQLite journal mode follows the agent pod's runtime class (#610). Under
+// gVisor the data volume is a 9p gofer mount that accepts WAL and then corrupts
+// it, and Hermes' own DELETE fallback never fires there. The leaf is rendered
+// into the managed scope because it is machine-global by nature — every
+// profile's state.db and the shared kanban.db sit on the same mount — and it is
+// rendered ONLY under a runtime class, so a default install's managed config
+// stays byte-identical and its databases stay in WAL.
+func TestManagedConfigPinsJournalModeUnderARuntimeClass(t *testing.T) {
+	withRuntimeClass := newTestPlatformAgent()
+	withRuntimeClass.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
+	}
+	var cfg map[string]any
+	if err := yaml.Unmarshal([]byte(buildConfigMapData(withRuntimeClass, nil)[managedConfigKey]), &cfg); err != nil {
+		t.Fatalf("managed config does not parse as YAML: %v", err)
+	}
+	database, _ := cfg["database"].(map[string]any)
+	if got := database["journal_mode"]; got != "delete" {
+		t.Errorf("runtimeClassName gvisor: database.journal_mode = %v, want delete; the pod's "+
+			"SQLite stays in WAL on a gofer mount", got)
+	}
+
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"no deployment spec": newTestPlatformAgent(),
+		"availability without a runtime class": func() *agentv1alpha1.PlatformAgent {
+			a := newTestPlatformAgent()
+			a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(1))},
+			}
+			return a
+		}(),
+		"an empty runtime class": func() *agentv1alpha1.PlatformAgent {
+			a := newTestPlatformAgent()
+			a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("")},
+			}
+			return a
+		}(),
+	} {
+		if content := buildConfigMapData(agent, nil)[managedConfigKey]; strings.Contains(content, "database:") ||
+			strings.Contains(content, "journal_mode") {
+			t.Errorf("%s: the managed config pins a journal mode, so a default install's "+
+				"databases leave WAL for no reason:\n%s", name, content)
 		}
 	}
 }
@@ -489,8 +537,8 @@ func TestBuildDeployment(t *testing.T) {
 				t.Errorf("dashboard readiness probe must not use curl --fail: any HTTP response proves the listener is up, got %q", cmd)
 			}
 		}
-		if len(dashboardC.Env) != 6 {
-			t.Errorf("expected 6 env vars on dashboard container, got %d", len(dashboardC.Env))
+		if len(dashboardC.Env) != 7 {
+			t.Errorf("expected 7 env vars on dashboard container, got %d", len(dashboardC.Env))
 		} else {
 			dashboardEnvMap := make(map[string]corev1.EnvVar)
 			for _, env := range dashboardC.Env {
@@ -863,8 +911,8 @@ func TestBuildDeployment(t *testing.T) {
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}
-	if fbContainer.Image != "fluent/fluent-bit:5.1.1" {
-		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.1, got %s", fbContainer.Image)
+	if fbContainer.Image != "fluent/fluent-bit:5.1.2" {
+		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.2, got %s", fbContainer.Image)
 	}
 	if fbContainer.SecurityContext == nil || fbContainer.SecurityContext.ReadOnlyRootFilesystem == nil || !*fbContainer.SecurityContext.ReadOnlyRootFilesystem {
 		t.Errorf("expected SecurityContext.ReadOnlyRootFilesystem true on fluent-bit container")
@@ -1128,6 +1176,18 @@ func TestSafeSandboxEnvOverridesPassesOtelSdkDisabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
+	// HERMES_OTEL_ENABLED is the specific knob controlling the hermes_otel
+	// plugin trace exporter. On the allowlist it lets operators disable or
+	// force-enable agent span telemetry via CR spec.deployment.env (#933).
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "HERMES_OTEL_ENABLED", Value: "false"},
+	})
+	if len(got) != 1 || got[0].Name != "HERMES_OTEL_ENABLED" || got[0].Value != "false" {
+		t.Fatalf("expected HERMES_OTEL_ENABLED to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without
@@ -1286,6 +1346,100 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	}
 }
 
+// TestCredentialProxyOutputCapClearsTheLargestFleetDump pins the output cap the
+// credential proxy runs with. Every command an agent issues arrives through this
+// proxy, so the cap bounds a cluster dump; at the proxy's own 4 MiB default the
+// fleet-audit workload dump for kube-agents-host measured 3,866,719 bytes, 92%
+// of the way there, and crossing it truncates the JSON mid-string and drops
+// that cluster out of compliance-audit and ai-security-audit.
+//
+// The name is on mergeCredentialProxyEnv's reserved list, so the second half
+// matters as much as the first: setting it here is the only way it gets set at
+// all, and a value in spec.deployment.env cannot raise or lower it.
+func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Env: []corev1.EnvVar{
+						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
+						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
+					},
+				},
+			},
+		},
+	}
+
+	proxy := buildCredentialProxyContainer(agent)
+	env := make(map[string]string)
+	for _, item := range proxy.Env {
+		env[item.Name] = item.Value
+	}
+
+	// Without this the override half of the test is vacuous: a spec env list
+	// that never reaches the merge would also produce the operator's value.
+	if env["UNRESERVED_PASSENGER"] != "arrived" {
+		t.Fatalf("spec.deployment.env never reached the proxy container, so the override below proves nothing")
+	}
+
+	const want = "8388608" // 8 MiB
+	if got := env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"]; got != want {
+		t.Errorf("expected the proxy output cap %s, got %q — a CR override must not reach it", want, got)
+	}
+	// The measured worst case, so a future reduction of the cap has to argue
+	// with the number rather than pass silently.
+	const largestObservedDump = 3866719
+	capBytes, err := strconv.Atoi(env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"])
+	if err != nil {
+		t.Fatalf("proxy output cap is not an integer: %v", err)
+	}
+	if capBytes <= largestObservedDump {
+		t.Errorf("proxy output cap %d does not clear the largest observed dump %d", capBytes, largestObservedDump)
+	}
+
+	// The other half of the argument, which the floor above cannot make: a cap
+	// this side of the fleet's needs is still wrong if the container cannot
+	// hold it. Five live copies of a capped output exist per in-flight command
+	// -- subprocess bytes, slice, decoded str, JSON-escaped str, encoded
+	// response -- and the commands in flight are one per kanban worker plus
+	// the front-door session. Nothing bounds that concurrency inside the
+	// proxy; it is a ThreadingHTTPServer. So the burst has to fit under the
+	// memory limit alongside what the container holds at rest, or an OOMKill
+	// takes gcloud, kubectl, gh and git away from every agent the proxy serves.
+	//
+	// Five workers rather than defaultKanbanMaxInProgress, because that
+	// default is overridable and resolveResources sizes the agent container
+	// for the five-way fan-out it has actually observed. The proxy is sized
+	// for the same install.
+	//
+	// And two capped streams per command, not one. `_execute` truncates stdout
+	// and stderr in two independent calls -- see the pair of `self._truncate`
+	// lines in credential_proxy.py -- so the cap is a per-stream ceiling and a
+	// single command can hold 2x it. Modelling one stream understates the
+	// burst by half, which is the direction that lets a too-large cap pass.
+	//
+	// The resting footprint is the container's own memory request rather than
+	// a measured constant: the ~250Mi the old sidecar held steady was mostly
+	// the event watcher's informer caches, which stayed in the gateway Pod
+	// when #913 moved the proxy out, and the request is upstream's statement
+	// of what this pod holds with nothing in flight.
+	const copiesPerCommand = 5
+	const streamsPerCommand = 2
+	const observedFanOut = 5
+	inFlight := int64(observedFanOut + 1)
+	burst := int64(capBytes) * copiesPerCommand * streamsPerCommand * inFlight
+	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
+	if steadyStateBytes == 0 {
+		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
+	}
+	limit := proxy.Resources.Limits.Memory().Value()
+	if burst+steadyStateBytes > limit {
+		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands, which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit or lower the cap",
+			capBytes, burst, inFlight, limit, steadyStateBytes)
+	}
+}
+
 // TestBuildPodTemplateSpecHoldsNoCredentialRuntime covers the Pod-level half of
 // the credential boundary: no container of the gateway Pod runs the credential
 // runtime, and every container in it runs as the same unprivileged user.
@@ -1327,9 +1481,12 @@ func TestBuildPodTemplateSpecHoldsNoCredentialRuntime(t *testing.T) {
 		if container.Name == "envoy-credential-proxy" {
 			t.Error("the credential runtime is back in the gateway Pod, where the agent shares its network namespace")
 		}
-		user := podSC.RunAsUser
-		if container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
-			user = container.SecurityContext.RunAsUser
+		// The pod default unless the container overrides it, which is the
+		// kubelet's own rule; see effectiveRunAsUser.
+		user := effectiveRunAsUser(spec, container)
+		if user == nil {
+			t.Errorf("expected container %s to run as the sandbox UID %d, got no runAsUser at either level", container.Name, sandboxUID)
+			continue
 		}
 		if *user != sandboxUID {
 			t.Errorf("expected container %s to run as the sandbox UID %d, got %d", container.Name, sandboxUID, *user)
@@ -1354,20 +1511,37 @@ func TestBuildPodTemplateSpecHoldsNoCredentialRuntime(t *testing.T) {
 //
 // Dashboard-disabled is deliberately absent: TestBuildDeployment_DashboardDisabled
 // already asserts it, and a second copy would only look like coverage.
+//
+// mode: next is the shape the field is actually load-bearing on, and it had no
+// case here until the bus surface landed: that render puts NATS_PASSWORD on the
+// agent container by SecretKeyRef, so sharing the namespace publishes the bus
+// credential through /proc/<pid>/environ to every other container in the Pod,
+// spec.deployment.sidecars entries included. The case carries a non-vacuity
+// check for exactly that reason -- an assertion that the process namespace is
+// unshared on a Pod that turns out to hold no credential proves nothing, so the
+// subtest fails if the credential it is guarding is not there.
 func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
 	stock := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 	}
 
 	for _, testCase := range []struct {
-		name  string
-		agent *agentv1alpha1.PlatformAgent
+		name string
+		// credentialed marks the shapes whose agent container carries the A2A
+		// bus password; on those the subtest first proves the credential is
+		// present, so the assertion below cannot pass by its absence.
+		credentialed bool
+		agent        *agentv1alpha1.PlatformAgent
 	}{
-		{"no harness configuration at all", stock},
-		{"broker in its own Pod", brokerPodAgent()},
+		{"no harness configuration at all", false, stock},
+		{"broker in its own Pod", false, brokerPodAgent()},
+		{"mode: next, where the agent container holds the bus credential", true, a2aTestAgent()},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			spec := buildPodTemplateSpec(testCase.agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true}).Spec
+			if testCase.credentialed {
+				assertAgentContainerHoldsBusCredential(t, spec)
+			}
 			if spec.ShareProcessNamespace != nil {
 				t.Errorf("a shared process namespace puts the credential holder's /proc/<pid>/environ "+
 					"inside a directory the sandbox can read; got shareProcessNamespace=%v",
@@ -1375,6 +1549,33 @@ func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertAgentContainerHoldsBusCredential fails unless the platform-agent
+// container carries NATS_PASSWORD as a SecretKeyRef. It is the non-vacuity
+// guard for the credentialed rows above: were the bus surface to stop
+// rendering, or move to another container, those rows would keep passing while
+// asserting nothing, and the comment in buildPodTemplateSpec that tells the
+// next author why ShareProcessNamespace stays unset would lose its test.
+func assertAgentContainerHoldsBusCredential(t *testing.T, spec corev1.PodSpec) {
+	t.Helper()
+	for _, container := range spec.Containers {
+		if container.Name != "platform-agent" {
+			continue
+		}
+		for _, env := range container.Env {
+			if env.Name != "NATS_PASSWORD" {
+				continue
+			}
+			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
+				t.Fatalf("NATS_PASSWORD is not a SecretKeyRef (%+v); the literal must never render into the pod spec", env)
+			}
+			return
+		}
+		t.Fatal("no NATS_PASSWORD on the platform-agent container: this shape holds no bus credential, " +
+			"so the shared-process-namespace assertion beside this one would pass vacuously")
+	}
+	t.Fatal("no platform-agent container in the pod template")
 }
 
 func TestResolveCredentialProxyImagePreservesTag(t *testing.T) {
@@ -1427,10 +1628,10 @@ func TestImageEnvOverrides(t *testing.T) {
 }
 
 func TestFluentBitImageEnvOverride(t *testing.T) {
-	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.1" {
+	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.2" {
 		t.Fatalf("unexpected default fluent-bit image: %s", got)
 	}
-	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.1")
+	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.2")
 
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
@@ -1440,7 +1641,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		if c.Name == "fluent-bit" {
 			found = true
-			if c.Image != "registry.corp/mirror/fluent-bit:5.1.1" {
+			if c.Image != "registry.corp/mirror/fluent-bit:5.1.2" {
 				t.Fatalf("expected FLUENT_BIT_IMAGE override on sidecar, got %s", c.Image)
 			}
 		}
@@ -1459,7 +1660,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 func TestNoPublicRegistryWhenMirrored(t *testing.T) {
 	const mirror = "registry.corp/mirror"
 	t.Setenv("PLATFORM_AGENT_IMAGE", mirror+"/platform-agent:v1.2.3")
-	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.1")
+	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.2")
 	// CREDENTIAL_PROXY_IMAGE deliberately left unset: the sidecar must derive
 	// its registry from PLATFORM_AGENT_IMAGE, not fall back to ghcr.io.
 
@@ -3084,10 +3285,14 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// loopback bearer, which is not conditional on anything; see the next test.
+	// three unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, and the mode switch.
 	bare := renderManagedEnv(newTestPlatformAgent())
-	if got, want := bare, "API_SERVER_KEY="+loopbackAgentAPIKey+"\n"+kubeagentsModeEnvKey+"=today\n"; got != want {
-		t.Errorf("renderManagedEnv with no integration = %q, want %q", got, want)
+	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
+		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
+		kubeagentsModeEnvKey + "=today\n"
+	if bare != want {
+		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
 }
 
@@ -3235,6 +3440,85 @@ func TestDashboardLoadsTheSameConfigAsTheGateway(t *testing.T) {
 	}
 }
 
+// TestHermesHomeModeGrantsGroupAccessOnTheDataVolume pins the mode Hermes re-applies to
+// $HERMES_HOME on every process start. Without HERMES_HOME_MODE it defaults to 0700, and
+// a cron or kanban worker runs with $HERMES_HOME set to profiles/platform — so 0700 locks
+// every other uid on the data volume out of the profile. The case that found it was the
+// credential proxy, back when it ran in this Pod as uid 10001 and got EACCES filing a
+// kubeconfig under the profile; #913 moved it to a Pod of its own, and what remains on
+// the volume is the dashboard container running Hermes against the same directories and
+// any container the CR supplies under spec.deployment.sidecars with a runAsUser of its
+// own (platformagent_data_volume_uid_test.go). The comment on the env var in
+// platformagent_manifests.go is the full account.
+//
+// The assertion is on the permission bits rather than the literal string: what a second
+// uid in gid 10000 needs is group write (mkdir on the parent) plus group execute
+// (traverse), and a future mode that keeps the string plausible while dropping either
+// would reintroduce the lockout. Group read is asserted too — a writer stats what it
+// filed.
+func TestHermesHomeModeGrantsGroupAccessOnTheDataVolume(t *testing.T) {
+	dep := buildDeployment(haAgent("mode-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+	gateway := containerNamed(t, dep, "platform-agent")
+
+	raw, found := envValue(gateway, "HERMES_HOME_MODE")
+	if !found {
+		t.Fatalf("no HERMES_HOME_MODE on the gateway; hermes falls back to 0700 and locks every " +
+			"other uid on the data volume out of profiles/platform")
+	}
+	mode, err := strconv.ParseInt(raw, 8, 32)
+	if err != nil {
+		t.Fatalf("HERMES_HOME_MODE = %q, which hermes parses as octal and this does not: %v", raw, err)
+	}
+	for _, bit := range []struct {
+		mask int64
+		what string
+		why  string
+	}{
+		{0o070, "group rwx", "a second uid in gid 10000 on the data volume must traverse into " +
+			"$HERMES_HOME and create directories inside it"},
+		{0o700, "owner rwx", "the agent itself owns these directories and must keep full access"},
+	} {
+		if mode&bit.mask != bit.mask {
+			t.Errorf("HERMES_HOME_MODE = %q lacks %s (%04o & %03o = %03o); %s",
+				raw, bit.what, mode, bit.mask, mode&bit.mask, bit.why)
+		}
+	}
+	if mode&0o007 != 0 {
+		t.Errorf("HERMES_HOME_MODE = %q grants `other` %03o, but no uid on this volume reaches it "+
+			"— both containers that mount the PVC are in gid 10000", raw, mode&0o007)
+	}
+	// Setgid is the half of this the permission bits above cannot see. Group rwx lets the
+	// proxy mkdir inside $HERMES_HOME; setgid is what makes the directory it creates carry
+	// gid 10000 rather than the creating process's own primary group, so the *next* writer
+	// still gets in. 0770 passes every assertion above and loses that on the second hop.
+	if mode&0o2000 == 0 {
+		t.Errorf("HERMES_HOME_MODE = %q has no setgid bit; directories the credential proxy "+
+			"creates under $HERMES_HOME would not inherit gid 10000 and the agent could not "+
+			"write into them", raw)
+	}
+
+	// The dashboard runs hermes against the same directories. A different mode there means
+	// the two containers re-chmod the PVC out from under each other on every start.
+	dash := containerNamed(t, dep, "platform-agent-dashboard")
+	if dashMode, ok := envValue(dash, "HERMES_HOME_MODE"); !ok || dashMode != raw {
+		t.Errorf("HERMES_HOME_MODE = %q on the dashboard but %q on the gateway (found=%v); both run "+
+			"hermes against the same PVC, so they must agree", dashMode, raw, ok)
+	}
+
+	// Container.Env is the LOWEST of the three layers hermes reads — the managed .env
+	// beats the PVC .env beats the process environment — so the two assertions above
+	// establish the operator's intent and not the outcome. One `HERMES_HOME_MODE=0777`
+	// line in $HERMES_HOME/.env outranks them, the agent can write that line, and
+	// sandbox-credential-cleanup does not remove it, so it survives upgrades. Every
+	// directory hermes secures on the shared PVC widens and the pod stays green.
+	// The pin in renderManagedEnv is what makes the mode above the value that holds.
+	managed := renderManagedEnv(newTestPlatformAgent())
+	if !strings.Contains(managed, "HERMES_HOME_MODE="+raw+"\n") {
+		t.Errorf("HERMES_HOME_MODE is %q in the container env but not pinned in the managed .env:\n%s",
+			raw, managed)
+	}
+}
+
 func TestRWOStoragePerReplica(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3299,8 +3583,10 @@ func TestBuildPlatformLeaderRole(t *testing.T) {
 	if role.Name != "kubeagents:leader:test-ns:test-agent" || role.Namespace != "test-ns" {
 		t.Errorf("expected role name kubeagents:leader:test-ns:test-agent and namespace test-ns, got name %s ns %s", role.Name, role.Namespace)
 	}
-	if len(role.Rules) != 2 || role.Rules[0].Resources[0] != "leases" || role.Rules[1].Resources[0] != "pods" {
-		t.Errorf("expected rules for leases and pods, got %v", role.Rules)
+	// This agent names no Deployment, so it resolves to one replica and leader
+	// election never runs. Leases only -- see TestLeaderRolePodsRuleTracksLeaderElectionArming.
+	if len(role.Rules) != 1 || role.Rules[0].Resources[0] != "leases" {
+		t.Errorf("expected a leases-only rule set at one replica, got %v", role.Rules)
 	}
 
 	rb := buildLeaderRoleBinding(agent, role.Name, role.Name)
@@ -3711,6 +3997,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 				{Name: "PATH", Value: "/tmp/hijacked/bin:/usr/bin"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
+				{Name: "HERMES_HOME_MODE", Value: "0777"},
 			},
 		},
 	}
@@ -3749,8 +4036,8 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	}
 
 	// AGENT_SHARED_STATE_SETUP is operator-owned for the same reason and by the same
-	// means — appended after the plugin merge, so the kubelet's last-wins resolution
-	// lands on the operator's value. A plugin that could set it to `skip` would switch
+	// means — appended after the plugin merge, so lastWinsEnv's collapse lands on the
+	// operator's value. A plugin that could set it to `skip` would switch
 	// off the entrypoint's shared-state setup for the whole agent, and the resulting
 	// unpopulated $HERMES_HOME surfaces nowhere near the plugin that caused it.
 	if env["AGENT_SHARED_STATE_SETUP"] != "owner" {
@@ -3766,8 +4053,142 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 		t.Errorf("plugin must not be able to override HERMES_MANAGED_DIR, got %q",
 			env["HERMES_MANAGED_DIR"])
 	}
+	// HERMES_HOME_MODE is operator-owned by the same means. An arbitrary value reaches
+	// every directory hermes secures on the shared PVC — 0777 would open the agent's
+	// sessions, memories and logs to anything else that mounts it — and nothing about the
+	// widened tree surfaces as an unhealthy pod.
+	//
+	// A plugin is not the only writer that can reach this name, and this assertion covers
+	// only the plugin. The PVC .env outranks Container.Env whatever a plugin does, which
+	// is why the value is pinned in renderManagedEnv too; see the tail of
+	// TestHermesHomeModeGrantsGroupAccessOnTheDataVolume.
+	if env["HERMES_HOME_MODE"] != hermesHomeMode {
+		t.Errorf("plugin must not be able to override HERMES_HOME_MODE, got %q",
+			env["HERMES_HOME_MODE"])
+	}
 	if counts["SESSION_KV_DB_PATH"] != 1 {
 		t.Errorf("expected SESSION_KV_DB_PATH exactly once, got %d occurrences", counts["SESSION_KV_DB_PATH"])
+	}
+	// The four assertions above read the env as a map, so they pass whether the operator
+	// won by replacing the plugin's entry or by appending a second one the kubelet would
+	// collapse. Those are not the same outcome. `Container.Env` carries
+	// `patchMergeKey=name` and the controller applies server-side, so a second entry is
+	// refused by the API server -- ".spec.template.spec.containers[name=\"platform-agent\"]
+	// .env: duplicate entries for key" -- and the Deployment never reconciles at all.
+	// Count each one; the map read cannot see the failure it is asserting against.
+	for _, name := range []string{
+		"CREDENTIAL_PROXY_URL",
+		"AGENT_SHARED_STATE_SETUP",
+		"HERMES_MANAGED_DIR",
+		"HERMES_HOME_MODE",
+	} {
+		if counts[name] != 1 {
+			t.Errorf("expected %s exactly once, got %d occurrences; a repeated env name is "+
+				"rejected by server-side apply, so this stalls the gateway rather than "+
+				"letting the operator's value win", name, counts[name])
+		}
+	}
+}
+
+// allContainers is every container the API server validates env on, which is not
+// `Spec.Containers`: the agent-api-auth sidecar is a *native sidecar* — a normal
+// container with RestartPolicy: Always, which Kubernetes requires be declared in
+// `Spec.InitContainers` — so a test that walks only `Spec.Containers` cannot see it.
+// The credential proxy is not in this Pod at all since #913; its env is merged by
+// `mergeCredentialProxyEnv` in credential_proxy_manifests.go and is outside this
+// property.
+func allContainers(spec corev1.PodSpec) []corev1.Container {
+	return append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...)
+}
+
+// TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets is the general form of
+// the four-name count loop above, and the reason it is separate: that list has to be
+// maintained and this one cannot go stale. Every variable the operator sets in the
+// baseline is overridden here, so a new operator-owned name added after this is
+// written is covered the day it is added. It walks init containers too — see
+// allContainers — so the native sidecar is inside the property rather than beside it.
+// The credential proxy's own Pod is not: `buildCredentialProxyEnv` merges
+// `agent.Spec.Deployment.Env` through `mergeCredentialProxyEnv`, and a name its
+// federation env appends afterwards is not collapsed by anything here.
+//
+// Two inputs, because the two merges take different ones. A plugin's `spec.env` reaches
+// `mergeEnvVars`; `Spec.Deployment.Env` reaches the operator's own merge. Driving the
+// plugin alone left the second path ungraded, so `Spec.Deployment.Env` carries the same
+// override set.
+//
+// The gap is real and the reserved list is what stands in it: `buildCredentialProxyEnv`
+// appends CREDENTIAL_PROXY_WORKSPACE_ROOT, EVENT_WATCHER_CLUSTER_NAME and
+// EVENT_WATCHER_ENABLED *after* the merge runs, and only a hand-maintained list keeps a
+// CR that names one of them from producing a duplicate — which is exactly the "list that
+// has to be maintained" this test exists to replace.
+//
+// The property is not "the operator wins" — the test above covers that for the names
+// where it matters. It is that no name appears twice at all. `Container.Env` carries
+// patchMergeKey=name and the controller applies server-side, so the API server refuses
+// a duplicate outright and the gateway stops reconciling; the pod keeps running the
+// spec it already had, which is why the failure reads as "my change did nothing"
+// rather than as an error.
+func TestBuildPodTemplateSpec_NoEnvNameRepeatsWhateverThePluginSets(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "dup-agent", Namespace: "test-ns"},
+	}
+
+	baseline := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true})
+	var pluginEnv []corev1.EnvVar
+	for _, container := range allContainers(baseline.Spec) {
+		for _, e := range container.Env {
+			pluginEnv = append(pluginEnv, corev1.EnvVar{Name: e.Name, Value: "plugin-supplied"})
+		}
+	}
+	if len(pluginEnv) == 0 {
+		t.Fatalf("expected the baseline pod spec to set at least one env var")
+	}
+
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "dupenv"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "dup-agent",
+			Image:    "gcr.io/env:v1",
+			Env:      pluginEnv,
+		},
+	}
+	// Same names again through the one input the proxy's merge reads. Values
+	// differ from the plugin's so a container taking the wrong source is
+	// visible in a failure message rather than hidden behind matching strings.
+	//
+	// Deduplicated, unlike pluginEnv, because this list has to be a CR the API
+	// server would accept: DeploymentSpec.Env carries +listType=map
+	// +listMapKey=name, so a repeated name is refused before the operator sees
+	// it. Feeding one anyway reports four duplicates on the proxy that no CR
+	// can produce — HERMES_HOME_MODE and HERMES_MANAGED_DIR are each set on
+	// both the gateway and the dashboard, so walking every container collects
+	// them twice — and a false failure here would be read as the reserved list
+	// being incomplete when it is not.
+	seen := map[string]struct{}{}
+	deploymentEnv := make([]corev1.EnvVar, 0, len(pluginEnv))
+	for _, e := range pluginEnv {
+		if _, dup := seen[e.Name]; dup {
+			continue
+		}
+		seen[e.Name] = struct{}{}
+		deploymentEnv = append(deploymentEnv, corev1.EnvVar{Name: e.Name, Value: "cr-supplied"})
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: deploymentEnv}
+
+	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{imageVolumeSupported: true})
+	for _, container := range allContainers(pod.Spec) {
+		counts := map[string]int{}
+		for _, e := range container.Env {
+			counts[e.Name]++
+		}
+		for name, n := range counts {
+			if n != 1 {
+				t.Errorf("container %s: env %s appears %d times; server-side apply rejects "+
+					"a duplicate env name outright (\"duplicate entries for key\"), so the "+
+					"gateway would stop reconciling rather than resolve to a value",
+					container.Name, name, n)
+			}
+		}
 	}
 }
 
@@ -4998,6 +5419,63 @@ func TestDeploymentEnvCannotDuplicateTheEventWatcherClusterName(t *testing.T) {
 	}
 }
 
+// The watcher derives its Go soft memory limit from this variable, so it has to
+// be the container's own limits.memory read through the Downward API — not a
+// copy of the number, which would drift the first time the limit changed — and
+// as a plain byte count, which is what divisor 1 yields.
+func TestAgentAPIAuthSidecarReportsItsMemoryLimitToTheWatcher(t *testing.T) {
+	sidecar := buildAgentAPIAuthSidecar(newTestPlatformAgent(), "/opt/data")
+
+	var found []corev1.EnvVar
+	for _, e := range sidecar.Env {
+		if e.Name == "EVENT_WATCHER_MEMORY_LIMIT_BYTES" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_MEMORY_LIMIT_BYTES entry, got %d (%#v)", len(found), found)
+	}
+	ref := found[0].ValueFrom
+	if ref == nil || ref.ResourceFieldRef == nil {
+		t.Fatalf("EVENT_WATCHER_MEMORY_LIMIT_BYTES must come from a resourceFieldRef, got %#v", found[0])
+	}
+	if ref.ResourceFieldRef.ContainerName != sidecar.Name {
+		t.Errorf("resourceFieldRef names container %q, want the sidecar's own %q", ref.ResourceFieldRef.ContainerName, sidecar.Name)
+	}
+	if ref.ResourceFieldRef.Resource != "limits.memory" {
+		t.Errorf("resourceFieldRef reads %q, want limits.memory", ref.ResourceFieldRef.Resource)
+	}
+	if ref.ResourceFieldRef.Divisor.Cmp(resource.MustParse("1")) != 0 {
+		t.Errorf("resourceFieldRef divisor is %s, want 1 so the value is a byte count", ref.ResourceFieldRef.Divisor.String())
+	}
+	if _, ok := sidecar.Resources.Limits[corev1.ResourceMemory]; !ok {
+		t.Error("the sidecar has no memory limit for the resourceFieldRef to read")
+	}
+}
+
+// Same hole as the two variables beside it: appended after the merge, so a
+// same-named spec.deployment.env entry would sit alongside it and server-side
+// apply would reject the Deployment.
+func TestDeploymentEnvCannotDuplicateTheEventWatcherMemoryLimit(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_MEMORY_LIMIT_BYTES", Value: "1"}},
+	}
+
+	var found []corev1.EnvVar
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if e.Name == "EVENT_WATCHER_MEMORY_LIMIT_BYTES" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_MEMORY_LIMIT_BYTES entry, got %d (%#v)", len(found), found)
+	}
+	if found[0].ValueFrom == nil || found[0].Value == "1" {
+		t.Errorf("spec.deployment.env overrode the operator's memory limit reference, got %#v", found[0])
+	}
+}
+
 // Turning the watcher off must not disturb the wiring around it. The volumes, the
 // token projection, and the kubeconfig path are shared with the credential proxy or
 // needed the moment the switch goes back on, so the stop is a decision about one
@@ -6023,5 +6501,75 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 	}
 	if modeLines != 1 {
 		t.Errorf("expected exactly one KUBEAGENTS_MODE line, got %d:\n%s", modeLines, rendered)
+	}
+}
+
+// TestLeaderRolePodsRuleTracksLeaderElectionArming pins the grant to its consumer.
+//
+// pods get/patch on the agent's ServiceAccount exists for one caller:
+// leader_elect.py's update_pod_label, which labels its own pod so the Service
+// selector finds the leader. That wrapper is armed by LEADER_ELECTION_LEASE_NAME
+// in the pod template, and only above one replica -- so the Role and the env have
+// to agree, and this asserts it directly rather than restating the condition.
+//
+// The failure it prevents is silent in the direction that matters: change the
+// arming condition and leave the Role alone, and every single-replica install
+// carries namespace-wide pods:patch on the identity that also holds the agent's
+// Workload Identity annotation. Nothing breaks, nothing logs, and the grant is
+// only found by someone auditing RBAC.
+func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		replicas    *int32
+		scaleToZero *bool
+	}{
+		{name: "unset (defaults to one)"},
+		{name: "explicitly one", replicas: ptr.To(int32(1))},
+		{name: "three", replicas: ptr.To(int32(3))},
+		{name: "three but scaled to zero", replicas: ptr.To(int32(3)), scaleToZero: ptr.To(true)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := newTestPlatformAgent()
+			if agent.Spec.Deployment == nil {
+				agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+			}
+			if tc.replicas != nil {
+				agent.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{Replicas: tc.replicas}
+			}
+			agent.Spec.Deployment.ScaleToZero = tc.scaleToZero
+
+			var hasPods bool
+			for _, r := range buildPlatformLeaderRole(agent).Rules {
+				if !slices.Contains(r.Resources, "pods") {
+					continue
+				}
+				hasPods = true
+				// The verbs, not just the resource. update_pod_label reads its
+				// own pod and patches one label, so get and patch is the whole
+				// requirement -- and this is the agent identity's only write
+				// grant on workloads, so a verb added here is worth a red test
+				// rather than a quiet golden update.
+				if !slices.Equal(r.Verbs, []string{"get", "patch"}) {
+					t.Errorf("leader Role pods rule grants %v, want [get patch]", r.Verbs)
+				}
+				if !slices.Equal(r.Resources, []string{"pods"}) {
+					t.Errorf("leader Role pods rule reaches %v, want [pods]", r.Resources)
+				}
+			}
+
+			var armed bool
+			for _, c := range buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec.Containers {
+				for _, e := range c.Env {
+					if e.Name == "LEADER_ELECTION_LEASE_NAME" {
+						armed = true
+					}
+				}
+			}
+
+			if hasPods != armed {
+				t.Errorf("leader Role grants pods=%v but leader election armed=%v; the grant and its "+
+					"only caller disagree", hasPods, armed)
+			}
+		})
 	}
 }

@@ -145,9 +145,11 @@ MUTATIONS: list[Mutation] = [
         "obvious improvement that turns a denial into an oracle",
     ),
         Mutation(
-        # The original unpinned bind's resourceNames; #387 removed the bind
-        # rule outright, so the live escalation edit is granting escalate on
-        # the RBAC rule the operator still holds full CRUD through.
+        # The original unpinned bind's resourceNames. #387 removed the bind
+        # rule outright and this edit became "grant escalate on the RBAC rule
+        # the operator holds full CRUD through"; the auth callout has since
+        # brought bind back, scoped to one name, and A4-bind-unscoped below
+        # is the mutation that covers the scoping. This one stays on escalate.
         "A4-operator-escalate",
         "k8s-operator/config/rbac/role.yaml",
         ("      - roles\n    verbs:\n      - create\n",
@@ -196,9 +198,37 @@ MUTATIONS: list[Mutation] = [
         "refusals, which is how a control gets switched off in production",
     ),
         Mutation(
-        # Originally unpinned the chart's bind-to-view rule; the rule is gone
-        # from both delivery paths (#387), so the live edit is bind returning
-        # to the chart copy alone — the same-ceiling drift A4 exists to catch.
+        # The bind grant is only bounded while it names resources. Stripping
+        # resourceNames leaves a rule that lets the operator attach ANY
+        # existing ClusterRole -- cluster-admin included -- to any subject it
+        # can write a binding for, which is escalate without the verb.
+        "A4-bind-unscoped",
+        "k8s-operator/config/rbac/role.yaml",
+        ("    resourceNames:\n      - system:auth-delegator\n", ""),
+        "test_A4_the_operator_cannot_escalate_its_own_grants",
+        "drop the resourceNames bound on the operator's bind grant so it can "
+        "attach any role to any subject -- escalate without the verb",
+    ),
+    Mutation(
+        # The generated block is gated byte-for-byte by `make chart-check`, so
+        # the interesting place to hide a grant is just past its end marker:
+        # chart-sync will not touch it and a parser that reads only the block
+        # never sees it.
+        "A4-chart-bind-outside-markers",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - rbac.authorization.k8s.io\n"
+         "    resources:\n      - clusterroles\n    verbs:\n      - bind"),
+        "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
+        "write an unrestricted bind into the chart BELOW the generated-rules "
+        "marker, where chart-sync leaves it and a block-scoped parse misses it",
+    ),
+    Mutation(
+        # Originally unpinned the chart's bind-to-view rule. Both delivery
+        # paths now carry a bind again (scoped to system:auth-delegator), so
+        # the edit is an UNSCOPED bind appearing in the chart copy alone —
+        # the same-ceiling drift A4 exists to catch, in the direction that
+        # widens.
         "A4-chart-bind-returns",
         "charts/kube-agents/templates/operator-rbac.yaml",
         ("  # END GENERATED RULES",
@@ -207,6 +237,31 @@ MUTATIONS: list[Mutation] = [
         "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
         "give the chart's operator role an unrestricted bind the kustomize "
         "role does not carry -- one delivery path quietly grows a ceiling",
+    ),
+    Mutation(
+        # The chart half was three literal string scans until #1319; this is
+        # the spelling that walked past them. Flow style is not exotic -- it is
+        # what `helm create` scaffolds and what a hand-edit reaches for.
+        "A4-chart-impersonate-flow-style",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("    resources:\n      - events\n    verbs:\n      - create\n      - patch",
+         "    resources:\n      - events\n    verbs: [impersonate, create, patch]"),
+        "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
+        "give the chart's leader-election Role impersonate, written in flow "
+        "style: the object is outside the generated block so chart-sync leaves "
+        "it, and `- impersonate` as a substring does not appear",
+    ),
+    Mutation(
+        # The kustomize half read role.yaml alone. leader_election_role.yaml is
+        # listed beside it in the same kustomization and installs just as
+        # readily.
+        "A4-leader-election-escalate",
+        "k8s-operator/config/rbac/leader_election_role.yaml",
+        ("    resources:\n      - events\n    verbs:\n      - create\n      - patch",
+         "    resources:\n      - events\n    verbs:\n      - escalate\n      - create\n      - patch"),
+        "test_A4_the_operator_cannot_escalate_its_own_grants",
+        "add escalate to the operator's OTHER Role -- the leader-election one, "
+        "which the same kustomization installs and A4 did not read",
     ),
     Mutation(
         "A4-inject-assertion-renamed",
@@ -319,8 +374,14 @@ Mutation(
         "add an auto-merge job, which is the thing B2 exists to forbid",
     ),
     Mutation(
+        # autopush-redeploy-agent.yml was deleted by #1199, which consolidated
+        # the autopush deploys; every run of the whole sweep has crashed on
+        # the missing path since. autopush-deploy.yml is the replacement and
+        # carries the same predicate, once. This branch and #1310 found and
+        # fixed that independently -- hence the missing-file case handled
+        # below, which turns a crash into one stale mutation.
         "B4-workflow-run-gate",
-        ".github/workflows/autopush-redeploy-agent.yml",
+        ".github/workflows/autopush-deploy.yml",
         ("github.event.workflow_run.head_branch == 'main'", "true"),
         "test_B4_every_workflow_run_deploy_gates",
         "drop the branch predicate while debugging a deploy, which is when it "
@@ -509,6 +570,27 @@ Mutation(
         "test_C1_every_operator_supplied_cidr_reaches_the_refusal_guards",
         "rename the 4-in-6 guard so every call site misses it; Go would not "
         "compile, but the point is that the conformance suite says so first",
+    ),
+    Mutation(
+        "C1-gateway-oauth-shape",
+        "charts/kube-agents/files/redactor.py",
+        ('        text = cls.GCP_OAUTH_TOKEN_PATTERN.sub("[REDACTED_SECRET]", text)\n', ""),
+        "test_C1_the_gateway_redactor_matches_the_leaked_credential_shapes",
+        "drop the ya29 substitution from the chain while reordering it -- the "
+        "pattern constant stays, so anything that greps for it is satisfied, "
+        "and the shape gke-labs/kube-agents#603 measured leaves for the "
+        "provider in the clear",
+    ),
+    Mutation(
+        "C1-gateway-sa-exemption",
+        "charts/kube-agents/files/redactor.py",
+        ('r"[a-zA-Z0-9._%+\\-]+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
+         'r"[a-zA-Z0-9._%+\\-]+@"'),
+        "test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone",
+        "simplify the e-mail pattern by dropping the service-account exemption; "
+        "every IAM principal in a tool result then reaches the model as "
+        "[REDACTED_EMAIL], which is the over-eager shape that gets redaction "
+        "turned off",
     ),
     Mutation(
         "C2-unknown-flag-fail-open",
@@ -740,7 +822,10 @@ Mutation(
     ),
     Mutation(
         "C5-leader-reaches-configmaps",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        # platformagent-ha.yaml, not platformagent.yaml: the leader Role's pods
+        # rule renders only above one replica, and the HA fixture is the only
+        # golden that sets it.
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-ha.yaml",
         ("    resources:\n      - pods\n    verbs:\n      - get\n      - patch\n",
          "    resources:\n      - configmaps\n      - pods\n    verbs:\n      - get\n      - patch\n"),
         "test_C5_the_leader_role_stays_confined_to_coordination",
@@ -948,6 +1033,115 @@ Mutation(
         "entering it costs an argument",
     ),
     Mutation(
+        "C1-session-fence-selector-drift",
+        "a2a/gateway/spawn.go",
+        ('\tsessionRole = "a2a-session"', '\tsessionRole = "a2a-worker"'),
+        "test_C1_the_session_fence_selects_the_pods_the_spawner_stamps",
+        "rename the session pod's component label on the spawner side only -- "
+        "the shape a rename that misses the other Go module takes. Both Go "
+        "suites stay green and the operator's NetworkPolicy then selects no "
+        "pod, which the API server reports as success",
+    ),
+    Mutation(
+        "C1-session-pod-gets-a-second-token",
+        "a2a/gateway/spawn.go",
+        ("AutomountServiceAccountToken: ptr.To(false),",
+         "AutomountServiceAccountToken: ptr.To(true),"),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "automount a SECOND token into a session pod, beside the bus token it "
+        "is supposed to have. A session pod now names a ServiceAccount -- the "
+        "callout resolves a Kubernetes identity, so it has to -- and this is "
+        "the flip that turns that identity from inert into a cluster "
+        "credential: the automounted token carries the API server's default "
+        "audience, so unlike the projected bus token it authenticates against "
+        "the API server, which the session fence's rule set does not account "
+        "for",
+    ),
+    Mutation(
+        "C1-session-token-loses-its-audience",
+        "a2a/gateway/spawn.go",
+        ("Audience:          lib.BusTokenAudience,", ""),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "drop the audience from the session pod's projected token. An "
+        "audience-less projection is a default-audience token by another name, "
+        "so automount staying off would stop meaning anything -- and this is "
+        "the quiet version, because the pod keeps exactly one token file at "
+        "exactly the path the worker reads",
+    ),
+    Mutation(
+        "C1-session-account-gets-rbac",
+        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
+        ("""\t\tRoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: a2aCalloutName(agent)},
+\t\tSubjects: []rbacv1.Subject{{
+\t\t\tKind:      "ServiceAccount",
+\t\t\tName:      a2aCalloutName(agent),""",
+         """\t\tRoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: a2aCalloutName(agent)},
+\t\tSubjects: []rbacv1.Subject{{
+\t\t\tKind:      "ServiceAccount",
+\t\t\tName:      a2aSessionServiceAccountName(agent),"""),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "point an RBAC binding at the session ServiceAccount instead of the "
+        "callout's. The session account holds no permissions, which is the "
+        "third thing keeping a session pod's token inert; this is the "
+        "cross-module half, because the account is named by the gateway "
+        "(module a2a) and granted by the operator (module k8s-operator) and no "
+        "Go test in either can see both",
+    ),
+    Mutation(
+        "C1-session-account-gets-rbac-in-the-sibling-file",
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("""\t\tSubjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: agent.Namespace}},""",
+         """\t\tSubjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: a2aSessionServiceAccountName(agent), Namespace: agent.Namespace}},"""),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "the same grant as the mutation above, in the other file that renders "
+        "A2A RBAC. The scan used to read only the callout's file and to match "
+        "one literal space after `Subjects:`, so a binding added here -- where "
+        "gofmt aligns the field -- passed it twice over. Both halves of that "
+        "hole are what this mutation holds shut",
+    ),
+    Mutation(
+        "A3-supervisor-terminal-back-on-events",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t\t"a2a.tasks.*.*.in",\n\t\t\t"a2a.tasks.*.*.supervisor",',
+         '\t\t\t"a2a.tasks.*.*.in",\n\t\t\t"a2a.tasks.*.*.events",'),
+        "test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject",
+        "move the gateway's supervisor publish back onto the executors' events "
+        "subject -- the pre-split render, and the change a rollback of the "
+        "relay durable would tempt. Every executor's subject is two-writer "
+        "again and a forged supervisor terminal is indistinguishable on replay",
+    ),
+    Mutation(
+        "A3-second-supervisor-writer",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",',
+         '\t\t"a2a.tasks.*.*.events",\n\t\t"a2a.tasks.*.*.supervisor",\n\t\t"a2a.topics.agent.platform.upgrade-readiness",'),
+        "test_A3_the_supervisor_subject_has_exactly_one_writer",
+        "grant the static worker publish on the supervisor subject, the shape "
+        "a bridge-side janitor written against the shared credential would "
+        "take. The subject then no longer says who wrote there",
+    ),
+    Mutation(
+        "A3-session-writes-its-own-supervisor-subject",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskSupervisorSubject(pod, "*"),\n\t\t},'),
+        "test_A3_the_supervisor_subject_has_exactly_one_writer",
+        "derive a session a grant on its own supervisor subject -- the "
+        "helpful-looking change that lets a worker adapter finalise itself "
+        "after a harness crash. An executor can then declare itself dead as "
+        "infrastructure",
+    ),
+    Mutation(
+        "A3-session-per-task-wildcard",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.TaskInSubject(pod, "*"),\n\t\t},'),
+        "test_A3_the_executors_grant_does_not_reach_its_own_in_subject",
+        "widen the session's task-plane grant toward the per-task wildcard the "
+        "cards sketched, which puts the executor in its own in-subject writer "
+        "set: it can steer and cancel itself as if from the user",
+    ),
+    Mutation(
         "harness-fixture-emptied",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("\nkind: StatefulSet\n", "\nkind: StatefulSetXX\n"),
@@ -1037,6 +1231,10 @@ def main() -> int:
     verdicts = []
     for mutation in selected:
         path = REPO / mutation.path
+        if not path.exists():
+            verdicts.append((mutation, "STALE", []))
+            print(f"STALE    {mutation.id}: {mutation.path} does not exist")
+            continue
         original = path.read_text()
         old, new = mutation.edit
         if old not in original:

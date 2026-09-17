@@ -14,7 +14,9 @@ benchmark. That is what `bench/` in this repository is: tasks and the `kubeagent
 here, devops-bench ships separately. The same shape works for anything you cannot make public.
 
 For running the evals that already exist here, see [README.md](README.md). This page is about
-adding new ones.
+adding new ones. For getting one you wrote into this repository's presubmit — the review bar,
+the fixture-sanitization check, the `owner` field and roster admission — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Prerequisites
 
@@ -208,27 +210,35 @@ covers no row gets a reviewed `KNOWN_NO_DOMAIN` entry instead of an absent field
 `docs/designs/bench-case-format.md` is the contract, and this section is the how-to.
 The slugs live in `docs/designs/domains.yaml`, and
 `scripts/test_domain_coverage.py` counts a domain as covered only when a task carries its
-slug AND a non-empty `verification_spec` AND is an active (uncommented) entry in
-`hack/ci-eval-pr.sh`'s `TASKS` array — covered means running, so a spec-ready task
-registered commented-out leaves its domain honestly uncovered until it activates, and
-activating it forces the allowlist edit in `domains.yaml` in the same change. devops-bench
+slug AND a non-empty `verification_spec` AND is an entry in
+`hack/eval/presubmit-cases.txt` — covered means running on every pull request, so a
+nightly-only task leaves its domain honestly uncovered until its line moves to the presubmit
+file, and that move forces the allowlist edit in `domains.yaml` in the same change. devops-bench
 ignores the extra key (`extra: "ignore"` on its task model), so the field is free to carry.
+
+Every task also carries a top-level `owner:` — a GitHub login without the at sign, or
+`maintainers` — naming who answers when the case flakes. The validator rejects a task without
+one; [CONTRIBUTING.md](CONTRIBUTING.md) says what the owner commits to.
 
 A task may also carry a top-level `expected_fail: true`, which inverts the presubmit's verdict for
 it: failing is the declared outcome, and _passing_ every repetition is what reports. That is the
-eval-driven-development marker — write the case for a gap before the fix exists, land it
-expected-fail, and the flip to `false` shows up in the diff that closes the gap. It defaults to
-`false`, so no existing task needs the field, and like `domain:` it is read by `bench-gate` rather
-than by devops-bench.
+eval-driven-development marker for a gap whose fix is not yours to make — land the case red and
+marked, and the owner's fix flips the marker in the diff that closes the gap; a case for your own
+change goes red to green inside one pull request and never carries it
+([`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md)). It
+defaults to `false`, so no existing task needs the field, and like `domain:` it is read by
+`bench-gate` rather than by devops-bench. It must be a bare YAML boolean; the validator rejects a
+quoted one, which is a string and truthy.
 
-A new task must also be registered: the presubmit runs only what the `TASKS` array in
-`hack/ci-eval-pr.sh` names, the nightly adds what `NIGHTLY_TASKS` names (appended when
-the job exports `EVAL_TIER=nightly`), and `scripts/test_task_registration.py` fails the
-build for a task that appears in neither. A commented-out `TASKS` entry counts as
-registered, pending activation — that is how scenarios wait for infrastructure that does
-not exist yet; a `NIGHTLY_TASKS` entry is for a validated case too slow or too redundant
-for a presubmit seat — and a task that deliberately must not run needs a reviewed entry
-in `scripts/validate_bench_cases.py`'s `KNOWN_UNREGISTERED` with the reason.
+A new task must also be registered: the presubmit runs only what
+`hack/eval/presubmit-cases.txt` names, the nightly adds what `hack/eval/nightly-cases.txt`
+names (appended when the job exports `EVAL_TIER=nightly`), and
+`scripts/test_task_registration.py` fails the build for a task that appears in neither. A
+new task goes in the nightly file and earns a presubmit seat on its record (the rule's one
+statement is `docs/designs/bench-case-format.md` §Registration); a task whose fixture does
+not exist yet waits in `scripts/validate_bench_cases.py`'s `FIXTURE_NOT_READY` with its
+issue, and a task that deliberately must not run needs a reviewed entry in that file's
+`KNOWN_UNREGISTERED` with the reason.
 
 A task whose verification reads live cluster state also carries `fixtures:`, a list of
 seeded-fleet role slugs from `bench/tf/fleet/fixtures.json`, or `fixtures: []` if it
@@ -247,6 +257,7 @@ fails if it reported anything, so a case that passes locally passes there too.
 id: my-provisioned-task
 name: Human-readable name
 domain: capacity # required; a slug from docs/designs/domains.yaml
+owner: maintainers # required; a GitHub login without the at sign, or maintainers -- see CONTRIBUTING.md
 fixtures: [] # required when the spec reads cluster state; seeded-fleet roles, or [] for none
 prompt: >-
   The evaluation cluster {{CLUSTER_NAME}} has just been provisioned.

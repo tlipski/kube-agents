@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, one of the three
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt, one of the three
 # activations that take the reliability domain to five enabled tasks
 # (#1049). The two parking reasons from #984 are both answered: the prompt
 # below uses the located pattern (its 0.0 was the unlocated-prompt failure
@@ -46,6 +46,9 @@ validated: false
 
 # Slug per docs/designs/domains.yaml.
 domain: reliability
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
 
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run

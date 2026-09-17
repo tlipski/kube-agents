@@ -111,7 +111,18 @@ PLUGIN_BASE_IMAGE: str = "alpine:3.19"
 # GKE nodes are linux/amd64; a mismatch here yields a CrashLoopBackOff, not a build error.
 TARGET_PLATFORM: str = os.environ.get("TARGET_PLATFORM", "linux/amd64")
 
-OPERATOR_DEPLOYMENT: str = "kubeagents-controller-manager"
+# Operator label contract: both Helm and Kustomize label the operator Deployment
+# and its pod template with 'app.kubernetes.io/name=kube-agents-operator'.
+OPERATOR_LABEL_SELECTOR: str = "app.kubernetes.io/name=kube-agents-operator"
+OPERATOR_CONTAINER_NAME: str = "manager"
+OPERATOR_POD_POLL_TIMEOUT_SEC: int = 30
+OPERATOR_PROBE_TIMEOUT_SEC: int = 15
+DEFAULT_ROLLOUT_TIMEOUT_SEC: int = 900
+ROLLOUT_RETRY_INTERVAL_SEC: int = 3
+API_POLL_INTERVAL_SEC: int = 2
+MIN_ROLLOUT_TIMEOUT_SEC: int = 5
+DEFAULT_GENERATION_TIMEOUT_SEC: int = 180
+CRD_MISSING_LOG_POLL_TIMEOUT_SEC: int = 30
 GATEWAY_DEPLOYMENT: str = "platform-agent-gateway"
 # AgentPlugin names are restricted to ^[a-z][a-z0-9]*$ by the CRD: the name doubles as
 # the plugin directory and the module identifier Hermes imports.
@@ -435,8 +446,15 @@ def get_latest_pod_template_hash(deployment_name: str) -> str:
     return lines[-1] if lines else ""
 
 
-def wait_deployment_generation_change(deployment_name: str, min_gen: int, timeout_sec: int = 20) -> None:
-    """Wait for operator reconciliation to update deployment metadata.generation."""
+def wait_deployment_generation_change(
+    deployment_name: str, min_gen: int, timeout_sec: int = DEFAULT_GENERATION_TIMEOUT_SEC
+) -> None:
+    """Wait for operator reconciliation to update deployment metadata.generation.
+
+    Raises TimeoutError if the deployment generation does not reach min_gen within
+    timeout_sec, preventing subsequent rollout and spec checks from validating a stale
+    revision.
+    """
     end_time = time.time() + timeout_sec
     while time.time() < end_time:
         try:
@@ -447,7 +465,9 @@ def wait_deployment_generation_change(deployment_name: str, min_gen: int, timeou
         except (subprocess.CalledProcessError, ValueError):
             pass
         time.sleep(1)
-    log(f"Warning: Deployment '{deployment_name}' generation did not reach {min_gen} within {timeout_sec}s")
+    raise TimeoutError(
+        f"Deployment '{deployment_name}' generation did not reach {min_gen} within {timeout_sec}s"
+    )
 
 
 def poll_running_pod_name(label_selector: str, pod_template_hash: str | None = None, timeout_sec: int = 30) -> str:
@@ -550,9 +570,69 @@ def poll_pod_logs(
     return pod_name, logs
 
 
-def wait_deployment_rollout(deployment_name: str, timeout: str = "180s") -> None:
-    """Wait for deployment rollout status to succeed."""
-    run_kubectl(["rollout", "status", f"deployment/{deployment_name}", "-n", NAMESPACE, f"--timeout={timeout}"])
+def get_operator_deployment() -> str:
+    """Resolve active operator deployment name across Helm and Kustomize installations."""
+    env_override = os.environ.get("OPERATOR_DEPLOYMENT")
+    if env_override:
+        return env_override
+
+    name = get_kubectl_output([
+        "get", "deployment", "-n", NAMESPACE,
+        "-l", OPERATOR_LABEL_SELECTOR,
+        "-o", "jsonpath={.items[0].metadata.name}",
+    ]).strip()
+    if name:
+        return name
+    raise AssertionError(
+        f"No operator deployment with label '{OPERATOR_LABEL_SELECTOR}' found in namespace '{NAMESPACE}'"
+    )
+
+
+def poll_operator_pod(expected_image: str = "", timeout_sec: int = OPERATOR_POD_POLL_TIMEOUT_SEC) -> str:
+    """Poll Kubernetes API for running operator pod matching the operator label selector."""
+    return poll_pod_with_image(
+        OPERATOR_LABEL_SELECTOR,
+        OPERATOR_CONTAINER_NAME,
+        expected_image=expected_image,
+        timeout_sec=timeout_sec,
+    )
+
+
+def wait_deployment_rollout(deployment_name: str, timeout: str = f"{DEFAULT_ROLLOUT_TIMEOUT_SEC}s") -> None:
+    """Wait for deployment object to exist in API server and its rollout status to succeed."""
+    timeout_sec = DEFAULT_ROLLOUT_TIMEOUT_SEC
+    if timeout.endswith("s") and timeout[:-1].isdigit():
+        timeout_sec = int(timeout[:-1])
+
+    deadline = time.time() + timeout_sec
+    # 1. Wait for deployment object to appear in API server
+    deployment_found = False
+    while time.time() < deadline:
+        res = run_kubectl(["get", "deployment", deployment_name, "-n", NAMESPACE], check=False, capture_output=True)
+        if res.returncode == 0:
+            deployment_found = True
+            break
+        time.sleep(API_POLL_INTERVAL_SEC)
+
+    if not deployment_found:
+        raise TimeoutError(f"Deployment '{deployment_name}' did not appear in namespace '{NAMESPACE}' within {timeout_sec}s")
+
+    # 2. Run rollout status with retry until deadline
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        remaining_sec = max(MIN_ROLLOUT_TIMEOUT_SEC, int(deadline - time.time()))
+        try:
+            run_kubectl(["rollout", "status", f"deployment/{deployment_name}", "-n", NAMESPACE, f"--timeout={remaining_sec}s"])
+            return
+        except subprocess.CalledProcessError as err:
+            last_err = err
+            if time.time() < deadline - MIN_ROLLOUT_TIMEOUT_SEC:
+                time.sleep(ROLLOUT_RETRY_INTERVAL_SEC)
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise TimeoutError(f"Deployment '{deployment_name}' rollout timed out after {timeout_sec}s")
 
 
 def get_platform_configmap_yaml() -> str:
@@ -572,11 +652,12 @@ def get_platform_configmap_yaml() -> str:
 
 def step1_verify_existing_operator_healthy() -> None:
     """Step 1 (Default): Verify existing k8s-operator and PlatformAgent deployments are healthy without mutating or rebuilding."""
-    log(f"STEP 1: Verifying existing k8s-operator deployment '{OPERATOR_DEPLOYMENT}' in namespace '{NAMESPACE}'...")
-    wait_deployment_rollout(OPERATOR_DEPLOYMENT)
+    op_deployment = get_operator_deployment()
+    log(f"STEP 1: Verifying existing k8s-operator deployment '{op_deployment}' in namespace '{NAMESPACE}'...")
+    wait_deployment_rollout(op_deployment)
 
-    pod_name = poll_pod_with_image("control-plane=controller-manager", "manager", timeout_sec=30)
-    assert pod_name != "", f"No running operator pod found for deployment '{OPERATOR_DEPLOYMENT}'"
+    pod_name = poll_operator_pod()
+    assert pod_name != "", f"No running operator pod found for deployment '{op_deployment}'"
     pod_image = get_pod_image(pod_name, "manager")
     log(f"Running operator pod name:  {pod_name}")
     log(f"Running operator pod image: {pod_image}")
@@ -587,6 +668,7 @@ def step1_verify_existing_operator_healthy() -> None:
 
 def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) -> None:
     """Step 1 (Opt-in Rebuild): Rebuild k8s-operator Go binary and container image from scratch, push, apply CRDs, update deployment."""
+    op_deployment = get_operator_deployment()
     log(f"STEP 1 (Opt-in Rebuild): Rebuilding and deploying k8s-operator from scratch with tag '{operator_tag}'...")
     operator_dir = REPO_ROOT / "k8s-operator"
 
@@ -600,22 +682,23 @@ def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) ->
     build_and_push_operator_image(operator_image, operator_dir)
     apply_crd_manifests(operator_dir / "config" / "crd" / "bases")
 
-    run_kubectl(["set", "image", f"deployment/{OPERATOR_DEPLOYMENT}", f"manager={operator_image}", "-n", NAMESPACE])
-    wait_deployment_rollout(OPERATOR_DEPLOYMENT)
+    run_kubectl(["set", "image", f"deployment/{op_deployment}", f"manager={operator_image}", "-n", NAMESPACE])
+    wait_deployment_rollout(op_deployment)
     log("STEP 1 (Opt-in Rebuild) SUCCESS: k8s-operator built, pushed, and deployed.")
 
 
 def step2_verify_operator_version(operator_image: str) -> None:
     """Step 2 (Opt-in Rebuild): Verify deployed image tag in deployment spec and active running pod."""
     log("STEP 2 (Opt-in Rebuild): Verifying deployed version by image tag...")
+    op_deployment = get_operator_deployment()
     deployed_image = get_kubectl_output([
-        "get", "deployment", OPERATOR_DEPLOYMENT, "-n", NAMESPACE,
+        "get", "deployment", op_deployment, "-n", NAMESPACE,
         "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
     ])
     log(f"Deployment spec image: {deployed_image}")
     assert deployed_image == operator_image, f"Spec image '{deployed_image}' != expected '{operator_image}'"
 
-    pod_name = poll_pod_with_image("control-plane=controller-manager", "manager", operator_image, timeout_sec=30)
+    pod_name = poll_operator_pod(expected_image=operator_image)
     assert pod_name != "", f"No running operator pod found with image '{operator_image}'"
 
     pod_image = get_pod_image(pod_name, "manager")
@@ -666,9 +749,10 @@ def step3_build_and_push_plugin_image(plugin_image: str, unique_str: str) -> Non
 
 def check_operator_error_log(search_str: str) -> bool:
     """Fetch logs from controller manager and check for expected error message."""
+    op_deployment = get_operator_deployment()
     try:
         output = get_kubectl_output([
-            "logs", "deployment/kubeagents-controller-manager", "-n", NAMESPACE, "-c", "manager", "--tail=5000"
+            "logs", f"deployment/{op_deployment}", "-n", NAMESPACE, "-c", "manager", "--tail=5000"
         ])
         return search_str in output
     except Exception:
@@ -720,11 +804,16 @@ def step4_deploy_agent_plugin_cr(plugin_image: str, unique_str: str) -> None:
     wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
     wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
-    # Verify custom imagePullPolicy (Always) is set on deployment volume
+    # Verify custom imagePullPolicy (Always) is set on deployment volume or staging init container
     vol_pull_policy = get_kubectl_output([
         "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
         "-o", f"jsonpath={{.spec.template.spec.volumes[?(@.name==\"plugin-{PLUGIN_CR_NAME}\")].image.pullPolicy}}"
     ])
+    if not vol_pull_policy:
+        vol_pull_policy = get_kubectl_output([
+            "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
+            "-o", f"jsonpath={{.spec.template.spec.initContainers[?(@.name==\"stage-{PLUGIN_CR_NAME}\")].imagePullPolicy}}"
+        ])
     log(f"Verified plugin volume imagePullPolicy on deployment: {vol_pull_policy}")
     assert vol_pull_policy == "Always", f"Expected imagePullPolicy Always, got {vol_pull_policy}"
 
@@ -920,8 +1009,8 @@ def step8_verify_config_cleanup(unique_str: str) -> None:
 
 
 def step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image: str, unique_str: str) -> None:
-    """Step 9: Verify image volume disable annotation guard and status update to Degraded/ImageVolumeUnsupported."""
-    log("STEP 9: Testing 'kubeagents.x-k8s.io/enable-image-volumes=false' annotation safeguard...")
+    """Step 9: Verify image volume disable annotation fallback to emptyDir/initContainer staging."""
+    log("STEP 9: Testing 'kubeagents.x-k8s.io/enable-image-volumes=false' annotation fallback to staging...")
 
     # 9a. Annotate PlatformAgent to force enable-image-volumes=false
     run_kubectl([
@@ -945,33 +1034,55 @@ def step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image: s
         wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
-        # 9d. Verify OCI volume was NOT attached to gateway deployment
-        vols = get_kubectl_output([
+        # 9d. Verify volume is attached as emptyDir (not OCI image volume)
+        dep_raw = get_kubectl_output([
             "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
-            "-o", f"jsonpath={{.spec.template.spec.volumes[?(@.name==\"plugin-{PLUGIN_CR_NAME}\")].name}}"
+            "-o", "json"
         ])
-        assert vols == "", f"Volume 'plugin-{PLUGIN_CR_NAME}' should NOT be attached when enable-image-volumes=false, got '{vols}'"
-        log("Verified OCI volume attachment was skipped when enable-image-volumes=false.")
+        dep_spec = json.loads(dep_raw).get("spec", {}).get("template", {}).get("spec", {})
+        plugin_vols = [v for v in dep_spec.get("volumes", []) if v.get("name") == f"plugin-{PLUGIN_CR_NAME}"]
+        assert len(plugin_vols) == 1, (
+            f"Expected exactly 1 volume for 'plugin-{PLUGIN_CR_NAME}', got {len(plugin_vols)}"
+        )
+        assert "emptyDir" in plugin_vols[0], (
+            f"Expected emptyDir volume source for 'plugin-{PLUGIN_CR_NAME}' when enable-image-volumes=false, got {plugin_vols[0]}"
+        )
+        assert "image" not in plugin_vols[0], (
+            f"Did not expect image volume source for 'plugin-{PLUGIN_CR_NAME}' when enable-image-volumes=false"
+        )
+        log("Verified plugin volume is attached as emptyDir when enable-image-volumes=false.")
 
-        # 9e. Verify AgentPlugin status condition Reason == ImageVolumeUnsupported and Phase == Degraded
+        # 9e. Verify staging init container is injected
+        init_containers = dep_spec.get("initContainers", [])
+        stage_inits = [c for c in init_containers if c.get("name") == f"stage-{PLUGIN_CR_NAME}"]
+        assert len(stage_inits) == 1, (
+            f"Expected init container 'stage-{PLUGIN_CR_NAME}' to be present when enable-image-volumes=false, got {stage_inits}"
+        )
+        log(f"Verified staging init container 'stage-{PLUGIN_CR_NAME}' is present.")
+
+        # 9f. Verify AgentPlugin status condition Reason == Applied, Phase == Ready, and message mentions staging
         status_phase = get_kubectl_output([
             "get", "agentplugin", PLUGIN_CR_NAME, "-n", NAMESPACE,
             "-o", "jsonpath={.status.phase}"
         ])
-        assert status_phase == "Degraded", f"Expected AgentPlugin status.phase 'Degraded', got '{status_phase}'"
+        assert status_phase == "Ready", f"Expected AgentPlugin status.phase 'Ready', got '{status_phase}'"
         log(f"Verified AgentPlugin status phase is '{status_phase}'.")
 
         cond_reason = get_kubectl_output([
             "get", "agentplugin", PLUGIN_CR_NAME, "-n", NAMESPACE,
             "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].reason}"
         ])
-        assert cond_reason == "ImageVolumeUnsupported", f"Expected condition reason 'ImageVolumeUnsupported', got '{cond_reason}'"
+        assert cond_reason == "Applied", f"Expected condition reason 'Applied', got '{cond_reason}'"
         log(f"Verified AgentPlugin condition reason is '{cond_reason}'.")
 
-        # 9f. Verify operator logged error message for skipped OCI volume attachment
-        err_logged = check_operator_error_log("skipping plugin OCI image volume mount")
-        assert err_logged, "Expected operator to log 'skipping plugin OCI image volume mount'"
-        log("Verified operator logged manifestsLog error for skipped OCI image volume attachment.")
+        cond_msg = get_kubectl_output([
+            "get", "agentplugin", PLUGIN_CR_NAME, "-n", NAMESPACE,
+            "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].message}"
+        ])
+        assert "staged via init container" in cond_msg, (
+            f"Expected condition message to mention 'staged via init container', got '{cond_msg}'"
+        )
+        log(f"Verified AgentPlugin condition message notes staging: '{cond_msg}'.")
 
     finally:
         # 9g. Cleanup Step 9 resources
@@ -1050,30 +1161,36 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
     """
     log("STEP 12 (Opt-in Destructive): Testing missing AgentPlugin CRD decoupled dependency safeguard...")
     crd_dir = REPO_ROOT / "k8s-operator" / "config" / "crd" / "bases"
+    op_deployment = get_operator_deployment()
 
     try:
         log("Deleting AgentPlugin CRD from cluster...")
         run_kubectl(["delete", "crd", "agentplugins.kubeagents.x-k8s.io"], check=True)
 
-        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
         trigger_val = str(int(time.time()))
         run_kubectl([
             "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
             f"e2e.test/crd-missing-trigger={trigger_val}", "--overwrite"
         ])
-
-        wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
         op_image = get_kubectl_output([
-            "get", "deployment", OPERATOR_DEPLOYMENT, "-n", NAMESPACE,
+            "get", "deployment", op_deployment, "-n", NAMESPACE,
             "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
         ])
-        op_pod = poll_pod_with_image("control-plane=controller-manager", "manager", op_image, timeout_sec=15)
-        crd_missing_logged = (
-            check_operator_error_log("the server could not find the requested resource") or
-            check_operator_error_log("AgentPlugin CRD is not installed on cluster")
-        )
+        op_pod = poll_operator_pod(expected_image=op_image, timeout_sec=OPERATOR_PROBE_TIMEOUT_SEC)
+
+        crd_missing_logged = False
+        start_time = time.time()
+        while time.time() - start_time < CRD_MISSING_LOG_POLL_TIMEOUT_SEC:
+            if (
+                check_operator_error_log("the server could not find the requested resource") or
+                check_operator_error_log("AgentPlugin CRD is not installed on cluster")
+            ):
+                crd_missing_logged = True
+                break
+            time.sleep(1)
+
         assert crd_missing_logged, "Expected operator to log missing CRD reflector warning or info message"
         log("Verified operator logged missing CRD reflector message while PlatformAgent reconciliation succeeded.")
 
@@ -1089,8 +1206,8 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
         # exponential backoff / stops watching the missing resource until the controller process
         # or deployment is restarted. Restarting the operator forces a fresh informer cache sync.
         log("Restarting operator to rebuild the AgentPlugin watch...")
-        run_kubectl(["rollout", "restart", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE])
-        run_kubectl(["rollout", "status", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE, "--timeout=180s"])
+        run_kubectl(["rollout", "restart", f"deployment/{op_deployment}", "-n", NAMESPACE])
+        wait_deployment_rollout(op_deployment, timeout="180s")
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
     log("STEP 12 (Opt-in Destructive) SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
@@ -1213,11 +1330,14 @@ def agent_exec_until(script: str, expect: str, timeout_sec: int = 150) -> str:
     """Run a probe in the agent container until its output contains `expect`.
 
     Rolling out is not the same as being ready to assert against. The platform-agent
-    container has no readiness probe — the pod's readiness comes from the credential-proxy
-    sidecar — so `kubectl rollout status` returns while the entrypoint may still be
-    syncing files, scaffolding the platform profile, or linking plugins. A single-shot
-    probe against that window passes or fails on timing, which in a suite this slow reads
-    as a flaky product rather than a flaky test.
+    container does carry probes — a StartupProbe and a ReadinessProbe, both `agentAPIProbe`
+    in `platformagent_manifests.go`, which curl the Hermes API on pod loopback — and on a
+    single-replica gateway a Ready pod has therefore finished the entrypoint's file sync,
+    profile scaffolding, and plugin linking, all of which run before `exec`. Under leader
+    election it has not: that probe exits 0 on connection-refused when
+    ENABLE_LEADER_ELECTION is true, so a standby reports Ready without serving. Polling
+    covers that configuration, and costs one exec where a single-replica gateway has
+    already settled.
 
     Every probe must print a token for both outcomes, so "not yet" and "the exec broke"
     stay distinguishable. The two tokens must not be substrings of one another: this
@@ -1259,9 +1379,10 @@ def restart_agent_pod() -> None:
     raise AssertionError(f"agent pod {old} was not replaced within 240s")
 
 
-def reconcile_and_wait() -> None:
+def reconcile_and_wait(gen_before: int | None = None) -> None:
     """Give the operator a reconcile, then wait for the agent Deployment to settle."""
-    gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
+    if gen_before is None:
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
     # min_gen must be gen_before + 1: passing the current generation satisfies the
     # >= check immediately and the helper returns without waiting for anything.
     wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
@@ -1646,6 +1767,7 @@ def step17_verify_link_self_heals_over_a_stale_directory(plugin_image: str) -> N
 
     link = profile_plugin_link(TARGET_PROFILE, TARGETED_PLUGIN_CR_NAME)
     try:
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
         apply_kubectl_manifest(f"""apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: AgentPlugin
 metadata:
@@ -1656,7 +1778,7 @@ spec:
   image: {plugin_image}
   targetProfile: {TARGET_PROFILE}
 """)
-        reconcile_and_wait()
+        reconcile_and_wait(gen_before)
 
         # Recreate the pre-upgrade shape: the link replaced by the empty directory the
         # kubelet used to leave on the PVC.
@@ -1678,8 +1800,52 @@ spec:
             f"the healed link must resolve to the mounted plugin: {reachable.stdout}{reachable.stderr}"
         )
         log("Verified startup replaced the stale directory with a working link.")
+        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
+        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE])
+        reconcile_and_wait(gen_before)
     finally:
-        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+        # The delete is unconditional. `check=False` already swallows NotFound, and a `get`
+        # that fails for any other reason -- an API blip, an expired credential, the wrong
+        # context -- must not be read as "already gone" and skip it: leaving the plugin
+        # mounted on the gateway for whichever suite runs next is the failure this block
+        # exists to prevent.
+        #
+        # What the probe decides is which wait follows it, so it runs before the delete and
+        # nothing between here and there is allowed to raise. On the success path the step
+        # has already withdrawn the CR and waited its rollout out, and the plain rollout
+        # wait is a settled-state re-check. On a failure path the CR is still here and the
+        # delete below is what starts the rollout -- and wait_deployment_rollout cannot see
+        # that one coming, because `kubectl rollout status` succeeds as soon as the observed
+        # generation matches the current one, which is still the pre-delete generation. It
+        # would return against the revision that still has the plugin in it. So capture the
+        # generation first and wait for the operator's bump, the way step 6 does.
+        gen_before_cleanup = None
+        try:
+            cr_still_present = run_kubectl(
+                ["get", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE],
+                check=False,
+                capture_output=True,
+            ).returncode == 0
+            if cr_still_present:
+                gen_before_cleanup = get_deployment_generation(GATEWAY_DEPLOYMENT)
+        except subprocess.CalledProcessError:
+            # Reading the cluster failed, which says nothing about what the cleanup owes.
+            # Fall through to the delete and settle with the generation-blind wait.
+            pass
+
+        deleted = run_kubectl(
+            ["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE],
+            check=False,
+            capture_output=True,
+        ).returncode == 0
+
+        # A delete that did not land starts no rollout, so waiting for a generation bump
+        # would spend DEFAULT_GENERATION_TIMEOUT_SEC on one that is never coming and then
+        # raise a TimeoutError over whatever the step actually failed on.
+        if gen_before_cleanup is not None and deleted:
+            reconcile_and_wait(gen_before_cleanup)
+        else:
+            wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
     log("STEP 17 SUCCESS: stale plugin directory self-heals into the link on startup.")
 

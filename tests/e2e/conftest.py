@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import warnings
 from collections.abc import Generator
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -220,7 +221,7 @@ def _resolve_github_org() -> Optional[str]:
 def _qualify_repo(repo: Optional[str]) -> Optional[str]:
     """Prefixes a bare repository name with the owner.
 
-    GH_REPO is bare by repository convention -- reusable-deploy-integrations.yml passes
+    GH_REPO is bare by repository convention -- the install configuration passes
     the org and the repo to the GitHub Token Minter as separate values -- while every
     consumer of this fixture wants 'owner/repo': test_github_target_repository_configuration
     asserts the shape, and github_token_refresh.py rejects anything else.
@@ -254,20 +255,23 @@ def github_repo(agent_namespace: str) -> Optional[str]:
     if val:
         return _qualify_repo(val)
 
-    # Try reading from platform-agent-settings in the cluster
+    # Try reading from platform-agent-gitops-state in the cluster
     try:
         cmd = [
-            "kubectl", "get", "cm", "platform-agent-settings",
+            "kubectl", "get", "cm", "platform-agent-gitops-state",
             "-n", agent_namespace,
-            "-o", "jsonpath={.data.SETTINGS\\.md}",
+            "-o", "jsonpath={.data.managed_repos}",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                if "Git Repo:" in line:
-                    repo_cand = line.split("Git Repo:", 1)[1].strip().strip("*` ")
-                    if repo_cand and repo_cand.lower() != "none":
-                        return _qualify_repo(repo_cand)
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                entries = json.loads(result.stdout)
+                if isinstance(entries, list):
+                    for item in entries:
+                        if isinstance(item, dict) and item.get("url"):
+                            return _qualify_repo(item["url"])
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -433,7 +437,7 @@ from exec_tunnel import TunnelConfig, serve_background  # noqa: E402
 # bench/kube_agents_bench/harness.py reads for the same value.
 _AGENT_NAME = os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
 
-_PROXY_CONTAINER = "envoy-credential-proxy"
+_PROXY_CONTAINER = os.environ.get("AGENT_PROXY_CONTAINER", "agent-api-auth")
 _AGENT_CONTAINER = "platform-agent"
 
 # The interpreter the relay runs inside _PROXY_CONTAINER. Named here rather than
@@ -444,10 +448,24 @@ _AGENT_CONTAINER = "platform-agent"
 # with this same path.
 _PROXY_PYTHON = "/opt/hermes/.venv/bin/python3"
 
-# The credential-proxy sidecar's authenticated listener, and the Service's
-# targetPort for `api`.
+# The credential-proxy / agent-api-auth sidecar's authenticated listener, and
+# the Service's targetPort for `api`.
 _PROXY_API_PORT = 8643
 _HERMES_API_PORT = 8642
+
+# The local end of the relay, and the name this suite reads it under. bench
+# (bench/kube_agents_bench/harness.py) reads AGENT_LOCAL_PORT for the same idea
+# with the opposite default: a fixed 8642, because it dials a URL it builds from
+# the number, where this suite yields the bound URL to its tests and wants an
+# ephemeral port. Sharing one name for two defaults is #971's finding 7 -- the
+# mitigation was a warning in .env.example telling the reader not to set it to
+# 0; two names need no warning. The legacy name is not read, only reported.
+#
+# The report is for one release, so a .env or a shell mid-flight is told rather
+# than ignored. Deleted together after that: _LEGACY_LOCAL_PORT_ENV, the branch
+# in _local_port, and the paragraph naming it in .env.example.
+_LOCAL_PORT_ENV = "E2E_AGENT_LOCAL_PORT"
+_LEGACY_LOCAL_PORT_ENV = "AGENT_LOCAL_PORT"
 
 # Read-only, and the endpoint the operator's own readiness probe asks for
 # (agentAPIProbe in platformagent_manifests.go), so a pass here means what a
@@ -467,6 +485,31 @@ def _numeric_env(name: str, default: str, cast: Any) -> Any:
         return cast(raw)
     except ValueError:
         raise ValueError(f"{name} must be numeric, got {raw!r}") from None
+
+
+def _local_port() -> int:
+    """The local end of the relay, plus a word about the name that no longer feeds it.
+
+    0 takes an ephemeral port. A fixed one turns a leftover listener from an
+    earlier run into "address already in use", which reads like a broken agent.
+
+    A still-set AGENT_LOCAL_PORT is reported rather than honoured: honouring it
+    is the collision this suite was renamed out of, and ignoring it in silence
+    would move a configuration that used to work into doing nothing visible.
+
+    The report is a warning rather than a print because a print would be the
+    silence it is meant to prevent: pytest captures a fixture's stderr and shows
+    it only for a failing test, and this run passes. A warning reaches the
+    summary of a green run, and stderr when the helper is called outside pytest.
+    """
+    if os.environ.get(_LEGACY_LOCAL_PORT_ENV) and not os.environ.get(_LOCAL_PORT_ENV):
+        warnings.warn(
+            f"{_LEGACY_LOCAL_PORT_ENV} is set but this suite no longer reads it -- "
+            f"the name is bench's alone, where it means a fixed port. Taking an "
+            f"ephemeral one; set {_LOCAL_PORT_ENV} to pin the local end instead.",
+            stacklevel=2,
+        )
+    return _numeric_env(_LOCAL_PORT_ENV, "0", int)
 
 
 def _probe_agent_api(port: int, api_key: str, timeout: float) -> Tuple[Optional[int], str]:
@@ -592,6 +635,46 @@ def _gateway_pod_selector(namespace: str, note: Callable[[str], None]) -> str:
     return ",".join(f"{key}={value}" for key, value in sorted(selector.items()))
 
 
+def _resolve_gateway_proxy_container(
+    namespace: str, selector: str, note: Callable[[str], None]
+) -> str:
+    """Resolves the container in the gateway pod listening on _PROXY_API_PORT.
+
+    In PR #913+ the gateway pod runs the native sidecar `agent-api-auth`.
+    For legacy single-pod deployments, it was `envoy-credential-proxy`.
+    """
+    configured = os.environ.get("AGENT_PROXY_CONTAINER")
+    if configured:
+        return configured
+    try:
+        res = subprocess.run(
+            [
+                "kubectl",
+                "get",
+                "pods",
+                "-n",
+                namespace,
+                "-l",
+                selector,
+                "--field-selector=status.phase=Running",
+                "-o",
+                "jsonpath={.items[0].spec.initContainers[*].name} {.items[0].spec.containers[*].name}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            containers = res.stdout.strip().split()
+            if "agent-api-auth" in containers:
+                return "agent-api-auth"
+            if "envoy-credential-proxy" in containers:
+                return "envoy-credential-proxy"
+    except Exception as exc:  # noqa: BLE001
+        note(f"failed to detect proxy container in {selector}: {exc}")
+    return _PROXY_CONTAINER
+
+
 def _diagnose_hermes(namespace: str) -> str:
     """Separates "the agent is down" from "the credential proxy is broken".
 
@@ -669,9 +752,7 @@ def port_forward_agent(
             "API_SERVER_KEY, and neither PLATFORM_AGENT_TOKEN nor API_SERVER_KEY is set."
         )
 
-    # 0 takes an ephemeral port. A fixed one turns a leftover listener from an
-    # earlier run into "address already in use", which reads like a broken agent.
-    local_port = _numeric_env("AGENT_LOCAL_PORT", "0", int)
+    local_port = _local_port()
     budget = _numeric_env("AGENT_TUNNEL_TIMEOUT", "30", float)
 
     # kubectl's stderr, which is where a failed exec explains itself. A file
@@ -686,8 +767,11 @@ def port_forward_agent(
     selector = _gateway_pod_selector(
         agent_namespace, lambda message: diary.append(f"  {message}")
     )
+    proxy_container = _resolve_gateway_proxy_container(
+        agent_namespace, selector, lambda message: diary.append(f"  {message}")
+    )
     target = (
-        f"exec relay -> {_PROXY_CONTAINER}:{_PROXY_API_PORT} "
+        f"exec relay -> {proxy_container}:{_PROXY_API_PORT} "
         f"in a pod matching {selector}"
     )
 
@@ -697,7 +781,7 @@ def port_forward_agent(
             TunnelConfig(
                 namespace=agent_namespace,
                 selector=selector,
-                container=_PROXY_CONTAINER,
+                container=proxy_container,
                 remote_port=_PROXY_API_PORT,
                 python=_PROXY_PYTHON,
                 ready_timeout=budget,
